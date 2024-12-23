@@ -5,10 +5,11 @@ import time
 import argparse
 import json
 import os
-from utils import get_k
+from get_k import *
 
 MPI = False 
 MPI_TASK = 4
+BAR_L = 8
 
 ABY3_FOLDER = os.getcwd()
 MAIN_FOLDER = ABY3_FOLDER + "/aby3-GORAM"
@@ -20,13 +21,13 @@ format_configs = {
         "prefix": MAIN_FOLDER + "/data/baseline/",
         "record_folder": MAIN_FOLDER + "/record/privGraph/",
         "record_pattern": "(.*?)_n-(\d+)_k-(\d+)-(\d+)",
-        "n": [1024], # [1024, 2048, 4096, 8192, 16384, 32768] change for other tests.
+        "n": [1024, 2048, 4096, 8192, 16384, 32768],
         "e": -1,
-        "k": [32],
-        "n_stash_size": [1024],
-        "n_pack_size": [16],
-        "e_stash_size": [1024],
-        "e_pack_size": [32],
+        "k": [32, 32, 32, 32, 32, 32],
+        "n_stash_size": [1024, 1024, 1024, 1024, 1024, 1024],
+        "n_pack_size": [16, 16, 16, 16, 16, 16],
+        "e_stash_size": [1024, 1024, 1024, 1024, 1024, 1024],
+        "e_pack_size": [32, 32, 32, 32, 32, 32],
         "config_keys" : ["gtype", "n", "e", "k", "se", "pe", "sn", "pn"],
         "performance_keys": ["GraphLoad", "EdgeOramInit", "NodeOramInit", "EdgeExistQuery", "OuttingEdgesCountQuery", "NeighborsGetQuery", "GraphLoad_recv", "EdgeOramInit_recv", "NodeOramInit_recv", "EdgeExistQuery_recv", "OuttingEdgesCountQuery_recv", "NeighborsGetQuery_recv", "GraphLoad_send", "EdgeOramInit_send", "NodeOramInit_send", "EdgeExistQuery_send", "OuttingEdgesCountQuery_send", "NeighborsGetQuery_send"],
     },
@@ -34,12 +35,12 @@ format_configs = {
         "prefix": MAIN_FOLDER + "/data/baseline/",
         "record_folder": MAIN_FOLDER + "/record/adjmat/",
         "record_pattern": "(.*?)_n-(\d+)-(\d+)",
-        "n": [1024],
+        "n": [1024, 2048, 4096, 8192, 16384, 32768],
         "e": -1,
-        "n_stash_size": [32],
-        "n_pack_size": [16],
-        "e_stash_size": [1024],
-        "e_pack_size": [32],
+        "n_stash_size": [32, 32, 32, 32, 32, 32],
+        "n_pack_size": [16, 16, 16, 16, 16, 16],
+        "e_stash_size": [1024, 1024, 1024, 1024, 1024, 1024],
+        "e_pack_size": [32, 32, 32, 32, 32, 32],
         "config_keys" : ["gtype", "n", "e", "se", "pe", "sn", "pn"],
         "performance_keys": ["GraphLoad", "EdgeOramInit", "NodeOramInit", "EdgeExistQuery", "OuttingEdgesCountQuery", "NeighborsGetQuery", "GraphLoad_recv", "EdgeOramInit_recv", "NodeOramInit_recv", "EdgeExistQuery_recv", "OuttingEdgesCountQuery_recv", "NeighborsGetQuery_recv", "GraphLoad_send", "EdgeOramInit_send", "NodeOramInit_send", "EdgeExistQuery_send", "OuttingEdgesCountQuery_send", "NeighborsGetQuery_send"],
     },
@@ -47,7 +48,7 @@ format_configs = {
         "prefix": MAIN_FOLDER + "/data/baseline/",
         "record_folder": MAIN_FOLDER + "/record/edgelist/",
         "record_pattern": "(.*?)_n-(\d+)-(\d+)",
-        "n": [1024],
+        "n": [1024, 2048, 4096, 8192, 16384, 32768],
         "e": -1,
         "config_keys" : ["gtype", "n", "e"],
         "performance_keys": ["GraphLoad", "EdgeExistQuery", "OuttingEdgesCountQuery", "NeighborsGetQuery", "GraphLoad_recv", "EdgeExistQuery_recv", "OuttingEdgesCountQuery_recv", "NeighborsGetQuery_recv", "GraphLoad_send", "EdgeExistQuery_send", "OuttingEdgesCountQuery_send", "NeighborsGetQuery_send"],
@@ -55,7 +56,7 @@ format_configs = {
 }
     
 
-REPEAT_TIMES = 1
+REPEAT_TIMES = 0
 
 if __name__ == "__main__":
     
@@ -117,7 +118,7 @@ if __name__ == "__main__":
                 # if data do not exist, generate the data.
                 if not os.path.exists(meta_file):
                     print(f"File {meta_file} does not exist. Generate the data...")
-                    generate_command = f"python ./aby3-GORAM/privGraphQuery/micro_benchmark_generation.py --file_prefix {file_prefix} --type {gtype} --n {n} --e {e} --k {k}"
+                    generate_command = f"python ./aby3-GORAM/privGraphQuery/micro_benchmark_generation.py --file_prefix {file_prefix} --type {gtype} --n {n} --e {e} --k {k} --bar_l {BAR_L}"
                     os.system(generate_command)
                 
                 # run the profiling.

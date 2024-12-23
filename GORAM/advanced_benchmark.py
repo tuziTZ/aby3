@@ -4,7 +4,7 @@ import argparse
 import json
 import os
 import random
-from utils import get_k 
+from get_k import * 
 
 MPI = True 
 MPI_TASK = 4

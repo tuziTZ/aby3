@@ -6,8 +6,12 @@ import math
 import random
 from igraph import Graph
 
-random.seed(16)
+# random.seed(16)
 PROB = 0.05
+
+def set_random_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
 
 def get_k(V, E, B=1024):
     B = max(B, V)
@@ -123,7 +127,8 @@ def graph_hashing(graph):
 
 
 def networkx_graph_hashing(graph):
-    hash_list = [hash(str(node)) for node in graph.nodes()]
+    random_seed = random.randint(0, 100)
+    hash_list = [hash(str(node) + str(random_seed)) for node in graph.nodes()]
     arg_list = np.argsort(hash_list)
     mapping_list = {node: arg_list[i] for i, node in enumerate(graph.nodes())}
     HG = nx.relabel_nodes(graph, mapping_list)
@@ -140,7 +145,8 @@ def networkx_graph_hashing(graph):
 def large_graph_hashing(graph):
     """The permutation is in inverse order: https://github.com/igraph/igraph/issues/1930
     """
-    hash_list = [hash(str(node.index)) for node in graph.vs]
+    random_seed = random.randint(0, 100)
+    hash_list = [hash(str(node.index) + str(random_seed)) for node in graph.vs]
     arg_list = np.argsort(hash_list)
     # mapping_list = {node.index: arg_list[i] for i, node in enumerate(graph.vs)}
     graph = graph.permute_vertices(arg_list)
@@ -244,12 +250,37 @@ def get_meta_data_igraph(graph, partition_size, l):
     return {"v": V, "e": E, "b": b, "k": partition_size, "l": l}
 
 
-def graph_save(graph, file_prefix, saving_type = "edgelist", partition_size = -1, hashing_flag = False):
+def pad_partition_multi_barl(partition, bar_l):
+    """Pad the partition into the multiple of bar_l.
+    """
+    max_size = max([len(partition[i]) for i in partition.keys()])
+    min_size = min([len(partition[i]) for i in partition.keys()])
+    mean_size = sum([len(partition[i]) for i in partition.keys()]) / len(partition.keys())
+    
+    # the target size now is the multiple of bar_l.
+    target_size = ((max_size + bar_l - 1) // bar_l) * bar_l
+    
+    for i in partition.keys():
+        partition[i] = partition[i] + [(0, 0)]*(target_size - len(partition[i]))
+        
+    partition_list = [item for sublist in [partition[i] for i in partition.keys()] for item in sublist]
+    
+    # update the utilization dict.
+    utilization_dict = {
+        "min": min_size / target_size,
+        "mean": mean_size / target_size
+    }
+    
+    return partition_list, target_size, utilization_dict
+
+
+def graph_save(graph, file_prefix, saving_type = "edgelist", partition_size = -1, hashing_flag = False, bar_l=-1):
     """Saving the generate graph into the datafile.
     """
     supporting_type = ["edgelist", "2dpartition"]
     
     if(hashing_flag):
+        print("Hashing the graph.")
         graph = graph_hashing(graph)
     
     if(saving_type not in supporting_type):
@@ -281,7 +312,11 @@ def graph_save(graph, file_prefix, saving_type = "edgelist", partition_size = -1
         
         partition = trans2_2dpartition(graph, partition_size)
         
-        partition_list, l, utilization_dict = partition_format(partition)
+        if(bar_l < 0):
+            partition_list, l, utilization_dict = partition_format(partition)
+        else:
+            print("Pad the partition into the multiple of bar_l.")
+            partition_list, l, utilization_dict = pad_partition_multi_barl(partition, bar_l)
         
         meta_data = get_meta_data(graph, partition_size, l)
         
@@ -322,7 +357,7 @@ def split_partition_into_subpartitions(partition, n):
     return partition_dict_list
 
 
-def graph_save_multi(graph, file_prefix, data_providers, saving_type = "edgelist", partition_size = -1, hashing_flag = False):
+def graph_save_multi(graph, file_prefix, data_providers, saving_type = "edgelist", partition_size = -1, hashing_flag = False, bar_l=-1):
 
     supporting_type = ["edgelist", "2dpartition"]
 
@@ -330,6 +365,7 @@ def graph_save_multi(graph, file_prefix, data_providers, saving_type = "edgelist
 
     # whole graph format transmission.
     if(hashing_flag):
+        print("Hashing the graph.")
         graph = graph_hashing(graph)
     
     if(saving_type not in supporting_type):
@@ -372,13 +408,40 @@ def graph_save_multi(graph, file_prefix, data_providers, saving_type = "edgelist
         k = partition_size
 
         print(f"configs b = {b} | k = {k}")
+        
+        total_data_list = []
 
         for i in range(data_providers):
-            partition_list, l, utilization_dict = partition_format(partition_dict_list[i])
-            meta_data = get_meta_data(graph, partition_size, l)
+            
+            if(bar_l < 0):
+                partition_list, l, utilization_dict = partition_format(partition_dict_list[i])
+                meta_data = get_meta_data(graph, partition_size, l)
+                assert meta_data["b"] == b
+                assert meta_data["k"] == k
+                total_data_list.append((partition_list, meta_data, utilization_dict))
+            else:
+                print("Pad the partition into the multiple of bar_l.")
+                partition_list, l, utilization_dict = pad_partition_multi_barl(partition_dict_list[i], bar_l)
+            
+                meta_data = get_meta_data(graph, partition_size, l)
+                assert meta_data["b"] == b
+                assert meta_data["k"] == k
+            
+                num_sublists = l // bar_l
+                 
+                for j in range(num_sublists):
+                    sub_partition_list = []
+                    for par in range(b**2):
+                        sub_par = partition_list[par*l + j*bar_l : par*l + (j+1)*bar_l]
+                        sub_partition_list.extend(sub_par)
+                    meta_data = get_meta_data(graph, partition_size, bar_l)
+                    total_data_list.append((sub_partition_list, meta_data, utilization_dict))
 
-            assert meta_data["b"] == b
-            assert meta_data["k"] == k
+
+        print(">>>>>>> total_data_list size = ", len(total_data_list))
+        # save the partition data.
+        for i in range(len(total_data_list)):
+            partition_list, meta_data, utilization_dict = total_data_list[i]
             
             partition_file = file_prefix + "_2dpartition_party-" + str(i) + ".txt"
             meta_file = file_prefix + "_meta_party-" + str(i) + ".txt"
@@ -391,30 +454,16 @@ def graph_save_multi(graph, file_prefix, data_providers, saving_type = "edgelist
             with open(meta_file, "w") as f:
                 for key in meta_data.keys():
                     f.write(str(meta_data[key]) + " ")
-
+    
         meta_file = file_prefix + "_meta_multiparty.txt"
         with open(meta_file, "w") as f:
-            f.write(str(graph.vcount()) + " " + str(data_providers) + " " + str(b) + " " + str(k) + " ")                
+            f.write(str(graph.vcount()) + " " + str(len(total_data_list)) + " " + str(b) + " " + str(k) + " ")                
             f.write("\n")
+        
+        utilization_file = file_prefix + "_utilization.txt"
+        with open(utilization_file, "w") as f:
+            f.write(json.dumps(utilization_dict))
         
         print("Multi-party 2d-partition Graph saved!")
 
         return
-        # meta_data = get_meta_data(graph, partition_size, l)
-        
-        # partition_file = file_prefix + "_2dpartition.txt"
-        # meta_file = file_prefix + "_meta.txt"
-        # utilization_file = file_prefix + "_utilization.txt"
-        
-        # with open(partition_file, "w") as f:
-        #     for i in partition_list:
-        #         f.write(str(i[0]) + " " + str(i[1]) + "\n")
-        
-        # # in meta file, we save the {node number}, {origional edge number}, {node block number}, {node block size} and the {edge block size} in sequence.
-        # with open(meta_file, "w") as f:
-        #     for key in meta_data.keys():
-        #         f.write(str(meta_data[key]) + " ")
-        
-        # # in utilization file, we save the utilization_dict info.
-        # with open(utilization_file, "w") as f:
-        #     f.write(json.dumps(utilization_dict))

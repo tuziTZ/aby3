@@ -8,6 +8,7 @@ parser.add_argument('--type', type=str, default= "complete", help='graph type')
 parser.add_argument('--n', type=int, default=2**8, help='nodes number')
 parser.add_argument('--e', type=int, default=-1, help='edges number')
 parser.add_argument('--k', type=int, default=2**4, help='partition size')
+parser.add_argument('--bar_l', type=int, default=-1, help='bar_l, the unit size for each partition.')
 parser.add_argument('--p', type=int, default=1, help='data provider numbers')
 
 parser.add_argument('--file_prefix', type=str, default="./data/micro_benchmark/tmp_graph", help='file prefix')
@@ -25,6 +26,6 @@ else:
     elif(args.tool == "nx"):
         graph = nx_graph_generation(args.type, args.n)
 if(args.p == 1):
-    graph_save(graph, args.file_prefix, args.saving_type, args.k, args.hash_flag)
+    graph_save(graph, args.file_prefix, args.saving_type, args.k, args.hash_flag, args.bar_l)
 else:
-    graph_save_multi(graph, args.file_prefix, args.p, args.saving_type, args.k, args.hash_flag)
+    graph_save_multi(graph, args.file_prefix, args.p, args.saving_type, args.k, args.hash_flag, args.bar_l)
