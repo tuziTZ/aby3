@@ -24,6 +24,8 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description='Microbenchmark data generation')
     parser.add_argument('--type', type=str, default= "complete", help='graph type')
+    parser.add_argument('--filename', type=str, default= "complete", help='save file name')
+    parser.add_argument('--samples', type=int, default=SAMPLE_TIME, help='sample times')
     args = parser.parse_args()
     
     data_folder = MAIN_FOLDER + "/data/sampling"
@@ -37,7 +39,8 @@ if __name__ == "__main__":
     # sample for the graphs.
     # for gtype in gtype_list:
     gtype = args.type
-    for _ in range(SAMPLE_TIME):
+    sample_time = args.samples
+    for _ in range(sample_time):
         set_random_seed(random.randint(0, SAMPLE_TIME+10086))
         graph = large_graph_generation(gtype, n)
         graph = graph_hashing(graph)
@@ -47,10 +50,10 @@ if __name__ == "__main__":
         
         partition_list, l, utilization_dict = partition_format(partition)
         
-        file_prefix = data_folder + "/tmp_graph_" + gtype
-        graph_save(graph, file_prefix, "2dpartition", k, True, l)
+        #file_prefix = data_folder + "/tmp_graph_" + gtype
+        #graph_save(graph, file_prefix, "2dpartition", k, True, l)
         
-        record_file = record_folder + "/record_" + gtype + ".txt"
+        record_file = record_folder + "/record_" + gtype + "-" + args.filename + ".txt"
         record_dict = {
             "v": v,
             "e": e,
