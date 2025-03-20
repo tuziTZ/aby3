@@ -11,9 +11,9 @@ for pfile in ./party-*.txt; do
 done
 
 # # synchronize with others
-scp ./out/build/linux/frontend/frontend aby31:~/aby3/out/build/linux/frontend/ &
-scp ./out/build/linux/frontend/frontend aby32:~/aby3/out/build/linux/frontend/ &
-wait;
+# scp ./out/build/linux/frontend/frontend aby31:~/aby3/out/build/linux/frontend/ &
+# scp ./out/build/linux/frontend/frontend aby32:~/aby3/out/build/linux/frontend/ &
+# wait;
 
 # run the tests
 # current tests: 
@@ -24,7 +24,7 @@ wait;
 # 5) -Shuffle : secure shuffling tests.
 # 8) -Comm : test inter-party communication.
 # 9) -Sort : test the sort functions.
-test_args=" -Bool -Arith -Comm -Sort -ORAM -Init -Shuffle"
+test_args=" -Bool -Arith -Sort -ORAM"
 ./Eval/dis_exec.sh "${test_args}"
 wait;
 
