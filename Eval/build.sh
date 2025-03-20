@@ -1,5 +1,5 @@
 # fix the bug in the thirdparty library.
-FILE_PATH="./aby3/thirdparty/libOTe/cryptoTools/cryptoTools/Circuit/BetaLibrary.cpp"
+FILE_PATH="./thirdparty/libOTe/cryptoTools/cryptoTools/Circuit/BetaLibrary.cpp"
 LINE_NUMBER=1203
 NEW_TEXT="           G = GateType::na_And;"
 
