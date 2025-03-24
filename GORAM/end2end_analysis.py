@@ -14,6 +14,65 @@ real_world_data_folder = MAIN_FOLDER + "/data/real_world/"
 data_prefix = "twitter"
 meta_data_file = f"{real_world_data_folder}/{data_prefix}_meta.txt"
 data_file = f"{real_world_data_folder}/{data_prefix}_2dpartition.txt"
+raw_edge_list_file = f"{real_world_data_folder}/{data_prefix}_edge_list.txt"
+
+
+def process_single_provider(args):
+    """处理单个provider的数据"""
+    j, data_file, data_folder, partitions, l, sub_l, last_l = args
+    
+    # 获取该provider的分区数据
+    partition_list = get_provider_partitions(data_file, j, partitions, l, sub_l, last_l)
+    
+    # 保存数据
+    print(f"provider {j} has {len(partition_list)} partitions | partition edge size: {len(partition_list[0])}")
+    provider_file = data_folder + f"provider_{j}.txt"
+    with open(provider_file, "w") as f:
+        for partition in partition_list:
+            for edge in partition:
+                f.write(f"{edge[0]} {edge[1]}\n")
+    
+    return j
+
+
+def get_provider_partitions(file_path, provider_id, partitions, l, sub_l, last_l):
+    """一次性获取一个provider的所有分区数据"""
+    # 预计算该provider需要的所有行索引范围
+    ranges = []
+    for i in range(partitions):
+        offset = i*l + provider_id*sub_l
+        length = last_l if provider_id == args.providers-1 else sub_l
+        ranges.append((offset, offset + length))
+    
+    # 存储所有分区数据
+    all_partitions = [[] for _ in range(partitions)]
+    partition_map = {ranges[i][0]: i for i in range(len(ranges))}
+    
+    # 一次性读取文件
+    with open(file_path, "r") as f:
+        current_range_idx = 0
+        current_start, current_end = ranges[current_range_idx]
+        
+        for i, line in enumerate(f):
+            if current_range_idx >= len(ranges):
+                break
+                
+            if i < current_start:
+                continue
+
+            while i >= current_end and current_range_idx < len(ranges) - 1:
+                current_range_idx += 1
+                current_start, current_end = ranges[current_range_idx]
+
+            if current_start <= i < current_end:
+                nodes = line.strip().split()
+                if len(nodes) == 2:
+                    partition_idx = partition_map[current_start]
+                    all_partitions[partition_idx].append((int(nodes[0]), int(nodes[1])))
+    
+    return all_partitions
+
+                
 
 def get_vertex_sequence_id(vertex_set):
     vertex_seq_map = {}
@@ -45,7 +104,7 @@ def edge_list_hash(edge_list, vertex_hash_map):
 
 def partition_organization(target_edge_list, k, vertex_hash_map):
     
-    target_edge_list = edge_list_hash(target_edge_list, vertex_hash_map)
+    # target_edge_list = edge_list_hash(target_edge_list, vertex_hash_map)
     V = len(vertex_hash_map)
     print(f"V: {V} | k: {k}")
     b = int(2**math.ceil(math.log2(V//k)))
@@ -77,10 +136,10 @@ def partition_organization_single(args):
 
 def parallel_2d_partition_process(edge_list_parts, k, vertex_set, threads_num):
     """process the edge_list_parts in parallel"""
-    vertex_seq_map = get_vertex_sequence_id(vertex_set)
-    vertex_hash_map = get_vertex_hash_map(vertex_seq_map)
+    # vertex_seq_map = get_vertex_sequence_id(vertex_set)
+    # vertex_hash_map = get_vertex_hash_map(vertex_seq_map)
     
-    args_list = [(part, k, vertex_hash_map) for part in edge_list_parts]
+    args_list = [(part, k, vertex_set) for part in edge_list_parts]
     
     # 使用进程池并行处理
     with Pool(processes=threads_num) as pool:
@@ -162,31 +221,33 @@ if __name__ == "__main__":
     
     # obtain the vertex set.
     if not os.path.exists(f"{real_world_data_folder}/{data_prefix}_vertex_set.txt"):
-        edge_list = []
-        with open(data_file, "r") as f:
+        vertex_set = set()
+        with open(raw_edge_list_file, "r") as f:
             for line in f:
                 nodes = line.strip().split()
                 if len(nodes) == 2:
-                    edge_list.append((int(nodes[0]), int(nodes[1])))
-        print("load the edge list.")
+                    # edge_list.append((int(nodes[0]), int(nodes[1])))
+                    vertex_set.add(int(nodes[0]))
+                    vertex_set.add(int(nodes[1]))
+        # print("load the edge list.")
                     
-        vertex_set = list(set([edge[0] for edge in edge_list] + [edge[1] for edge in edge_list]))
-        print(f"the number of vertices: {len(vertex_set)}")
         with open(f"{real_world_data_folder}/{data_prefix}_vertex_set.txt", "w") as f:
             f.write(' '.join(map(str, vertex_set)))
-        # delete the space of edge_list
         del edge_list
     else:
         with open(f"{real_world_data_folder}/{data_prefix}_vertex_set.txt", "r") as f:
             vertex_set = list(map(int, f.readline().strip().split()))
     
     # save the hash map.
+    print("load the vertex set.")
     if not os.path.exists(f"{real_world_data_folder}/{data_prefix}_vertex_hash_map.txt"):
         vertex_seq_map = get_vertex_sequence_id(vertex_set)
         vertex_hash_map = get_vertex_hash_map(vertex_seq_map)
+        print("generate the vertex hash map.")
         with open(f"{real_world_data_folder}/{data_prefix}_vertex_hash_map.txt", "w") as f:
             for key, val in vertex_hash_map.items():
                 f.write(f"{key} {val}\n")
+        print("save the vertex hash map.")
     else:
         vertex_hash_map = {}
         with open(f"{real_world_data_folder}/{data_prefix}_vertex_hash_map.txt", "r") as f:
@@ -194,7 +255,6 @@ if __name__ == "__main__":
                 key, val = map(int, line.strip().split())
                 vertex_hash_map[key] = val
 
-    
     if(flag_preprocess):
         # split the data for each data provider.
         sub_l = l // args.providers
@@ -202,38 +262,19 @@ if __name__ == "__main__":
         partitions = b*b # the number of partitions.
         print(f"the number of partitions: {partitions} | the size of each partition: {l}")
         
-        # load the raw data.
-        edge_list = []
-        with open(data_file, "r") as f:
-            for line in f:
-                nodes = line.strip().split()
-                if len(nodes) == 2:
-                    edge_list.append((int(nodes[0]), int(nodes[1])))
-            
-        partitions_for_data_providers = [[] for i in range(args.providers)]
-        for i in range(partitions):
-            for j in range(args.providers):
-                offset = i*l + j*sub_l
-                if(j == args.providers-1):
-                    partitions_for_data_providers[j].append(edge_list[offset:offset+last_l])
-                else:
-                    partitions_for_data_providers[j].append(edge_list[offset:offset+sub_l])
-        
         # save the data, check whether the data folder (x) exists, if not, create it.
         data_folder = f"{real_world_data_folder}/{data_prefix}_{args.providers}/"
         if not os.path.exists(data_folder):
-            os.makedirs(data_folder)
+            os.makedirs(data_folder)   
         
-        for i in range(args.providers):
-            print(f"provider {i} has {len(partitions_for_data_providers[i])} edges | edge size: {len(partitions_for_data_providers[i][0])}")
-            provider_file = data_folder + f"provider_{i}.txt"
-            # flatten the 2d-list
-            private_edge_list = [edge for partition in partitions_for_data_providers[i] for edge in partition]
+        args_list = [(j, data_file, data_folder, partitions, l, sub_l, last_l) for j in range(args.providers)]
+        
+        # with Pool(processes=args.providers) as pool:
+        #     results = pool.map(process_single_provider, args_list) 
+        for _args in args_list:
+            result = process_single_provider(_args)
+            print(f"provider {result} has been processed.")
             
-            with open(provider_file, "w") as f:
-                lines = [f"{edge[0]} {edge[1]}\n" for edge in private_edge_list]
-                f.writelines(lines)
-
     
     # count the time for transferring the data into 2d-partitions.
     time_record = []

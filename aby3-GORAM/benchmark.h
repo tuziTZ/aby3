@@ -39,3 +39,8 @@ int neighbor_statistics_profiling_edgelist(oc::CLP& cmd);
 // microbenchmarks.
 int permutation_network_profiling(oc::CLP& cmd);
 int shuffMem_profiling(oc::CLP& cmd);
+
+// preprocessing.
+int data_preparation(oc::CLP& cmd);
+int partition_initialization_profiling(oc::CLP& cmd);
+int partition_transmission_profiling(oc::CLP& cmd);

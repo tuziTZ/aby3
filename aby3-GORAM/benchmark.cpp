@@ -73,6 +73,11 @@ static std::string base_folder = graph_folder.substr(0, pos + 1);
     Timer& timer = Timer::getInstance(); \
     timer.clear_records();
 
+struct Edge {
+    int src;
+    int dst;
+    size_t grid_idx; 
+};
 
 size_t get_sending_bytes(aby3Info &party_info){
     size_t send_next = party_info.runtime->mComm.mNext.getTotalDataSent();
@@ -1922,5 +1927,205 @@ int shuffMem_profiling(oc::CLP& cmd){
         cmeter.print_total_per_party("MB", stream); 
     }
 
+    return 0;
+}
+
+
+int data_preparation(oc::CLP& cmd){
+
+    SET_STRING_OR_DEFAULT(cmd, data_folder, graph_folder);
+    SET_STRING_OR_DEFAULT(cmd, data_file_path, "tmp");
+    SET_STRING_OR_DEFAULT(cmd, meta_file_path, "meta");
+    SET_STRING_OR_DEFAULT(cmd, save_folder, graph_folder);
+    SET_OR_DEFAULT(cmd, N, 2);
+
+
+    data_file_path = data_folder + data_file_path;
+    meta_file_path = data_folder + meta_file_path;
+
+    std::ifstream meta_file(meta_file_path);
+    size_t v, e, b, k, l;
+    meta_file >> v >> e >> b >> k >> l;
+
+    std::vector<Edge> edges(b*b*l);
+
+    size_t sub_l = l / N;
+    size_t last_l = l - sub_l * (N-1);
+
+    std::vector<std::ofstream> provider_files(N);
+    for(int i=0; i<N; i++){
+        provider_files[i].open(save_folder + "provider_" + std::to_string(i) + ".txt");
+    }
+    std::vector<int> edges_num(N, 0);
+
+    std::ifstream file(data_file_path);
+    file.rdbuf()->pubsetbuf(nullptr, 0);
+    std::ios_base::sync_with_stdio(false);
+
+    size_t edge_idx = 0;
+    int src, dst;
+    while(file >> src >> dst){
+        size_t grid_idx = edge_idx / l;
+        size_t pos_in_grid = edge_idx % l;
+        size_t provider_idx = pos_in_grid % N;
+
+        if(src != 0 && dst != 0){
+            provider_files[provider_idx] << src << " " << dst << std::endl;
+            edges_num[provider_idx]++;
+        }
+    }
+
+    std::vector<std::ofstream> provider_meta_file(N);
+    for(int i=0; i<N; i++){
+        provider_files[i].close();
+        provider_meta_file[i].open(save_folder + "provider_" + std::to_string(i) + "_meta.txt");
+        provider_meta_file[i] << v << " " << edges_num[i] << " " << b << " " << k << std::endl;
+        provider_meta_file[i].close();
+    }
+
+    return 0;
+}
+
+
+int partition_initialization_profiling(oc::CLP& cmd){
+
+    Timer& timer = Timer::getInstance(); \
+    timer.clear_records();
+
+    std::string graph_data_folder = graph_folder;
+    std::string file_path = "tmp";
+    std::string meta_file_path = "meta";
+    std::string record_folder = base_folder + "record/partition_initialization/";
+    std::string record_file = "tmp";
+
+    if(cmd.isSet("data_folder")){
+        auto keys = cmd.getMany<std::string>("data_folder");
+        graph_data_folder = keys[0];
+    }
+
+    if(cmd.isSet("file_path")){
+        auto keys = cmd.getMany<std::string>("file_path");
+        file_path = keys[0];
+    }
+
+    if(cmd.isSet("meta_file_path")){
+        auto keys = cmd.getMany<std::string>("meta_file_path");
+        meta_file_path = keys[0];
+    }
+
+    if(cmd.isSet("record_folder")){
+        auto keys = cmd.getMany<std::string>("record_folder");
+        record_folder = keys[0];
+    }
+
+    if(cmd.isSet("record_file")){
+        auto keys = cmd.getMany<std::string>("record_file");
+        record_file = keys[0];
+    }
+
+    file_path = graph_data_folder + file_path;
+    meta_file_path = graph_data_folder + meta_file_path;
+    record_file = record_folder + record_file;
+
+    // load the meta data.
+    std::ifstream meta_file(meta_file_path);
+    size_t v, e, b, k;
+
+    meta_file >> v >> e >> b >> k;
+
+    std::vector<Edge> edges;
+    std::vector<std::vector<Edge>> grids(b*b);
+
+    timer.start("data_load");
+    edges.reserve(e);
+
+    std::ifstream file(file_path);
+    file.rdbuf()->pubsetbuf(nullptr, 0);
+    std::ios_base::sync_with_stdio(false);
+
+    int src, dst;
+    size_t grid_index;
+    while(file >> src >> dst){
+        grid_index = (src/k) * b + (dst/k); 
+        edges.push_back({src, dst, grid_index});
+    }
+
+    timer.end("data_load");
+    
+    timer.start("sort");
+    std::sort(edges.begin(), edges.end(), 
+        [](const Edge& a, const Edge& b) {
+            return a.grid_idx < b.grid_idx;
+        });
+    timer.end("sort");
+
+    timer.start("partition");
+    for(const auto& edge : edges){
+        grids[edge.grid_idx].push_back(edge);
+    }
+    timer.end("partition");
+
+    edges.clear();
+
+    timer.start("normalize");
+    // find the maximum partition size.
+    size_t max_size = std::max_element(grids.begin(), grids.end(),
+    [](const auto& a, const auto& b) {
+        return a.size() < b.size();
+    })->size();
+
+    // normalize the partition size.
+    Edge zero_edge = {0, 0, 0};
+    #pragma omp parallel for
+    for(auto& grid : grids) {
+        grid.resize(max_size, zero_edge);
+    }
+    timer.end("normalize");
+
+    // secret sharing split.
+    timer.start("secret_share");
+    std::vector<int> share1(b * b * max_size * 2);
+    std::vector<int> share2(b * b * max_size * 2);
+    std::vector<int> share3(b * b * max_size * 2);
+
+    std::random_device rd;
+    std::mt19937 gen(rd());  // Mersenne Twister generator.
+    const int MOD = 1 << 32;
+    std::uniform_int_distribution<int> dis(1, MOD);  // range from 1-1000.
+
+    // pad the random numbers.
+    #pragma omp parallel sections
+    {
+        #pragma omp section
+        {
+            std::generate(share1.begin(), share1.end(), 
+                [&]() { return dis(gen); });
+        }
+        #pragma omp section
+        {
+            std::generate(share2.begin(), share2.end(), 
+                [&]() { return dis(gen); });
+        }
+    }
+    # pragma omp parallel for
+    int i=0;
+    for(auto& grid : grids){
+        for(auto& edge : grid){
+            share3[i] = ((edge.src - share1[i] - share2[i]) % MOD + MOD) % MOD;
+            i++;
+        }
+    }
+    timer.end("secret_share");
+
+    // print the records.
+    std::ofstream stream(record_file, std::ios::app);
+    timer.print_total("milliseconds", stream);
+    stream << "partition size = " << b << " x " << b << " x " << max_size << std::endl;
+
+
+    return 0;
+}
+
+int partition_transmission_profiling(oc::CLP& cmd){
     return 0;
 }

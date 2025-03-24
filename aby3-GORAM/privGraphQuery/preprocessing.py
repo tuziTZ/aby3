@@ -160,7 +160,7 @@ def twitter_data_organization(twitter_edge_list, k):
     meta_dict = {"v": V, "e": E, "b": b, "k": k, "l": l}  
     
 
-    return partition_list, meta_dict, utilization_dict
+    return partition_list, meta_dict, utilization_dict, edge_hash_list
 
 
 
@@ -184,12 +184,12 @@ if __name__ == "__main__":
         twitter_edge_list = get_edge_list(edge_list_file)
 
         print("Generating 2d-partitioning...")
-        partition_list, meta_dict, utilization_dict = twitter_data_organization(twitter_edge_list, k)
+        partition_list, meta_dict, utilization_dict, edge_hash_list = twitter_data_organization(twitter_edge_list, k)
         
         # save edgelist.
         print("Saving edge list.")
         with open(real_world_data_folder + dataset + "_edge_list.txt", "w") as f:
-            for e in twitter_edge_list:
+            for e in edge_hash_list:
                 f.write(str(e[0]) + " " + str(e[1]) + "\n")
         elist_meta_data_file = real_world_data_folder + dataset + "_edge_list_meta.txt"
         with open(elist_meta_data_file, "w") as f:
