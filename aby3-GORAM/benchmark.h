@@ -3,6 +3,10 @@
 #include <random>
 #include <thread>
 #include <tuple>
+#include <fcntl.h>
+#include <omp.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <aby3/sh3/Sh3Encryptor.h>
 #include <aby3/sh3/Sh3Evaluator.h>
 #include <aby3/sh3/Sh3FixedPoint.h>

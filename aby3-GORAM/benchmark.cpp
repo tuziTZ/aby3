@@ -2038,18 +2038,98 @@ int partition_initialization_profiling(oc::CLP& cmd){
     std::vector<std::vector<Edge>> grids(b*b);
 
     timer.start("data_load");
-    edges.reserve(e);
 
-    std::ifstream file(file_path);
-    file.rdbuf()->pubsetbuf(nullptr, 0);
-    std::ios_base::sync_with_stdio(false);
-
-    int src, dst;
-    size_t grid_index;
-    while(file >> src >> dst){
-        grid_index = (src/k) * b + (dst/k); 
-        edges.push_back({src, dst, grid_index});
+    int fd = open(file_path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        std::cerr << "failed to open file.\n";
+        return -1;
     }
+    
+    struct stat sb;
+    if (fstat(fd, &sb) < 0) {
+        std::cerr << "fstat failed\n";
+        close(fd);
+        return -1;
+    }
+    
+    char* data = (char*)mmap(nullptr, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (data == MAP_FAILED) {
+        std::cerr << "mmap failed\n";
+        close(fd);
+        return -1;
+    }
+
+    const int num_threads = std::thread::hardware_concurrency();
+    std::vector<std::thread> threads;
+    std::vector<std::vector<Edge>> thread_edges(num_threads);
+
+    size_t chunk_size = sb.st_size / num_threads;
+
+    auto adjust_start = [data, file_size = sb.st_size](char* ptr) -> char* {
+        while (ptr < data + file_size && *ptr != '\n') {
+            ++ptr;
+        }
+        if (ptr < data + file_size) ++ptr;  // skip.
+        return ptr;
+    };
+
+    auto adjust_end = [data](char* ptr) -> char* {
+        while (ptr > data && *(ptr - 1) != '\n') {
+            --ptr;
+        }
+        return ptr;
+    };
+
+    // using multi-threads.
+    for (int t = 0; t < num_threads; t++) {
+        char* chunk_start = data + t * chunk_size;
+        char* chunk_end = (t == num_threads - 1) ? data + sb.st_size : data + (t + 1) * chunk_size;
+        
+        if (t > 0) {
+            chunk_start = adjust_start(chunk_start);
+        }
+        if (t < num_threads - 1) {
+            chunk_end = adjust_end(chunk_end);
+        }
+        
+        threads.emplace_back([=, &thread_edges, k, b]() {
+            char* cur = chunk_start;
+            while (cur < chunk_end) {
+                while (cur < chunk_end && !isdigit(*cur)) cur++;
+                if (cur >= chunk_end) break;
+                
+                int src = 0;
+                while (cur < chunk_end && isdigit(*cur)) {
+                    src = src * 10 + (*cur - '0');
+                    cur++;
+                }
+                while (cur < chunk_end && !isdigit(*cur)) cur++;
+                if (cur >= chunk_end) break;
+                
+                int dst = 0;
+                while (cur < chunk_end && isdigit(*cur)) {
+                    dst = dst * 10 + (*cur - '0');
+                    cur++;
+                }
+                
+                size_t grid_index = (src / k) * b + (dst / k);
+                thread_edges[t].push_back({src, dst, grid_index});
+            }
+        });
+    }
+    
+    for (auto& thread : threads) {
+        thread.join();
+    }
+    
+    for (auto& vec : thread_edges) {
+        edges.insert(edges.end(), 
+                     std::make_move_iterator(vec.begin()),
+                     std::make_move_iterator(vec.end()));
+    }
+    
+    munmap(data, sb.st_size);
+    close(fd);
 
     timer.end("data_load");
     
@@ -2085,36 +2165,70 @@ int partition_initialization_profiling(oc::CLP& cmd){
 
     // secret sharing split.
     timer.start("secret_share");
+    {
     std::vector<int> share1(b * b * max_size * 2);
     std::vector<int> share2(b * b * max_size * 2);
     std::vector<int> share3(b * b * max_size * 2);
 
-    std::random_device rd;
-    std::mt19937 gen(rd());  // Mersenne Twister generator.
-    const int MOD = 1 << 30;
-    std::uniform_int_distribution<int> dis(1, MOD);  // range from 1-1000.
+    size_t total_size = b * b * max_size * 2;
 
-    // pad the random numbers.
-    #pragma omp parallel sections
+    // random generator.
+    const int num_threads = omp_get_max_threads();
+    std::vector<std::mt19937> generators(num_threads);
+    #pragma omp parallel
     {
-        #pragma omp section
-        {
-            std::generate(share1.begin(), share1.end(), 
-                [&]() { return dis(gen); });
+        int tid = omp_get_thread_num();
+        generators[tid].seed(std::random_device{}());
+    }
+
+    const int MOD = 1 << 30;
+    const int CHUNK_SIZE = 1024; // cache-friendly.
+
+    // generate the randomness in parallel.
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        std::uniform_int_distribution<int> dis(1, MOD);
+        
+        #pragma omp for schedule(static, CHUNK_SIZE)
+        for (size_t i = 0; i < total_size; i++) {
+            share1[i] = dis(generators[tid]);
         }
-        #pragma omp section
-        {
-            std::generate(share2.begin(), share2.end(), 
-                [&]() { return dis(gen); });
+
+        #pragma omp for schedule(static, CHUNK_SIZE)
+        for (size_t i = 0; i < total_size; i++) {
+            share2[i] = dis(generators[tid]);
         }
     }
-    # pragma omp parallel for
-    int i=0;
-    for(auto& grid : grids){
-        for(auto& edge : grid){
-            share3[i] = ((edge.src - share1[i] - share2[i]) % MOD + MOD) % MOD;
-            i++;
+
+    // pre-compute the mask val.
+    const int MOD_MASK = MOD - 1;
+    const bool IS_MOD_POWER_OF_TWO = (MOD & (MOD - 1)) == 0;
+
+    #pragma omp parallel
+    {
+        #pragma omp for schedule(dynamic, num_threads)
+        for (size_t grid_idx = 0; grid_idx < grids.size(); grid_idx++) {
+            const auto& grid = grids[grid_idx];
+            size_t base_idx = grid_idx * max_size;
+            
+            for (size_t edge_idx = 0; edge_idx < grid.size(); edge_idx++) {
+                size_t i = (base_idx + edge_idx) * 2;
+                int temp1 = grid[edge_idx].src - share1[i] - share2[i];
+                int temp2 = grid[edge_idx].dst - share1[i+1] - share2[i+1];
+                
+                if (IS_MOD_POWER_OF_TWO) {
+                    share3[i] = temp1 & MOD_MASK;
+                    share3[i+1] = temp2 & MOD_MASK;
+                } else {
+                    temp1 = (temp1 % MOD + MOD);
+                    temp2 = (temp2 % MOD + MOD);
+                    share3[i] = (temp1 >= MOD) ? temp1 - MOD : temp1;
+                    share3[i+1] = (temp2 >= MOD) ? temp2 - MOD : temp2;
+                }
+            }
         }
+    }
     }
     timer.end("secret_share");
 
@@ -2123,9 +2237,9 @@ int partition_initialization_profiling(oc::CLP& cmd){
     timer.print_total("milliseconds", stream);
     stream << "partition size = " << b << " x " << b << " x " << max_size << std::endl;
 
-
     return 0;
 }
+
 
 int partition_transmission_profiling(oc::CLP& cmd){
     return 0;
