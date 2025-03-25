@@ -2128,5 +2128,146 @@ int partition_initialization_profiling(oc::CLP& cmd){
 }
 
 int partition_transmission_profiling(oc::CLP& cmd){
+
+    Timer& timer = Timer::getInstance();
+    timer.clear_records();
+
+    // assign role and setup the communication.
+    SET_OR_DEFAULT(cmd, role, 0); // 0 for server and 1 for data provider.
+    SET_OR_DEFAULT(cmd, N, 1); // the total number of dat providers.
+    SET_OR_DEFAULT(cmd, provider_id, -1);
+    SET_STRING_OR_DEFAULT(cmd, server_ip, "127.0.0.1");
+    SET_STRING_OR_DEFAULT(cmd, data_folder, graph_folder);
+    SET_STRING_OR_DEFAULT(cmd, data_file_path, "tmp");
+    SET_STRING_OR_DEFAULT(cmd, meta_file_path, "meta");
+
+    data_file_path = data_folder + data_file_path;
+    meta_file_path = data_folder + meta_file_path;
+
+    int base_port = 3333;
+    size_t chunk_size = 1 << 22;
+
+    if(role == 0){ // server side computation.
+        // setup the communication.
+        boost::asio::io_context io_context;
+        std::vector<std::thread> server_threads;
+
+        for (int i = 0; i < N; ++i) {
+            int port = base_port + i;
+            server_threads.emplace_back([port, &io_context, i, &chunk_size]() {
+                boost::asio::ip::tcp::acceptor acceptor(io_context, boost::asio::ip::tcp::endpoint(boost::asio::ip::tcp::v4(), port));
+                // std::cout << "Server listening on port " << port << "...\n";
+
+                std::ofstream pfile("/root/GORAM-ABY3/aby3/server_debug-" + std::to_string(i)+".txt", std::ios_base::app);
+
+                debug_info("Server listensing on port" + std::to_string(port), pfile);
+
+                boost::asio::ip::tcp::socket socket(io_context);
+                acceptor.accept(socket);
+
+                // Receive key for authentication
+                char buffer[1024];
+                size_t length = socket.read_some(boost::asio::buffer(buffer));
+                std::string received_hmac(buffer, length);
+
+                // authentication.
+                std::string shared_key = "shared_key";
+                std::string message = "message";
+                unsigned char expected_hmac[EVP_MAX_MD_SIZE];
+                unsigned int hmac_length;
+
+                HMAC(EVP_sha256(), shared_key.c_str(), shared_key.length(),
+                    reinterpret_cast<const unsigned char*>(message.c_str()), message.length(),
+                    expected_hmac, &hmac_length);
+
+                // Compare received HMAC with expected HMAC
+                if (received_hmac != std::string(reinterpret_cast<char*>(expected_hmac), hmac_length)) {
+                    std::cerr << "Invalid HMAC from provider " << i << " on port " << port << ". Closing connection.\n";
+                    // socket.close();
+                    // return;
+                }
+                
+                debug_info("Secure channel established on port " + std::to_string(port) + ".", pfile);
+
+                // Receive data
+                size_t total_length;
+                socket.read_some(boost::asio::buffer(&total_length, sizeof(total_length)));
+
+                std::vector<int> received_data;
+                received_data.reserve(total_length);
+
+                std::vector<int> data_buffer(chunk_size);
+                size_t received_count = 0;
+
+                while(received_count < total_length){
+                    size_t remaining_length = total_length - received_count;
+                    size_t current_chunk_size = std::min(chunk_size, remaining_length);
+
+                    size_t length = socket.read_some(boost::asio::buffer(data_buffer.data(), current_chunk_size * sizeof(int)));
+                    size_t received_integers = length / sizeof(int);
+
+                    received_data.insert(received_data.end(), data_buffer.begin(), data_buffer.begin() + received_integers);
+                    received_count += received_integers;
+
+                    debug_info("Received " + std::to_string(received_count) + " / " + std::to_string(total_length));
+                }
+
+            });
+        }
+    }
+    else{ // data provider.
+        if(provider_id < 0) {
+            std::cerr << "error id " << provider_id << std::endl;
+        }
+
+        std::ofstream pfile("/root/GORAM-ABY3/aby3/provider_debug-" + std::to_string(provider_id)+".txt", std::ios_base::app);
+
+        // setup the channel.
+        boost::asio::io_context io_context;
+        int port = base_port + provider_id;
+        boost::asio::ip::tcp::socket socket(io_context);
+        socket.connect(boost::asio::ip::tcp::endpoint(boost::asio::ip::address::from_string(server_ip), port));
+
+        // send the authentication key.
+        std::string key = "provider_key";
+        boost::asio::write(socket, boost::asio::buffer(key));
+        debug_info("provider " + std::to_string(provider_id) + " sent key");
+
+        // send the data length.
+        int v, e, b, k, l, total_length;
+        std::ifstream meta_file(meta_file_path);
+        meta_file >> v >> e >> b >> k >> l >> total_length;
+
+        boost::asio::write(socket, boost::asio::buffer(&total_length, sizeof(total_length)));
+        std::cout << "Provider sent total data length: " << total_length << " integers.\n";
+
+        std::ifstream data_file(data_file_path, std::ios::binary);
+        if(!data_file.is_open()){
+            debug_info("Failed to open data file: " + data_file_path, pfile);
+            return -1;
+        }
+
+        // send the data.
+        size_t sent_count = 0;
+        std::vector<int> data_buffer(chunk_size);
+
+        while(sent_count < total_length){
+            size_t remaining_size = total_length - sent_count;
+            int current_chunk_size = std::min(chunk_size, remaining_size);
+
+            data_file.read(reinterpret_cast<char*>(data_buffer.data()), current_chunk_size * sizeof(int));
+            size_t read_count = data_file.gcount() / sizeof(int);
+
+            // send data chunk;
+            boost::asio::write(socket, boost::asio::buffer(data_buffer.data() + sent_count, current_chunk_size * sizeof(int)));
+            sent_count += current_chunk_size;
+
+            debug_info("Provider send " + std::to_string(sent_count) + " / " + std::to_string(total_length));
+        }
+
+        data_file.close();
+    }
+    
+
     return 0;
 }
