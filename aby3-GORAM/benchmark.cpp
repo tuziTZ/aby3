@@ -1973,6 +1973,7 @@ int data_preparation(oc::CLP& cmd){
             provider_files[provider_idx] << src << " " << dst << std::endl;
             edges_num[provider_idx]++;
         }
+        edge_idx += 1;
     }
 
     std::vector<std::ofstream> provider_meta_file(N);
@@ -2090,7 +2091,7 @@ int partition_initialization_profiling(oc::CLP& cmd){
 
     std::random_device rd;
     std::mt19937 gen(rd());  // Mersenne Twister generator.
-    const int MOD = 1 << 32;
+    const int MOD = 1 << 30;
     std::uniform_int_distribution<int> dis(1, MOD);  // range from 1-1000.
 
     // pad the random numbers.

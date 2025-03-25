@@ -9,14 +9,16 @@ using namespace aby3;
 
 int main(int argc, char** argv) {
   oc::CLP cmd(argc, argv);
+  debug_info("in main");
   if(cmd.isSet("prepare")){
-	data_preparation(cmd);
+    debug_info("in prepare");
+	  data_preparation(cmd);
   }
   if(cmd.isSet("init")){
-	partition_initialization_profiling(cmd);
+	  partition_initialization_profiling(cmd);
   }
   if(cmd.isSet("transfer")){
-	partition_transmission_profiling(cmd);
+	  partition_transmission_profiling(cmd);
   }
   return 0;
 }
