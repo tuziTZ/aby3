@@ -14,6 +14,12 @@
 #include <aby3/sh3/Sh3Types.h>
 #include <cryptoTools/Common/CLP.h>
 #include <cryptoTools/Network/IOService.h>
+#include <boost/asio.hpp>
+#include <mutex>
+#include <condition_variable>
+#include <chrono>
+#include <openssl/hmac.h>
+#include <openssl/evp.h>
 
 #include "../aby3-RTR/debug.h"
 #include "../aby3-GORAM-Core/Basics.h"
