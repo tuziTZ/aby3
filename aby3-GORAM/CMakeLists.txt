@@ -1,10 +1,12 @@
 
 find_package(OpenMP REQUIRED)
+find_package(OpenSSL REQUIRED)
+
 file(GLOB_RECURSE SRCS *.cpp)
 add_library(aby3-GORAM STATIC ${SRCS})
 
-target_include_directories(aby3-GORAM PUBLIC ${CMAKE_SOURCE_DIR}) 
-target_link_libraries(aby3-GORAM OpenMP::OpenMP_CXX aby3 aby3-GORAM-Core aby3-RTR)
+target_include_directories(aby3-GORAM PUBLIC ${CMAKE_SOURCE_DIR} ${OPENSSL_INCLUDE_DIR}) 
+target_link_libraries(aby3-GORAM OpenMP::OpenMP_CXX OpenSSL::SSL OpenSSL::Crypto aby3 aby3-GORAM-Core aby3-RTR)
 
 target_compile_options(aby3-GORAM PRIVATE ${OpenMP_CXX_FLAGS})
 

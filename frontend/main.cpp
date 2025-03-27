@@ -20,5 +20,8 @@ int main(int argc, char** argv) {
   if(cmd.isSet("transfer")){
 	  partition_transmission_profiling(cmd);
   }
+  if(cmd.isSet("getShare")){
+    random_share_generation(cmd);
+  }
   return 0;
 }

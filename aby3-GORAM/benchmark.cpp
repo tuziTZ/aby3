@@ -2268,21 +2268,24 @@ int partition_transmission_profiling(oc::CLP& cmd){
 
         for (int i = 0; i < N; ++i) {
             int port = base_port + i;
-            server_threads.emplace_back([port, &io_context, i, &chunk_size]() {
-                boost::asio::ip::tcp::acceptor acceptor(io_context, boost::asio::ip::tcp::endpoint(boost::asio::ip::tcp::v4(), port));
-                // std::cout << "Server listening on port " << port << "...\n";
-
+            server_threads.emplace_back([port, &io_context, i, chunk_size]() {
                 std::ofstream pfile("/root/GORAM-ABY3/aby3/server_debug-" + std::to_string(i)+".txt", std::ios_base::app);
+
+                debug_info("Server starting on port " + std::to_string(port), pfile);
+
+                boost::asio::ip::tcp::acceptor acceptor(io_context, boost::asio::ip::tcp::endpoint(boost::asio::ip::tcp::v4(), port));
 
                 debug_info("Server listensing on port" + std::to_string(port), pfile);
 
                 boost::asio::ip::tcp::socket socket(io_context);
                 acceptor.accept(socket);
+                debug_info("Connection established with provider " + std::to_string(i) + " on port " + std::to_string(port), pfile);
 
                 // Receive key for authentication
                 char buffer[1024];
                 size_t length = socket.read_some(boost::asio::buffer(buffer));
                 std::string received_hmac(buffer, length);
+                debug_info("Received HMAC from provider " + std::to_string(i) + " = " + received_hmac, pfile);
 
                 // authentication.
                 std::string shared_key = "shared_key";
@@ -2297,18 +2300,19 @@ int partition_transmission_profiling(oc::CLP& cmd){
                 // Compare received HMAC with expected HMAC
                 if (received_hmac != std::string(reinterpret_cast<char*>(expected_hmac), hmac_length)) {
                     std::cerr << "Invalid HMAC from provider " << i << " on port " << port << ". Closing connection.\n";
-                    // socket.close();
-                    // return;
                 }
                 
                 debug_info("Secure channel established on port " + std::to_string(port) + ".", pfile);
 
                 // Receive data
                 size_t total_length;
-                socket.read_some(boost::asio::buffer(&total_length, sizeof(total_length)));
+                boost::asio::read(socket, boost::asio::buffer(&total_length, sizeof(total_length)));
 
-                std::vector<int> received_data;
-                received_data.reserve(total_length);
+                debug_info("Received total data length: " + std::to_string(total_length), pfile);
+
+                // std::vector<int> received_data;
+                // received_data.reserve(total_length);
+                std::vector<std::vector<int>> reveived_data;
 
                 std::vector<int> data_buffer(chunk_size);
                 size_t received_count = 0;
@@ -2317,17 +2321,29 @@ int partition_transmission_profiling(oc::CLP& cmd){
                     size_t remaining_length = total_length - received_count;
                     size_t current_chunk_size = std::min(chunk_size, remaining_length);
 
-                    size_t length = socket.read_some(boost::asio::buffer(data_buffer.data(), current_chunk_size * sizeof(int)));
-                    size_t received_integers = length / sizeof(int);
+                    // size_t length = socket.read(boost::asio::buffer(data_buffer.data(), current_chunk_size * sizeof(int)));
+                    boost::asio::read(socket, boost::asio::buffer(data_buffer.data(), current_chunk_size * sizeof(int)));
+                    // size_t received_integers = current_chunk_size;
 
-                    received_data.insert(received_data.end(), data_buffer.begin(), data_buffer.begin() + received_integers);
-                    received_count += received_integers;
+                    // received_data.insert(received_data.end(), data_buffer.begin(), data_buffer.begin() + received_integers);
+                    reveived_data.push_back(std::vector<int>(data_buffer.begin(), data_buffer.begin() + current_chunk_size));
+                    received_count += current_chunk_size;
 
-                    debug_info("Received " + std::to_string(received_count) + " / " + std::to_string(total_length));
+                    debug_info("Received " + std::to_string(received_count) + " / " + std::to_string(total_length), pfile);
                 }
 
             });
         }
+
+        io_context.run();
+
+        timer.start("server");
+        for (auto& thread : server_threads) {
+            thread.join();
+        }
+        timer.end("server");
+        std::ofstream stream("/scratch1/data/server_timer-" + std::to_string(N) + ".txt", std::ios::app);
+        timer.print_total("milliseconds", stream);
     }
     else{ // data provider.
         if(provider_id < 0) {
@@ -2336,24 +2352,54 @@ int partition_transmission_profiling(oc::CLP& cmd){
 
         std::ofstream pfile("/root/GORAM-ABY3/aby3/provider_debug-" + std::to_string(provider_id)+".txt", std::ios_base::app);
 
+        timer.start("provider_channel");
         // setup the channel.
         boost::asio::io_context io_context;
         int port = base_port + provider_id;
         boost::asio::ip::tcp::socket socket(io_context);
-        socket.connect(boost::asio::ip::tcp::endpoint(boost::asio::ip::address::from_string(server_ip), port));
 
+        bool connected = false;
+        size_t attempts = 0;
+        while (!connected && attempts < 5) {
+            try {
+                socket.connect(boost::asio::ip::tcp::endpoint(boost::asio::ip::address::from_string(server_ip), port));
+                connected = true;
+                // std::cout << "Connected to server on port " << port << std::endl;
+                debug_info("Connected to server on port " + std::to_string(port), pfile);
+            } catch (const boost::system::system_error& e) {
+                // std::cerr << "Connection attempt " << attempts + 1 << " failed: " << e.what() << std::endl;
+                debug_info("Connection attempt " + std::to_string(attempts + 1) + " failed: " + e.what(), pfile);
+                std::this_thread::sleep_for(std::chrono::seconds(1));  // 等待1秒后重试
+                attempts++;
+            }
+        }
+
+        debug_info("Connected to server on port " + std::to_string(port), pfile);
+        timer.end("provider_channel");
         // send the authentication key.
-        std::string key = "provider_key";
+        // std::string key = "provider_key";
+        timer.start("provider_authentication");
+        char auth_key[1024];
+        std::fill_n(auth_key, 1024, 'A'); // 用'A'填充
+
+        // 加入一些特征字符以便识别
+        const char* marker = "provider_key";
+        std::copy(marker, marker + strlen(marker), auth_key);
+
+        // 转换为string用于传输
+        std::string key(auth_key, 1024);
         boost::asio::write(socket, boost::asio::buffer(key));
-        debug_info("provider " + std::to_string(provider_id) + " sent key");
+        debug_info("provider " + std::to_string(provider_id) + " sent key", pfile);
+        timer.end("provider_authentication");
 
         // send the data length.
-        int v, e, b, k, l, total_length;
+        timer.start("provider_data");
+        size_t total_length;
         std::ifstream meta_file(meta_file_path);
-        meta_file >> v >> e >> b >> k >> l >> total_length;
+        meta_file >> total_length;
 
         boost::asio::write(socket, boost::asio::buffer(&total_length, sizeof(total_length)));
-        std::cout << "Provider sent total data length: " << total_length << " integers.\n";
+        debug_info("Provider sent total data length: " + std::to_string(total_length) + " integers.", pfile);
 
         std::ifstream data_file(data_file_path, std::ios::binary);
         if(!data_file.is_open()){
@@ -2372,16 +2418,80 @@ int partition_transmission_profiling(oc::CLP& cmd){
             data_file.read(reinterpret_cast<char*>(data_buffer.data()), current_chunk_size * sizeof(int));
             size_t read_count = data_file.gcount() / sizeof(int);
 
+            if (read_count != current_chunk_size) {
+                // Data size mismatch, adjust current_chunk_size
+                // current_chunk_size = read_count;
+                debug_info("Data size mismatch, adjust current_chunk_size | read_count - " + std::to_string(read_count) + " | chunk_size = " + std::to_string(current_chunk_size), pfile);
+            }
+
             // send data chunk;
-            boost::asio::write(socket, boost::asio::buffer(data_buffer.data() + sent_count, current_chunk_size * sizeof(int)));
+            boost::asio::write(socket, boost::asio::buffer(data_buffer.data(), current_chunk_size * sizeof(int)));
             sent_count += current_chunk_size;
 
-            debug_info("Provider send " + std::to_string(sent_count) + " / " + std::to_string(total_length));
+            debug_info("Provider send " + std::to_string(sent_count) + " / " + std::to_string(total_length), pfile);
         }
 
         data_file.close();
+        timer.end("provider_data");
+
+        // print the records.
+        if(provider_id == 0){
+            std::ofstream stream("/scratch1/data/provider_timer-" + std::to_string(N) + ".txt", std::ios::app);
+            timer.print_total("milliseconds", stream);
+        }
     }
     
+
+    return 0;
+}
+
+
+int random_share_generation(oc::CLP& cmd){
+
+    SET_STRING_OR_DEFAULT(cmd, data_file_path, "tmp");
+    SET_STRING_OR_DEFAULT(cmd, meta_file_path, "meta");
+    SET_OR_DEFAULT(cmd, total_length, 1024);
+
+    // generate the data.
+    std::ofstream meta_file(meta_file_path);
+    meta_file << total_length << std::endl;
+
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<int> dis(std::numeric_limits<int>::min(), std::numeric_limits<int>::max());
+    
+    try {
+        // 打开文件用于二进制写入
+        std::ofstream file(data_file_path, std::ios::binary);
+        if (!file) {
+            std::cerr << "can not open: " << data_file_path << std::endl;
+            return false;
+        }
+
+        // 分块写入以提高性能
+        const size_t chunk_size = 1024 * 1024; // 1MB chunks
+        std::vector<int> buffer(std::min(chunk_size, total_length));
+        
+        size_t remaining = total_length;
+        while (remaining > 0) {
+            // 确定当前块大小
+            size_t current_chunk = std::min(chunk_size, remaining);
+            buffer.resize(current_chunk);
+            
+            // 生成随机数
+            for (size_t i = 0; i < current_chunk; ++i) {
+                buffer[i] = dis(gen);
+            }
+            
+            // 写入文件
+            file.write(reinterpret_cast<const char*>(buffer.data()), current_chunk * sizeof(int));
+
+            remaining -= current_chunk;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "An error occurred: " << e.what() << std::endl;
+        return false;
+    }
 
     return 0;
 }

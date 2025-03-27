@@ -54,3 +54,4 @@ int shuffMem_profiling(oc::CLP& cmd);
 int data_preparation(oc::CLP& cmd);
 int partition_initialization_profiling(oc::CLP& cmd);
 int partition_transmission_profiling(oc::CLP& cmd);
+int random_share_generation(oc::CLP& cmd);
