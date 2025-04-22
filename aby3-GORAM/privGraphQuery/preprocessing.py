@@ -173,9 +173,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     dataset = args.target
 
-    # for dataset in target_dataset:
-    #     print("Start dataset %s"%(dataset))
-        # k = configurations[dataset]["k"]
     k = -1
     edge_list_file = generate_edge_list(dataset)
     
@@ -217,6 +214,27 @@ if __name__ == "__main__":
         graph_save(graph, real_world_data_folder + dataset, "2dpartition", k, True)
         graph_save(graph, real_world_data_folder + dataset, "edgelist", -1, False)
         print("Finish dataset %s"%(dataset))
+
+        
+    # generate property file.
+    meta_file = real_world_data_folder + dataset + "_meta.txt"
+    with open(meta_file, "r") as f:
+        line = f.readline()
+        v, e, b, k, l = map(int, line.split())
+        
+    property_file = real_world_data_folder + dataset + "_2dproperty.txt"
+    with open(property_file, "w") as f:
+        for i in range(b*b):
+            for j in range(l):
+                random_number = random.randint(1, 10000)
+                f.write(f"{random_number}\n")
+    
+    # generate the random edgelist.
+    property_edgelist_file = real_world_data_folder + dataset + "_edge_list_property.txt"
+    with open(property_edgelist_file, "w") as f:
+        for i in range(e):
+            random_number = random.randint(1, 10000)
+            f.write(f"{random_number}\n")
 
     # data synchronize
     # for party in party_list:

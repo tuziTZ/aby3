@@ -14,7 +14,9 @@ main_record_folder = MAIN_FOLDER + "/record/real_world/"
 mpi_data_folder = MAIN_FOLDER + "/data/realworld_mpi/"
 
 n_stash_size, n_pack_size, e_stash_size, e_pack_size = 32, 16, 1024, 32
-test_format = ["privGraph", "edgelist"]
+test_format = ["privGraph", "edgelist", "cycle_detect", "neighbor_stats", "cycle_detect_edgelist", "neighbor_stats_edgelist"]
+
+# advanced_query_list = ["cycle_detect", "neighbor_stats", "cycle_detect_edgelist", "neighbor_stats_edgelist"]
 
 def data_synchronize(data_folder):
     os.system(f"ssh aby31 'rm -rf {data_folder}*'")
@@ -38,6 +40,7 @@ if __name__ == "__main__":
     parser.add_argument('--MPI', type=bool, default=MPI, help="MPI mode")
     parser.add_argument('--MPI_TASK', type=int, default=MPI_TASK, help="MPI task numbers")
     parser.add_argument('--data_folder', type=str, default=real_world_data_folder, help="origional data folder")
+    parser.add_argument('--rcounter', type=int, default=1, help="experiments counter")
     args = parser.parse_args()
     
     target = args.target
@@ -62,7 +65,7 @@ if __name__ == "__main__":
         if(not os.path.exists(target_record_folder)):
             os.makedirs(target_record_folder)
 
-        run_args = f" -{gformat} -prefix {target} -rcounter 1 -noram_stash_size {n_stash_size} -eoram_stash_size {e_stash_size} -noram_pack_size {n_pack_size} -eoram_pack_size {e_pack_size} -data_folder {real_world_data_folder} -record_folder {target_record_folder}"
+        run_args = f" -{gformat} -prefix {target} -rcounter {args.rcounter} -noram_stash_size {n_stash_size} -eoram_stash_size {e_stash_size} -noram_pack_size {n_pack_size} -eoram_pack_size {e_pack_size} -data_folder {real_world_data_folder} -record_folder {target_record_folder}"
 
         print(run_args)
         if(MPI):

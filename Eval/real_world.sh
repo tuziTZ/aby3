@@ -51,7 +51,7 @@ if [ -f "$real_world_folder/com-dblp.all.cmty.txt" ]; then
 else
     download_and_extract https://snap.stanford.edu/data/bigdata/communities/com-dblp.all.cmty.txt.gz $real_world_folder/
 fi
-python ./aby3-GORAM/privGraphQuery/preprocessing.py --target dblp
+# python ./aby3-GORAM/privGraphQuery/preprocessing.py --target dblp
 python ./GORAM/real_world_graph_analysis.py --target dblp;
 
 cp -r ./aby3-GORAM/data/real_world/* $record_folder/

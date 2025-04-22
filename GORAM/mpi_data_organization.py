@@ -5,7 +5,7 @@ import os
 
 MPI_TASK = 4
 
-MAIN_FOLDER = "/root/aby3/aby3-GORAM"
+MAIN_FOLDER = "/root/GORAM-ABY3/aby3/aby3-GORAM"
 origional_data_folder = MAIN_FOLDER + "/data/realworld/" 
 mpi_data_folder = MAIN_FOLDER + "/data/realworld_mpi/"
 

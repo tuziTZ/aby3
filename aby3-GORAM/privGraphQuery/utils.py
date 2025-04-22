@@ -13,9 +13,11 @@ def set_random_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
 
-def get_k(V, E, B=1024):
+def get_k(V, E, B=1024, maxB=8):
     B = max(B, V)
     k = int(np.ceil(B*V/E))
+    max_k = int(np.ceil(V/maxB))
+    k = min(k, max_k)
     k = 2**math.floor(math.log2(k))
     
     return k
