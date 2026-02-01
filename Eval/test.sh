@@ -2,17 +2,25 @@
 cp ./frontend/main.test ./frontend/main.cpp
 current_path=$(pwd)
 debugFile="${current_path}/debug.txt"
+<<<<<<< HEAD
 graphFolder="${current_path}/aby3-GORAM/data/"
 echo "Current path: ${debugFile}"
 python build.py --DEBUG_FILE ${debugFile} --GRAPH_FOLDER ${graphFolder}
+=======
+# echo "Current path: ${current_path}"
+python build.py --DEBUG_FILE ${debugFile}
+>>>>>>> origin/ladnir_aby3
 
 # clean debugging files party-*.txt if exist.
 for pfile in ./party-*.txt; do
     rm ${pfile};
 done
 
+<<<<<<< HEAD
 ./Eval/graph_test.sh
 
+=======
+>>>>>>> origin/ladnir_aby3
 # # synchronize with others
 # scp ./out/build/linux/frontend/frontend aby31:~/aby3/out/build/linux/frontend/ &
 # scp ./out/build/linux/frontend/frontend aby32:~/aby3/out/build/linux/frontend/ &
@@ -25,6 +33,7 @@ done
 # 3) -ORAM : ORAM tests; 
 # 4) -Init : initialization tests, including the correlated shares; 
 # 5) -Shuffle : secure shuffling tests.
+<<<<<<< HEAD
 # 6) -Graph : basic graph loading tests.
 # 7) -GraphQuery : basic graph query tests (block fetching, edge exist & outting edges count.)
 # 8) -Comm : test inter-party communication.
@@ -40,5 +49,16 @@ test_args=" -Shuffle -Sort -Graph -GraphQuery"
 ./Eval/dis_exec.sh "${test_args}"
 wait;
 
+=======
+# 8) -Comm : test inter-party communication.
+# 9) -Sort : test the sort functions.
+test_args=" -Bool -Arith -Sort -ORAM"
+./Eval/dis_exec.sh "${test_args}"
+wait;
+
+# scp aby31:~/aby3/debug.txt ./debug-p1.txt
+# scp aby32:~/aby3/debug.txt ./debug-p2.txt
+
+>>>>>>> origin/ladnir_aby3
 cat ./debug.txt
 rm ./debug.txt

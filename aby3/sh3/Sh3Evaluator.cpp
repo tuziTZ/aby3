@@ -97,9 +97,14 @@ namespace aby3
 				// 	= A.mShares[0] * B.mShares[0]
 				// 	+ A.mShares[0] * B.mShares[1]
 				// 	+ A.mShares[1] * B.mShares[0];
+				// C.mShares[0]
+				// 	= A.mShares[0] * B.mShares[0]
+				// 	+ A.mShares[0] * B.mShares[1]
+				// 	+ A.mShares[1] * B.mShares[0];
 
 				for (u64 i = 0; i < C.size(); ++i)
 				{
+					C.mShares[0](i) = A.mShares[0](i) * B.mShares[0](i) + A.mShares[0](i) * B.mShares[1](i) + A.mShares[1](i) * B.mShares[0](i);
 					C.mShares[0](i) = A.mShares[0](i) * B.mShares[0](i) + A.mShares[0](i) * B.mShares[1](i) + A.mShares[1](i) * B.mShares[0](i);
 					C.mShares[0](i) += mShareGen.getShare();
 				}

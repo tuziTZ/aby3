@@ -38,7 +38,11 @@ int main(int argc, char** argv) {
 
 	if(cmd.isSet("Shuffle")){
 		shuffle_test(cmd);
+<<<<<<< HEAD
 		permutation_network_test(cmd);
+=======
+		// large_scale_shuffle_test(cmd); // large-scale test, costs at least 150GB+ memory.
+>>>>>>> origin/ladnir_aby3
 	}
 
 	if(cmd.isSet("ORAM")){
@@ -46,6 +50,7 @@ int main(int argc, char** argv) {
 		sqrt_oram_test(cmd);
 	}
 
+<<<<<<< HEAD
 	if(cmd.isSet("Graph")){
 		graph_loading_test(cmd);
 		adj_graph_loading_test(cmd);
@@ -60,6 +65,8 @@ int main(int argc, char** argv) {
 		node_edge_list_basic_graph_query_test(cmd);	
 	}
 
+=======
+>>>>>>> origin/ladnir_aby3
 	if(cmd.isSet("Sort")){
 		bc_sort_test(cmd);
 		bc_sort_corner_test(cmd);
@@ -67,6 +74,7 @@ int main(int argc, char** argv) {
 		quick_sort_test(cmd);
 		// quick_sort_with_duplicate_elements_test(cmd); // too slow
 		odd_even_merge_test(cmd);
+<<<<<<< HEAD
 		arith_merge_sort_test(cmd);
 		arith_sort_test(cmd);
 		arith_sort_with_values_test(cmd);
@@ -74,6 +82,8 @@ int main(int argc, char** argv) {
 
 	if(cmd.isSet("LR")){
 		lr_test(cmd);
+=======
+>>>>>>> origin/ladnir_aby3
 	}
   return 0;
 }
