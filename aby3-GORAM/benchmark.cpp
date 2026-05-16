@@ -1,0 +1,2503 @@
+#include "benchmark.h"
+
+using namespace oc;
+using namespace aby3;
+
+#ifndef GRAPH_FOLDER
+#define GRAPH_FOLDER "/root/aby3/aby3-GORAM/data/" 
+#endif
+
+static std::string graph_folder = GRAPH_FOLDER;
+static size_t pos = graph_folder.find_last_of('/', graph_folder.length() - 2);
+static std::string base_folder = graph_folder.substr(0, pos + 1);
+
+
+#define SET_OR_DEFAULT(cmd, key, default_value) \
+    size_t key = default_value; \
+    if(cmd.isSet(#key)){ \
+        auto keys = cmd.getMany<size_t>(#key); \
+        key = keys[0]; \
+    } \
+    else{ \
+        debug_info(#key " is not set, using default value: " + std::to_string(key)); \
+    }
+
+#define SET_STRING_OR_DEFAULT(cmd, key, default_value) \
+    std::string key = default_value; \
+    if(cmd.isSet(#key)){ \
+        auto keys = cmd.getMany<std::string>(#key); \
+        key = keys[0]; \
+    } \
+    else{ \
+        debug_info(#key " is not set, using default value: " + key); \
+    }
+
+#define CONFIG_INIT \
+    int role = -1; \
+    if (cmd.isSet("role")) { \
+        auto keys = cmd.getMany<int>("role"); \
+        role = keys[0]; \
+    } \
+    if (role == -1) { \
+        throw std::runtime_error(LOCATION); \
+    } \
+    IOService ios; \
+    Sh3Encryptor enc; \
+    Sh3Evaluator eval; \
+    Sh3Runtime runtime; \
+    basic_setup((u64)role, ios, enc, eval, runtime); \
+    aby3Info party_info(role, enc, eval, runtime); \
+    Timer& timer = Timer::getInstance(); \
+    timer.clear_records();
+
+
+#define MPI_INIT \ 
+    int role = -1; \
+    if (cmd.isSet("role")) { \
+        auto keys = cmd.getMany<int>("role"); \
+        role = keys[0]; \
+    } \
+    if (role == -1) { \
+        throw std::runtime_error(LOCATION); \
+    } \
+    IOService ios; \
+    Sh3Encryptor enc; \
+    Sh3Evaluator eval; \
+    Sh3Runtime runtime; \
+    int rank; \
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank); \
+    int total_tasks; \
+    MPI_Comm_size(MPI_COMM_WORLD, &total_tasks); \
+    multi_processor_setup((u64)role, rank, ios, enc, eval, runtime); \
+    aby3Info party_info(role, enc, eval, runtime); \
+    Timer& timer = Timer::getInstance(); \
+    timer.clear_records();
+
+struct Edge {
+    int src;
+    int dst;
+    size_t grid_idx; 
+};
+
+size_t get_sending_bytes(aby3Info &party_info){
+    size_t send_next = party_info.runtime->mComm.mNext.getTotalDataSent();
+    size_t send_prev = party_info.runtime->mComm.mPrev.getTotalDataSent();
+    return send_next + send_prev;
+}
+
+size_t get_receiving_bytes(aby3Info &party_info){
+    size_t recv_next = party_info.runtime->mComm.mNext.getTotalDataRecv();
+    size_t recv_prev = party_info.runtime->mComm.mPrev.getTotalDataRecv();
+    return recv_next + recv_prev;
+}
+
+void clear_sending_reveiving_bytes(aby3Info &party_info){
+    party_info.runtime->mComm.mNext.resetStats();
+    party_info.runtime->mComm.mPrev.resetStats();
+    return;
+}
+
+void communication_synchronize(aby3Info &party_info){
+
+    CommunicationMeter& cmeter = CommunicationMeter::getInstance();
+    // synchronize the communications to the 0-party.
+    std::vector<uint64_t> communications_value;
+    std::vector<std::string> key_set;
+    for(const auto& pair : cmeter.communications){
+        std::string key = pair.first;
+        uint64_t comm = pair.second;
+        communications_value.push_back(comm);
+        key_set.push_back(key);
+    }
+
+    std::vector<uint64_t> comm_next(communications_value.size());
+    std::vector<uint64_t> comm_prev(communications_value.size());
+
+    if(party_info.pIdx == 0){
+        auto tmp_next = party_info.runtime->mComm.mNext.asyncRecv(comm_next.data(), comm_next.size());
+        auto tmp_prev = party_info.runtime->mComm.mPrev.asyncRecv(comm_prev.data(), comm_prev.size());
+        tmp_next.get();
+        tmp_prev.get();
+    }
+    if(party_info.pIdx == 1){
+        auto tmp = party_info.runtime->mComm.mPrev.asyncSendFuture<uint64_t>(communications_value.data(), communications_value.size());
+        tmp.get();
+    }
+    if(party_info.pIdx == 2){
+        auto tmp = party_info.runtime->mComm.mNext.asyncSendFuture<uint64_t>(communications_value.data(), communications_value.size());
+        tmp.get();
+    }
+
+    if(party_info.pIdx == 0){
+        for(size_t i=0; i<key_set.size(); i++){
+            std::string key = key_set[i];
+            cmeter.totalCommunications[key] = {communications_value[i], comm_next[i], comm_prev[i]};
+        }
+    }
+
+    return;
+}
+
+int privGraph_performance_profiling(oc::CLP& cmd){
+
+    #ifdef MPI_APP
+    MPI_INIT
+    #else
+    CONFIG_INIT
+    if(role == 0) debug_info("in this function!!!!");
+    #endif
+
+    // get the graph file parameters.
+    std::string graph_data_folder = graph_folder + "baseline/";
+    std::string file_prefix = "tmp";
+    std::string record_folder = base_folder + "record/privGraph/";
+    int record_counter = -1;
+
+    if(cmd.isSet("prefix")){
+        auto keys = cmd.getMany<std::string>("prefix");
+        file_prefix = keys[0];
+    }
+    else{
+        THROW_RUNTIME_ERROR("prefix must be set!");
+    }
+
+    if(cmd.isSet("rcounter")){
+        auto keys = cmd.getMany<int>("rcounter");
+        record_counter = keys[0];
+    }
+    else{
+        THROW_RUNTIME_ERROR("rcounter must be set!");
+    }
+
+    if(cmd.isSet("data_folder")){
+        auto keys = cmd.getMany<std::string>("data_folder");
+        graph_data_folder = keys[0];
+        if(role == 0) debug_info("data_folder: " + graph_data_folder);
+    }
+
+    if(cmd.isSet("record_folder")){
+        auto keys = cmd.getMany<std::string>("record_folder");
+        record_folder = keys[0];
+        if(role == 0) debug_info("record_folder: " + record_folder);
+    }
+
+    std::string meta_file = graph_data_folder + file_prefix + "_meta.txt";
+    std::string graph_data_file = graph_data_folder + file_prefix + "_2dpartition.txt";
+    std::string record_file = record_folder + file_prefix + "-" + std::to_string(record_counter) + ".txt";
+
+    if (role == 0) debug_info("Profiling the privGraph Query Engine...");
+
+    // get the oram configurations, todo - define the parameters.
+    size_t noram_stash_size = 1 << 4;
+    size_t noram_pack_size = 1 << 2;
+    size_t eoram_stash_size = 1 << 8;
+    size_t eoram_pack_size = 1 << 4;
+
+    if(cmd.isSet("noram_stash_size")){
+        auto keys = cmd.getMany<size_t>("noram_stash_size");
+        noram_stash_size = keys[0];
+    }
+    else{
+        debug_info("noram_stash_size is not set, using default value: " + std::to_string(noram_stash_size));
+    }
+    if(cmd.isSet("noram_pack_size")){
+        auto keys = cmd.getMany<size_t>("noram_pack_size");
+        noram_pack_size = keys[0];
+    }
+    else{
+        debug_info("noram_pack_size is not set, using default value: " + std::to_string(noram_pack_size));
+    }
+    if(cmd.isSet("eoram_stash_size")){
+        auto keys = cmd.getMany<size_t>("eoram_stash_size");
+        eoram_stash_size = keys[0];
+    }
+    else{
+        debug_info("eoram_stash_size is not set, using default value: " + std::to_string(eoram_stash_size));
+    }
+    if(cmd.isSet("eoram_pack_size")){
+        auto keys = cmd.getMany<size_t>("eoram_pack_size");
+        eoram_pack_size = keys[0];
+    }
+    else{
+        debug_info("eoram_pack_size is not set, using default value: " + std::to_string(eoram_pack_size));
+    }
+
+    if(role == 0) debug_info("Getting oram configs success");
+
+    if(role == 0) debug_info("Environment setup success");
+
+    // load the graph.
+    CommunicationMeter& cmeter = CommunicationMeter::getInstance();
+
+    cmeter.start("GraphLoad_send", get_sending_bytes(party_info));
+    cmeter.start("GraphLoad_recv", get_receiving_bytes(party_info));
+
+    if(role == 0) debug_info("sending_bytes = " + std::to_string(get_sending_bytes(party_info)) + " | reveiving_bytes = " + std::to_string(get_receiving_bytes(party_info)));
+
+    timer.start("GraphLoad");
+
+    GraphQueryEngine secGraphEngine(party_info, meta_file, graph_data_file);
+
+    timer.end("GraphLoad");
+    cmeter.end("GraphLoad_send", get_sending_bytes(party_info));
+    cmeter.end("GraphLoad_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+
+    if(role == 0) debug_info("Graph loaded successfully!");
+
+    // oram construction.
+    if(role == 0) debug_info("Eoram construction...");
+
+    cmeter.start("EdgeOramInit_send", get_sending_bytes(party_info));
+    cmeter.start("EdgeOramInit_recv", get_receiving_bytes(party_info));
+    timer.start("EdgeOramInit");
+
+    secGraphEngine.edge_block_oram_initialization(eoram_stash_size, eoram_pack_size);
+
+    timer.end("EdgeOramInit");
+    cmeter.end("EdgeOramInit_send", get_sending_bytes(party_info));
+    cmeter.end("EdgeOramInit_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    if(role == 0) debug_info("Eoram init success\nNoram construction...");
+
+    size_t b = secGraphEngine.graph->b;
+    size_t b2 = secGraphEngine.graph->edge_list_size;
+    size_t v = secGraphEngine.graph->v;
+
+    eoram_stash_size = secGraphEngine.edge_block_oram->S;
+
+    // basic graph query process.
+    size_t ps = 0, pe = v-1;
+    boolIndex snode = boolIndex(secGraphEngine.get_block_index(ps), role);
+    boolIndex enode = boolIndex(secGraphEngine.get_block_index(pe), role);
+    boolIndex edge_log_idx = boolIndex(secGraphEngine.get_edge_block_index(ps, pe), role);
+    boolIndex snode_log_idx = boolIndex(secGraphEngine.get_block_index(ps), role);
+
+    // 1) edge existence query.
+    cmeter.start("EdgeExistQuery_send", get_sending_bytes(party_info));
+    cmeter.start("EdgeExistQuery_recv", get_receiving_bytes(party_info));
+
+    #ifdef MPI_APP
+    MPI_Barrier(MPI_COMM_WORLD);
+    #endif
+
+    timer.start("EdgeExistQuery");
+
+    for(int i=0; i<1; i++){ // set to 1 for quick profiling of communications; for performance profiling, set to eoram_stash_size.
+        boolShare flag = edge_existance(snode, enode, edge_log_idx, secGraphEngine);
+    }
+    #ifdef MPI_APP
+    MPI_Barrier(MPI_COMM_WORLD);
+    #endif
+    timer.end("EdgeExistQuery");
+    cmeter.end("EdgeExistQuery_send", get_sending_bytes(party_info));
+    cmeter.end("EdgeExistQuery_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    if(role == 0) debug_info("Edge existence query success");
+
+    delete secGraphEngine.edge_block_oram;
+
+    cmeter.start("NodeOramInit_send", get_sending_bytes(party_info));
+    cmeter.start("NodeOramInit_recv", get_receiving_bytes(party_info));
+    timer.start("NodeOramInit");
+
+    secGraphEngine.node_edges_oram_initialization(noram_stash_size, noram_pack_size); 
+    noram_stash_size = secGraphEngine.node_edges_oram->S;
+
+    timer.end("NodeOramInit");
+    cmeter.end("NodeOramInit_send", get_sending_bytes(party_info));
+    cmeter.end("NodeOramInit_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    if(role == 0) debug_info("Noram init success");
+
+    // 2) outting edges count query.
+    cmeter.start("OuttingEdgesCountQuery_send", get_sending_bytes(party_info));
+    cmeter.start("OuttingEdgesCountQuery_recv", get_receiving_bytes(party_info));
+    #ifdef MPI_APP
+    MPI_Barrier(MPI_COMM_WORLD);
+    #endif
+    timer.start("OuttingEdgesCountQuery");
+    for(int i=0; i<1; i++){ // set to 1 for quick profiling of communications; for performance profiling, set to noram_stash_size.
+        aby3::si64Matrix out_edges = outting_edge_count(snode, snode_log_idx, secGraphEngine);
+    }
+    #ifdef MPI_APP
+    MPI_Barrier(MPI_COMM_WORLD);
+    #endif
+    timer.end("OuttingEdgesCountQuery");
+    cmeter.end("OuttingEdgesCountQuery_send", get_sending_bytes(party_info));
+    cmeter.end("OuttingEdgesCountQuery_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    if(role == 0) debug_info("Outting edges count query success");
+
+    if(role == 0) debug_info("Neighbors get query begin!");
+
+    cmeter.start("NeighborsGetQuery_send", get_sending_bytes(party_info));
+    cmeter.start("NeighborsGetQuery_recv", get_receiving_bytes(party_info));
+    #ifdef MPI_APP
+    MPI_Barrier(MPI_COMM_WORLD);
+    #endif
+    timer.start("NeighborsGetQuery");
+    for(size_t i=0; i<1; i++){ // set to 1 for quick profiling of communications; for performance profiling, set to noram_stash_size.
+        aby3::sbMatrix neighbors = outting_neighbors_sorted(snode, snode_log_idx, secGraphEngine);
+    }
+    #ifdef MPI_APP
+    MPI_Barrier(MPI_COMM_WORLD);
+    #endif
+    timer.end("NeighborsGetQuery");
+    cmeter.end("NeighborsGetQuery_send", get_sending_bytes(party_info));
+    cmeter.end("NeighborsGetQuery_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    if(role == 0) debug_info("Neighbors get query success");
+
+    communication_synchronize(party_info);
+
+    #ifdef MPI_APP
+    if((role == 0) && (rank == 0)){
+    #else
+    if(role == 0){
+    #endif
+        std::ofstream stream(record_file, std::ios::app);
+        secGraphEngine.print_configs(stream);
+        timer.print_total("milliseconds", stream);
+        cmeter.print_total_per_party("MB", stream);
+    }
+
+    return 0;
+}
+
+int adj_performance_profiling(oc::CLP& cmd){
+
+    // get the configs.
+    int role = -1;
+    if (cmd.isSet("role")) {
+        auto keys = cmd.getMany<int>("role");
+        role = keys[0];
+    }
+    if (role == -1) {
+        throw std::runtime_error(LOCATION);
+    }
+
+    // get the graph file parameters.
+    std::string graph_data_folder = graph_folder + "baseline/";
+    std::string file_prefix = "tmp";
+    std::string record_folder = base_folder + "record/adjmat/";
+    int record_counter = -1;
+
+    if(cmd.isSet("prefix")){
+        auto keys = cmd.getMany<std::string>("prefix");
+        file_prefix = keys[0];
+    }
+    else{
+        THROW_RUNTIME_ERROR("prefix must be set!");
+    }
+
+    if(cmd.isSet("rcounter")){
+        auto keys = cmd.getMany<int>("rcounter");
+        record_counter = keys[0];
+    }
+    else{
+        THROW_RUNTIME_ERROR("rcounter must be set!");
+    }
+
+    if(cmd.isSet("data_folder")){
+        auto keys = cmd.getMany<std::string>("data_folder");
+        graph_data_folder = keys[0];
+        if(role == 0) debug_info("data_folder: " + graph_data_folder);
+    }
+
+    if(cmd.isSet("record_folder")){
+        auto keys = cmd.getMany<std::string>("record_folder");
+        record_folder = keys[0];
+        if(role == 0) debug_info("record_folder: " + record_folder);
+    }
+
+    std::string meta_file = graph_data_folder + file_prefix + "_edge_list_meta.txt";
+    std::string graph_data_file = graph_data_folder + file_prefix + "_edge_list.txt";
+    std::string record_file = record_folder + file_prefix + "-" + std::to_string(record_counter) + ".txt";
+
+    if (role == 0) debug_info("Profiling the Mat Query Engine...");
+
+    // get the oram configurations, todo - define the parameters.
+    size_t noram_stash_size = 1 << 4;
+    size_t noram_pack_size = 1 << 2;
+    size_t eoram_stash_size = 1 << 8;
+    size_t eoram_pack_size = 1 << 4;
+
+    if(cmd.isSet("noram_stash_size")){
+        auto keys = cmd.getMany<size_t>("noram_stash_size");
+        noram_stash_size = keys[0];
+    }
+    else{
+        debug_info("noram_stash_size is not set, using default value: " + std::to_string(noram_stash_size));
+    }
+    if(cmd.isSet("noram_pack_size")){
+        auto keys = cmd.getMany<size_t>("noram_pack_size");
+        noram_pack_size = keys[0];
+    }
+    else{
+        debug_info("noram_pack_size is not set, using default value: " + std::to_string(noram_pack_size));
+    }
+    if(cmd.isSet("eoram_stash_size")){
+        auto keys = cmd.getMany<size_t>("eoram_stash_size");
+        eoram_stash_size = keys[0];
+    }
+    else{
+        debug_info("eoram_stash_size is not set, using default value: " + std::to_string(eoram_stash_size));
+    }
+    if(cmd.isSet("eoram_pack_size")){
+        auto keys = cmd.getMany<size_t>("eoram_pack_size");
+        eoram_pack_size = keys[0];
+    }
+    else{
+        debug_info("eoram_pack_size is not set, using default value: " + std::to_string(eoram_pack_size));
+    }
+
+    if(role == 0) debug_info("Getting oram configs success");
+
+    // setup communications.
+    IOService ios;
+    Sh3Encryptor enc;
+    Sh3Evaluator eval;
+    Sh3Runtime runtime;
+    basic_setup((u64)role, ios, enc, eval, runtime);
+    aby3Info party_info(role, enc, eval, runtime);
+
+    if(role == 0) debug_info("Environment setup success");
+
+    // get the timer.
+    Timer& timer = Timer::getInstance();
+    timer.clear_records();
+    CommunicationMeter& cmeter = CommunicationMeter::getInstance();
+
+    // graph loading.
+    cmeter.start("GraphLoad_send", get_sending_bytes(party_info));
+    cmeter.start("GraphLoad_recv", get_receiving_bytes(party_info));
+    timer.start("GraphLoad");
+    AdjGraphQueryEngine adjGraphEngine(party_info, meta_file, graph_data_file);
+    timer.end("GraphLoad");
+    cmeter.end("GraphLoad_send", get_sending_bytes(party_info));
+    cmeter.end("GraphLoad_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    if(role == 0) debug_info("Graph loaded successfully!");
+
+    // oram construction.
+    if(role == 0) debug_info("Eoram construction...");
+    cmeter.start("EdgeOramInit_send", get_sending_bytes(party_info));
+    cmeter.start("EdgeOramInit_recv", get_receiving_bytes(party_info));
+    timer.start("EdgeOramInit");
+    adjGraphEngine.edge_oram_initialization(eoram_stash_size, eoram_pack_size);
+    timer.end("EdgeOramInit");
+    cmeter.end("EdgeOramInit_send", get_sending_bytes(party_info));
+    cmeter.end("EdgeOramInit_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    if(role == 0) debug_info("Eoram init success\nNoram construction...");
+
+    cmeter.start("NodeOramInit_send", get_sending_bytes(party_info));
+    cmeter.start("NodeOramInit_recv", get_receiving_bytes(party_info));
+    timer.start("NodeOramInit");
+    adjGraphEngine.node_oram_initialization(noram_stash_size, noram_pack_size);
+    timer.end("NodeOramInit");
+    cmeter.end("NodeOramInit_send", get_sending_bytes(party_info));
+    cmeter.end("NodeOramInit_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    eoram_stash_size = adjGraphEngine.edge_oram->S;
+    noram_stash_size = adjGraphEngine.node_oram->S;
+
+    if(role == 0) debug_info("Noram init success");
+
+    // 1) edge existence query.
+    size_t v = adjGraphEngine.graph->v;
+    size_t ps = 0, pe = v-1;
+    boolIndex snode = boolIndex(ps, role);
+    boolIndex enode = boolIndex(pe, role);
+
+    cmeter.start("EdgeExistQuery_send", get_sending_bytes(party_info));
+    cmeter.start("EdgeExistQuery_recv", get_receiving_bytes(party_info));
+    timer.start("EdgeExistQuery");
+    for(int i=0; i<1; i++){ // set to 1 for quick profiling of communications; for performance profiling, set to eoram_stash_size.
+        boolShare flag = edge_existance(snode, enode, adjGraphEngine);
+    }
+    timer.end("EdgeExistQuery");
+    cmeter.end("EdgeExistQuery_send", get_sending_bytes(party_info));
+    cmeter.end("EdgeExistQuery_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    if(role == 0) debug_info("Edge existence query success");
+
+    // 2) outting edges count query.
+    cmeter.start("OuttingEdgesCountQuery_send", get_sending_bytes(party_info));
+    cmeter.start("OuttingEdgesCountQuery_recv", get_receiving_bytes(party_info));
+    timer.start("OuttingEdgesCountQuery");
+    for(int i=0; i<noram_stash_size; i++){
+        aby3::sbMatrix out_edges = outting_edge_count(snode, adjGraphEngine);
+    }
+    timer.end("OuttingEdgesCountQuery");
+    cmeter.end("OuttingEdgesCountQuery_send", get_sending_bytes(party_info));
+    cmeter.end("OuttingEdgesCountQuery_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    // 3) neighbors get query.
+    adjGraphEngine.node_oram_initialization(noram_stash_size, noram_pack_size);
+    cmeter.start("NeighborsGetQuery_send", get_sending_bytes(party_info));
+    cmeter.start("NeighborsGetQuery_recv", get_receiving_bytes(party_info));
+    timer.start("NeighborsGetQuery");
+    for(size_t i=0; i<1; i++){ // set to 1 for quick profiling of communications; for performance profiling, set to noram_stash_size.
+        aby3::sbMatrix neighbors = outting_neighbors(snode, adjGraphEngine);
+    }
+    timer.end("NeighborsGetQuery");
+    cmeter.end("NeighborsGetQuery_send", get_sending_bytes(party_info));
+    cmeter.end("NeighborsGetQuery_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    // print the timer records.
+    communication_synchronize(party_info);
+    if(role == 0){
+        std::ofstream stream(record_file, std::ios::app);
+        adjGraphEngine.print_configs(stream);
+        timer.print_total("milliseconds", stream);
+        // cmeter.print_total("MB", stream);
+        cmeter.print_total_per_party("MB", stream);
+    }
+
+    return 0;
+}
+
+int list_performance_profiling(oc::CLP& cmd){
+
+    // get the configs.
+    // int role = -1;
+    // if (cmd.isSet("role")) {
+    //     auto keys = cmd.getMany<int>("role");
+    //     role = keys[0];
+    // }
+    // if (role == -1) {
+    //     throw std::runtime_error(LOCATION);
+    // }
+
+    #ifdef MPI_APP
+    MPI_INIT
+    #else
+    CONFIG_INIT
+    if(role == 0) debug_info("in this function!!!!");
+    #endif
+
+    // get the graph file parameters.
+    std::string graph_data_folder = graph_folder + "baseline/";
+    std::string file_prefix = "tmp";
+    std::string record_folder = base_folder + "record/edgelist/";
+    int record_counter = -1;
+
+    if(cmd.isSet("prefix")){
+        auto keys = cmd.getMany<std::string>("prefix");
+        file_prefix = keys[0];
+    }
+    else{
+        THROW_RUNTIME_ERROR("prefix must be set!");
+    }
+
+    if(cmd.isSet("rcounter")){
+        auto keys = cmd.getMany<int>("rcounter");
+        record_counter = keys[0];
+    }
+    else{
+        THROW_RUNTIME_ERROR("rcounter must be set!");
+    }
+
+    if(cmd.isSet("data_folder")){
+        auto keys = cmd.getMany<std::string>("data_folder");
+        graph_data_folder = keys[0];
+        if(role == 0) debug_info("data_folder: " + graph_data_folder);
+    }
+    if(cmd.isSet("record_folder")){
+        auto keys = cmd.getMany<std::string>("record_folder");
+        record_folder = keys[0];
+        if(role == 0) debug_info("record_folder: " + record_folder);
+    }
+
+    std::string meta_file = graph_data_folder + file_prefix + "_edge_list_meta.txt";
+    std::string graph_data_file = graph_data_folder + file_prefix + "_edge_list.txt";
+    std::string record_file = record_folder + file_prefix + "-" + std::to_string(record_counter) + ".txt";
+
+    if (role == 0) debug_info("Profiling the Edgelist Query Engine...");
+
+    // // setup communications.
+    // IOService ios;
+    // Sh3Encryptor enc;
+    // Sh3Evaluator eval;
+    // Sh3Runtime runtime;
+    // basic_setup((u64)role, ios, enc, eval, runtime);
+    // aby3Info party_info(role, enc, eval, runtime);
+
+    if(role == 0) debug_info("Environment setup success");
+
+    // // get the timer.
+    // Timer& timer = Timer::getInstance();
+    // timer.clear_records();
+    CommunicationMeter& cmeter = CommunicationMeter::getInstance();
+
+    // graph loading.
+    cmeter.start("GraphLoad_send", get_sending_bytes(party_info));
+    cmeter.start("GraphLoad_recv", get_receiving_bytes(party_info));
+    timer.start("GraphLoad");
+    plainGraphList plainGraph(meta_file, graph_data_file);
+    ListGraphQueryEngine listGraphEngine(party_info, plainGraph);
+    timer.end("GraphLoad");
+    cmeter.end("GraphLoad_send", get_sending_bytes(party_info));
+    cmeter.end("GraphLoad_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    if(role == 0) debug_info("Graph loaded successfully!");
+
+    // 1) edge existence query.
+    size_t v = plainGraph.v;
+    size_t ps = 0, pe = v-1;
+    boolIndex snode = boolIndex(ps, role);
+    boolIndex enode = boolIndex(pe, role);
+
+    cmeter.start("EdgeExistQuery_send", get_sending_bytes(party_info));
+    cmeter.start("EdgeExistQuery_recv", get_receiving_bytes(party_info));
+    #ifdef MPI_APP
+    MPI_Barrier(MPI_COMM_WORLD);
+    #endif
+    timer.start("EdgeExistQuery");
+    boolShare flag = edge_existance(snode, enode, listGraphEngine);
+    #ifdef MPI_APP
+    MPI_Barrier(MPI_COMM_WORLD);
+    #endif
+    timer.end("EdgeExistQuery");
+    cmeter.end("EdgeExistQuery_send", get_sending_bytes(party_info));
+    cmeter.end("EdgeExistQuery_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    if(role == 0) debug_info("Edge existence query success");
+
+    // 2) outting edges count query.
+    cmeter.start("OuttingEdgesCountQuery_send", get_sending_bytes(party_info));
+    cmeter.start("OuttingEdgesCountQuery_recv", get_receiving_bytes(party_info)); 
+    #ifdef MPI_APP
+    MPI_Barrier(MPI_COMM_WORLD);
+    #endif  
+    timer.start("OuttingEdgesCountQuery");
+    // aby3::sbMatrix out_edges = outting_edge_count(snode, listGraphEngine);
+    aby3::si64Matrix out_edges = outting_edge_count_arith(snode, listGraphEngine);
+    #ifdef MPI_APP
+    MPI_Barrier(MPI_COMM_WORLD);
+    #endif
+    timer.end("OuttingEdgesCountQuery");
+    cmeter.end("OuttingEdgesCountQuery_send", get_sending_bytes(party_info));
+    cmeter.end("OuttingEdgesCountQuery_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    if(role == 0) debug_info("Outting edges count query success");
+
+    // // 3) neighbors get query.
+    // timer.start("NeighborsGetQuery");
+    // aby3::sbMatrix neighbors = outting_neighbors(snode, listGraphEngine);
+    // timer.end("NeighborsGetQuery");
+
+    if(role == 0) debug_info("Neighbors get query success");
+
+    // 4) sorted neighbors get query.
+    plainGraph.list_sort();
+    listGraphEngine.rebuild(party_info, plainGraph);
+
+    cmeter.start("NeighborsGetQuery_send", get_sending_bytes(party_info));
+    cmeter.start("NeighborsGetQuery_recv", get_receiving_bytes(party_info));
+    #ifdef MPI_APP
+    MPI_Barrier(MPI_COMM_WORLD);
+    #endif
+    timer.start("NeighborsGetQuery");
+    aby3::sbMatrix neighbors_sorted = outting_neighbors_sorted(snode, listGraphEngine);
+    #ifdef MPI_APP
+    MPI_Barrier(MPI_COMM_WORLD);
+    #endif
+    timer.end("NeighborsGetQuery");
+    cmeter.end("NeighborsGetQuery_send", get_sending_bytes(party_info));
+    cmeter.end("NeighborsGetQuery_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    if(role == 0) debug_info("Sorted Neighbors get query success");
+
+    communication_synchronize(party_info);
+    // print the timer records.
+    #ifdef MPI_APP
+    if((role == 0) && (rank == 0)){
+    #else
+    if(role == 0){
+    #endif
+        std::ofstream stream(record_file, std::ios::app);
+        listGraphEngine.print_configs(stream);
+        timer.print_total("milliseconds", stream);
+        // cmeter.print_total("MB", stream);
+        cmeter.print_total_per_party("MB", stream);
+    }
+
+
+    return 0;
+}
+
+int privGraph_integration_profiling(oc::CLP& cmd){
+    
+    // get the configs.
+    CONFIG_INIT
+    CommunicationMeter& cmeter = CommunicationMeter::getInstance();
+
+    // get the graph file parameters.
+    std::string graph_data_folder = graph_folder + "multiparty/";
+    std::string file_prefix = "tmp";
+    std::string record_folder = base_folder + "record_offline/privGraph/";
+    int record_counter = -1;
+
+    if(cmd.isSet("prefix")){
+        auto keys = cmd.getMany<std::string>("prefix");
+        file_prefix = keys[0];
+    }
+    else{
+        THROW_RUNTIME_ERROR("prefix must be set!");
+    }
+
+    if(cmd.isSet("rcounter")){
+        auto keys = cmd.getMany<int>("rcounter");
+        record_counter = keys[0];
+    }
+    else{
+        THROW_RUNTIME_ERROR("rcounter must be set!");
+    }
+
+    std::string meta_file = graph_data_folder + file_prefix + "_meta_multiparty.txt";
+    std::string record_file = record_folder + file_prefix + "-" + std::to_string(record_counter) + ".txt";
+
+    file_prefix = graph_data_folder + file_prefix;
+
+    SET_OR_DEFAULT(cmd, noram_stash_size, 1 << 4);
+    SET_OR_DEFAULT(cmd, noram_pack_size, 1 << 2);
+    SET_OR_DEFAULT(cmd, eoram_stash_size, 1 << 8);
+    SET_OR_DEFAULT(cmd, eoram_pack_size, 1 << 4);
+
+    // std::string record_file = record_folder + file_prefix + "-" + std::to_string(record_counter) + ".txt";
+
+    if (role == 0) debug_info("Profiling the privGraph Query Engine...");
+
+    // graph integration.
+    cmeter.start("GraphLoad_send", get_sending_bytes(party_info));
+    cmeter.start("GraphLoad_recv", get_receiving_bytes(party_info));
+    timer.start("GraphLoad");
+    GraphQueryEngine secGraphEngine(party_info, meta_file, file_prefix, true);
+    timer.end("GraphLoad");
+    cmeter.end("GraphLoad_send", get_sending_bytes(party_info));
+    cmeter.end("GraphLoad_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    if(role == 0) debug_info("Graph loaded successfully!");
+
+    // oram construction.
+    if(role == 0) debug_info("Eoram construction...");
+    cmeter.start("EdgeOramInit_send", get_sending_bytes(party_info));
+    cmeter.start("EdgeOramInit_recv", get_receiving_bytes(party_info));
+    timer.start("EdgeOramInit");
+    secGraphEngine.edge_block_oram_initialization(eoram_stash_size, eoram_pack_size);
+    timer.end("EdgeOramInit");
+    cmeter.end("EdgeOramInit_send", get_sending_bytes(party_info));
+    cmeter.end("EdgeOramInit_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    if(role == 0) debug_info("Eoram init success\nNoram construction...");
+
+    cmeter.start("NodeOramInit_send", get_sending_bytes(party_info));
+    cmeter.start("NodeOramInit_recv", get_receiving_bytes(party_info));
+    timer.start("NodeOramInit");
+    secGraphEngine.node_edges_oram_initialization(noram_stash_size, noram_pack_size);
+    timer.end("NodeOramInit");
+    cmeter.end("NodeOramInit_send", get_sending_bytes(party_info));
+    cmeter.end("NodeOramInit_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    if(role == 0) debug_info("Noram init success");
+
+    communication_synchronize(party_info);
+    // print the timer records.
+    if(role == 0){
+        std::ofstream stream(record_file, std::ios::app);
+        debug_info("Printing configs... " + record_file);
+        secGraphEngine.print_configs(stream);
+        timer.print_total("milliseconds", stream);
+        // cmeter.print_total("MB", stream);
+        cmeter.print_total_per_party("MB", stream);
+        stream.close();
+    }
+
+    return 0;
+}
+
+int adj_integration_profiling(oc::CLP& cmd){
+
+    // get the configs.
+    CONFIG_INIT
+    CommunicationMeter& cmeter = CommunicationMeter::getInstance();
+
+    // get the graph file parameters.
+    std::string graph_data_folder = graph_folder + "multiparty/";
+    std::string file_prefix = "tmp";
+    std::string record_folder = base_folder + "record_offline/adjmat/";
+    int record_counter = -1;
+
+    if(cmd.isSet("prefix")){
+        auto keys = cmd.getMany<std::string>("prefix");
+        file_prefix = keys[0];
+    }
+    else{
+        THROW_RUNTIME_ERROR("prefix must be set!");
+    }
+
+    if(cmd.isSet("rcounter")){
+        auto keys = cmd.getMany<int>("rcounter");
+        record_counter = keys[0];
+    }
+    else{
+        THROW_RUNTIME_ERROR("rcounter must be set!");
+    }
+
+    std::string meta_file = graph_data_folder + file_prefix + "_edge_list_meta_multiparty.txt";
+    std::string record_file = record_folder + file_prefix + "-" + std::to_string(record_counter) + ".txt";
+    file_prefix = graph_data_folder + file_prefix;
+
+    SET_OR_DEFAULT(cmd, noram_stash_size, 1 << 4);
+    SET_OR_DEFAULT(cmd, noram_pack_size, 1 << 2);
+    SET_OR_DEFAULT(cmd, eoram_stash_size, 1 << 8);
+    SET_OR_DEFAULT(cmd, eoram_pack_size, 1 << 4);
+
+    if (role == 0) debug_info("Profiling the Mat Query Engine...");
+
+    // graph integration.
+    cmeter.start("GraphLoad_send", get_sending_bytes(party_info));
+    cmeter.start("GraphLoad_recv", get_receiving_bytes(party_info));
+    timer.start("GraphLoad");
+    AdjGraphQueryEngine adjGraphEngine(party_info, meta_file, file_prefix, true);
+    timer.end("GraphLoad");
+    cmeter.end("GraphLoad_send", get_sending_bytes(party_info));
+    cmeter.end("GraphLoad_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    if(role == 0) debug_info("Graph loaded successfully!");
+
+    // oram construction.
+    if(role == 0) debug_info("Eoram construction...");
+    cmeter.start("EdgeOramInit_send", get_sending_bytes(party_info));
+    cmeter.start("EdgeOramInit_recv", get_receiving_bytes(party_info));
+    timer.start("EdgeOramInit");
+    adjGraphEngine.edge_oram_initialization(eoram_stash_size, eoram_pack_size);
+    timer.end("EdgeOramInit");
+    cmeter.end("EdgeOramInit_send", get_sending_bytes(party_info));
+    cmeter.end("EdgeOramInit_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    if(role == 0) debug_info("Eoram init success\nNoram construction...");
+
+    cmeter.start("NodeOramInit_send", get_sending_bytes(party_info));
+    cmeter.start("NodeOramInit_recv", get_receiving_bytes(party_info));
+    timer.start("NodeOramInit");
+    adjGraphEngine.node_oram_initialization(noram_stash_size, noram_pack_size);
+    timer.end("NodeOramInit");
+    cmeter.end("NodeOramInit_send", get_sending_bytes(party_info));
+    cmeter.end("NodeOramInit_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    if(role == 0) debug_info("Noram init success");
+
+    communication_synchronize(party_info);
+
+    // print the timer records.
+    if(role == 0){
+        std::ofstream stream(record_file, std::ios::app);
+        adjGraphEngine.print_configs(stream);
+        timer.print_total("milliseconds", stream);
+        // cmeter.print_total("MB", stream);
+        cmeter.print_total_per_party("MB", stream);
+    }
+
+    return 0;
+}
+
+int list_integration_profiling(oc::CLP& cmd){
+
+    // get the configs.
+    CONFIG_INIT
+    CommunicationMeter& cmeter = CommunicationMeter::getInstance();
+
+    // get the graph file parameters.
+    std::string graph_data_folder = graph_folder + "multiparty/";
+    std::string file_prefix = "tmp";
+    std::string record_folder = base_folder + "record_offline/edgelist/";
+
+    int record_counter = -1;
+    
+    if(cmd.isSet("prefix")){
+        auto keys = cmd.getMany<std::string>("prefix");
+        file_prefix = keys[0];
+    }
+    else{
+        THROW_RUNTIME_ERROR("prefix must be set!");
+    }
+
+    if(cmd.isSet("rcounter")){
+        auto keys = cmd.getMany<int>("rcounter");
+        record_counter = keys[0];
+    }
+    else{
+        THROW_RUNTIME_ERROR("rcounter must be set!");
+    }
+
+    std::string meta_file = graph_data_folder + file_prefix + "_edge_list_meta_multiparty.txt";
+    std::string record_file = record_folder + file_prefix + "-" + std::to_string(record_counter) + ".txt";
+    file_prefix = graph_data_folder + file_prefix;
+
+    cmeter.start("GraphLoad_send", get_sending_bytes(party_info));
+    cmeter.start("GraphLoad_recv", get_receiving_bytes(party_info));
+    timer.start("GraphLoad");
+    ListGraphQueryEngine listGraphEngine(party_info, meta_file, file_prefix, true);
+    timer.end("GraphLoad");
+    cmeter.end("GraphLoad_send", get_sending_bytes(party_info));
+    cmeter.end("GraphLoad_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    if(role == 0) debug_info("Graph loaded successfully!");
+    communication_synchronize(party_info);
+
+    // print the timer records.
+    if(role == 0){
+        std::ofstream stream(record_file, std::ios::app);
+        listGraphEngine.print_configs(stream);
+        timer.print_total("milliseconds", stream);
+        // cmeter.print_total("MB", stream);
+        cmeter.print_total_per_party("MB", stream);
+    }
+
+    return 0;
+}
+
+int cycle_detection_profiling(oc::CLP& cmd){
+
+    #ifdef MPI_APP
+    MPI_INIT
+    #else
+    CONFIG_INIT
+    if(role == 0) debug_info("in this function!!!!");
+    #endif
+
+    CommunicationMeter& cmeter = CommunicationMeter::getInstance();
+
+    if(role == 0) debug_info("in this function!!!");
+
+    // init the EORAM.
+    std::string graph_data_folder = graph_folder + "adv_application/";
+    std::string file_prefix = "tmp";
+    std::string record_folder = base_folder + "/record/cycle_detection/";
+    int record_counter = -1;
+
+    if(cmd.isSet("prefix")){
+        auto keys = cmd.getMany<std::string>("prefix");
+        file_prefix = keys[0];
+    }
+    else{
+        THROW_RUNTIME_ERROR("prefix must be set!");
+    }
+    if(cmd.isSet("rcounter")){
+        auto keys = cmd.getMany<int>("rcounter");
+        record_counter = keys[0];
+    }
+    else{
+        THROW_RUNTIME_ERROR("rcounter must be set!");
+    }
+
+    if(cmd.isSet("data_folder")){
+        auto keys = cmd.getMany<std::string>("data_folder");
+        graph_data_folder = keys[0];
+        if(role == 0) debug_info("data_folder: " + graph_data_folder);
+    }
+
+    if(cmd.isSet("record_folder")){
+        auto keys = cmd.getMany<std::string>("record_folder");
+        record_folder = keys[0];
+        if(role == 0) debug_info("record_folder: " + record_folder);
+    }
+
+    std::string meta_file = graph_data_folder + file_prefix + "_meta.txt";
+    std::string graph_data_file = graph_data_folder + file_prefix + "_2dpartition.txt";
+    std::string record_file = record_folder + file_prefix + "-" + std::to_string(record_counter) + ".txt";
+
+    SET_OR_DEFAULT(cmd, eoram_stash_size, 1 << 8);
+    SET_OR_DEFAULT(cmd, eoram_pack_size, 1 << 4);
+
+    if (role == 0) debug_info("Profiling the cycle detection...");
+
+    if(role == 0){
+        debug_info("meta_file = " + meta_file);
+        debug_info("graph_data_file = " + graph_data_file);
+        debug_info("record_file = " + record_file);
+    }
+
+    // load the graph and construct the eoram.
+    cmeter.start("GraphLoad_send", get_sending_bytes(party_info));
+    cmeter.start("GraphLoad_recv", get_receiving_bytes(party_info));
+
+    if(role == 0) debug_info("sending_bytes = " + std::to_string(get_sending_bytes(party_info)) + " | reveiving_bytes = " + std::to_string(get_receiving_bytes(party_info)));
+
+    timer.start("GraphLoad");
+
+    GraphQueryEngine secGraphEngine(party_info, meta_file, graph_data_file);
+
+    timer.end("GraphLoad");
+    cmeter.end("GraphLoad_send", get_sending_bytes(party_info));
+    cmeter.end("GraphLoad_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    if(role == 0) debug_info("Graph loaded successfully!");
+
+    // oram construction.
+    cmeter.start("EdgeOramInit_send", get_sending_bytes(party_info));
+    cmeter.start("EdgeOramInit_recv", get_receiving_bytes(party_info));
+    #ifdef MPI_APP
+    MPI_Barrier(MPI_COMM_WORLD);
+    #endif
+    timer.start("EdgeOramInit");
+
+    secGraphEngine.edge_block_oram_initialization(eoram_stash_size, eoram_pack_size);
+    #ifdef MPI_APP
+    MPI_Barrier(MPI_COMM_WORLD);
+    #endif
+    timer.end("EdgeOramInit");
+    cmeter.end("EdgeOramInit_send", get_sending_bytes(party_info));
+    cmeter.end("EdgeOramInit_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    if(role == 0) debug_info("Eoram init success");
+
+    // cycle detection.
+    // set the six edges.
+    size_t node1 = 1, node2 = 2, node3 = 3;
+    boolIndex node1_ind = boolIndex(secGraphEngine.get_block_index(node1), role);
+    boolIndex node2_ind = boolIndex(secGraphEngine.get_block_index(node2), role);
+    boolIndex node3_ind = boolIndex(secGraphEngine.get_block_index(node3), role);
+
+    std::vector<std::tuple<boolIndex, boolIndex, boolIndex>> target_edges(6);
+    target_edges[0] = {boolIndex(secGraphEngine.get_edge_block_index(node1, node2), role), node1_ind, node2_ind};
+    target_edges[1] = {boolIndex(secGraphEngine.get_edge_block_index(node2, node3), role), node2_ind, node3_ind};
+    target_edges[2] = {boolIndex(secGraphEngine.get_edge_block_index(node3, node1), role), node3_ind, node1_ind};
+    target_edges[3] = {boolIndex(secGraphEngine.get_edge_block_index(node2, node1), role), node2_ind, node1_ind};
+    target_edges[4] = {boolIndex(secGraphEngine.get_edge_block_index(node3, node2), role), node3_ind, node2_ind};
+    target_edges[5] = {boolIndex(secGraphEngine.get_edge_block_index(node1, node3), role), node1_ind, node3_ind};
+    std::vector<boolShare> edge_flags;
+
+    if(role == 0) debug_info("Cycle detection...");
+
+    cmeter.start("CycleDetection_send", get_sending_bytes(party_info));
+    cmeter.start("CycleDetection_recv", get_receiving_bytes(party_info));
+    #ifdef MPI_APP
+    MPI_Barrier(MPI_COMM_WORLD);
+    #endif
+    timer.start("CycleDetection");
+
+    for(auto& edge_info : target_edges){
+        auto& edge_index = std::get<0>(edge_info);
+        auto& node1_index = std::get<1>(edge_info);
+        auto& node2_index = std::get<2>(edge_info);
+
+        boolShare flag = edge_existance(node1_index, node2_index, edge_index, secGraphEngine);
+        edge_flags.push_back(flag);
+    }
+    #ifdef MPI_APP
+    MPI_Barrier(MPI_COMM_WORLD);
+    #endif
+    timer.end("CycleDetection");
+    cmeter.end("CycleDetection_send", get_sending_bytes(party_info));
+    cmeter.end("CycleDetection_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    if(role == 0) debug_info("Cycle detection success");
+
+    communication_synchronize(party_info);
+
+    // print the timer records.
+    #ifdef MPI_APP
+    if((role == 0) && (rank == 0)){
+    #else
+    if(role == 0){
+    #endif
+        std::ofstream stream(record_file, std::ios::app);
+        secGraphEngine.print_configs(stream);
+        timer.print_total("milliseconds", stream);
+        // cmeter.print_total("MB", stream);
+        cmeter.print_total_per_party("MB", stream);
+    }
+
+    return 0;
+}
+
+int twohop_neighbor_profiling(oc::CLP& cmd){
+
+    #ifdef MPI_APP
+    MPI_INIT
+    #else
+    CONFIG_INIT
+    if(role == 0) debug_info("in this function!!!!");
+    #endif
+    CommunicationMeter& cmeter = CommunicationMeter::getInstance();
+
+    // init the NORAM.
+    std::string graph_data_folder = graph_folder +"adv_application/";
+    std::string file_prefix = "tmp";
+    std::string record_folder = base_folder + "record/two_hop_neighbor/";
+    int record_counter = -1;
+
+    if(cmd.isSet("prefix")){
+        auto keys = cmd.getMany<std::string>("prefix");
+        file_prefix = keys[0];
+    }
+    else{
+        THROW_RUNTIME_ERROR("prefix must be set!");
+    }
+    if(cmd.isSet("rcounter")){
+        auto keys = cmd.getMany<int>("rcounter");
+        record_counter = keys[0];
+    }
+    else{
+        THROW_RUNTIME_ERROR("rcounter must be set!");
+    }
+
+    if(cmd.isSet("data_folder")){
+        auto keys = cmd.getMany<std::string>("data_folder");
+        graph_data_folder = keys[0];
+        if(role == 0) debug_info("data_folder: " + graph_data_folder);
+    }
+
+    if(cmd.isSet("record_folder")){
+        auto keys = cmd.getMany<std::string>("record_folder");
+        record_folder = keys[0];
+        if(role == 0) debug_info("record_folder: " + record_folder);
+    }
+
+    std::string meta_file = graph_data_folder + file_prefix + "_meta.txt";
+    std::string graph_data_file = graph_data_folder + file_prefix + "_2dpartition.txt";
+    std::string record_file = record_folder + file_prefix + "-" + std::to_string(record_counter) + ".txt";
+
+    SET_OR_DEFAULT(cmd, noram_stash_size, 1 << 8);
+    SET_OR_DEFAULT(cmd, noram_pack_size, 1 << 4);
+
+    if(role == 0){
+        debug_info("meta_file = " + meta_file);
+        debug_info("graph_data_file = " + graph_data_file);
+        debug_info("record_file = " + record_file);
+    }
+
+    if (role == 0) debug_info("Profiling the two-hop neighbor query...");
+
+    // load the graph and construct the noram.
+    cmeter.start("GraphLoad_send", get_sending_bytes(party_info));
+    cmeter.start("GraphLoad_recv", get_receiving_bytes(party_info));
+    timer.start("GraphLoad");
+
+    GraphQueryEngine secGraphEngine(party_info, meta_file, graph_data_file);
+
+    timer.end("GraphLoad");
+    cmeter.end("GraphLoad_send", get_sending_bytes(party_info));
+    cmeter.end("GraphLoad_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    if(role == 0) debug_info("Graph loaded successfully!");
+
+    // oram construction.
+    cmeter.start("NodeOramInit_send", get_sending_bytes(party_info));
+    cmeter.start("NodeOramInit_recv", get_receiving_bytes(party_info));
+    #ifdef MPI_APP
+    MPI_Barrier(MPI_COMM_WORLD);
+    #endif
+    timer.start("NodeOramInit");
+
+    secGraphEngine.node_edges_oram_initialization(noram_stash_size, noram_pack_size);
+    #ifdef MPI_APP
+    MPI_Barrier(MPI_COMM_WORLD);
+    #endif
+    timer.end("NodeOramInit");
+    cmeter.end("NodeOramInit_send", get_sending_bytes(party_info));
+    cmeter.end("NodeOramInit_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    if(role == 0) debug_info("Noram init success");
+
+    // // 2-htop neighbor detection.
+    // size_t node1 = 1;
+    // boolIndex snode = boolIndex(node1, role);
+    // boolIndex node1_ind = boolIndex(secGraphEngine.get_block_index(node1), role);
+
+    // cmeter.start("twohop_neighbor_send", get_sending_bytes(party_info));
+    // cmeter.start("twohop_neighbor_recv", get_receiving_bytes(party_info));
+    // #ifdef MPI_APP
+    // MPI_Barrier(MPI_COMM_WORLD);
+    // #endif
+    // timer.start("twohop_neighbor");    
+
+    // aby3::sbMatrix direct_neighbors = outting_neighbors_sorted(snode, node1_ind, secGraphEngine);
+
+    // aby3::i64Matrix direct_neighbors_plain(direct_neighbors.rows(), 1);
+    // enc.revealAll(runtime, direct_neighbors, direct_neighbors_plain).get();
+
+    // size_t neighbor_upper_bound = 10;
+    // if(file_prefix.find("slashdot") == 0){
+    //     neighbor_upper_bound = 7;
+    // }
+    // if(file_prefix.find("dblp") == 0){
+    //     neighbor_upper_bound = 4;
+    // }
+    // if(file_prefix.find("twitter") == 0){
+    //     neighbor_upper_bound = 5;
+    // }
+
+    // // size_t direct_neighbor_number = 0;
+    // std::vector<size_t> direct_neighbors_list;
+    // // for(size_t i=0; i<direct_neighbors_plain.rows(); i++){
+    // //     if(direct_neighbors_plain(i, 0) != 0){
+    // //         direct_neighbor_number++;
+    // //         direct_neighbors_list.push_back(i);
+    // //     }
+    // // }
+    // while(direct_neighbors_list.size() < neighbor_upper_bound){
+    //     direct_neighbors_list.push_back(10);
+    // }
+
+    // // 2-hop neighbor detection.
+    // std::vector<size_t> two_hop_neighbors_list;
+    // for(auto& neighbor : direct_neighbors_list){
+    //     boolIndex neighbor_id_ = boolIndex(neighbor, role);
+    //     boolIndex neighbor_ind_ = boolIndex(secGraphEngine.get_edge_block_index(node1, neighbor), role);
+    //     aby3::sbMatrix two_hop_neighbors = outting_neighbors_sorted(neighbor_id_, neighbor_ind_, secGraphEngine);
+    // }
+    // #ifdef MPI_APP
+    // MPI_Barrier(MPI_COMM_WORLD);
+    // #endif
+    // timer.end("twohop_neighbor");
+    // cmeter.end("twohop_neighbor_send", get_sending_bytes(party_info));
+    // cmeter.end("twohop_neighbor_recv", get_receiving_bytes(party_info));
+    // clear_sending_reveiving_bytes(party_info);
+
+    // // print the timer records.
+
+    communication_synchronize(party_info);  
+
+    #ifdef MPI_APP
+    if((role == 0) && (rank == 0)){
+    #else
+    if(role == 0){
+    #endif
+        std::ofstream stream(record_file, std::ios::app);
+        // debug_info("Direct neighbors of node " + std::to_string(direct_neighbors_list.size()), stream);
+        secGraphEngine.print_configs(stream);
+        timer.print_total("milliseconds", stream);
+        // cmeter.print_total("MB", stream);
+        cmeter.print_total_per_party("MB", stream);
+    }
+
+    return 0;
+}
+
+int neighbor_statistics_profiling(oc::CLP& cmd){
+
+    #ifdef MPI_APP
+    MPI_INIT
+    #else
+    CONFIG_INIT
+    if(role == 0) debug_info("in this function!!!!");
+    #endif
+    CommunicationMeter& cmeter = CommunicationMeter::getInstance();
+
+    // set the graph.
+    std::string graph_data_folder = graph_folder + "adv_application/";
+    std::string file_prefix = "tmp";
+    std::string record_folder = base_folder + "record/statistics_neighbor/";
+    int record_counter = -1;
+
+    if(cmd.isSet("prefix")){
+        auto keys = cmd.getMany<std::string>("prefix");
+        file_prefix = keys[0];
+    }
+    else{
+        THROW_RUNTIME_ERROR("prefix must be set!");
+    }
+    if(cmd.isSet("rcounter")){
+        auto keys = cmd.getMany<int>("rcounter");
+        record_counter = keys[0];
+    }
+    else{
+        THROW_RUNTIME_ERROR("rcounter must be set!");
+    }
+
+    if(cmd.isSet("data_folder")){
+        auto keys = cmd.getMany<std::string>("data_folder");
+        graph_data_folder = keys[0];
+        if(role == 0) debug_info("data_folder: " + graph_data_folder);
+    }
+
+    if(cmd.isSet("record_folder")){
+        auto keys = cmd.getMany<std::string>("record_folder");
+        record_folder = keys[0];
+        if(role == 0) debug_info("record_folder: " + record_folder);
+    }
+
+    std::string meta_file = graph_data_folder + file_prefix + "_meta.txt";
+    std::string graph_data_file = graph_data_folder + file_prefix + "_2dpartition.txt";
+    std::string graph_property_file = graph_data_folder + file_prefix + "_2dproperty.txt";
+    std::string record_file = record_folder + file_prefix + "-" + std::to_string(record_counter) + ".txt";
+
+    SET_OR_DEFAULT(cmd, noram_stash_size, 1 << 8);
+    SET_OR_DEFAULT(cmd, noram_pack_size, 1 << 4);
+
+    if(role == 0){
+        debug_info("meta_file = " + meta_file);
+        debug_info("graph_data_file = " + graph_data_file);
+        debug_info("property_graph_file = " + graph_property_file);
+        debug_info("record_file = " + record_file);
+    }
+
+    if (role == 0) debug_info("Profiling the neighbor statis query...");
+
+    // get the property graph.
+    cmeter.start("GraphLoad_send", get_sending_bytes(party_info));
+    cmeter.start("GraphLoad_recv", get_receiving_bytes(party_info));
+    timer.start("GraphLoad");
+
+    PropertyGraph2d property_graph(meta_file, graph_data_file, party_info);
+    property_graph.add_property(graph_property_file, party_info);
+    property_graph.get_node_edges_property();
+
+
+    // construct the query_engine.
+    GraphQueryEngine secGraphEngine;
+    secGraphEngine.party_info = &party_info;
+    secGraphEngine.set_graph(property_graph);
+
+    timer.end("GraphLoad");
+    cmeter.end("GraphLoad_send", get_sending_bytes(party_info));
+    cmeter.end("GraphLoad_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    if(role == 0) debug_info("Graph loaded successfully!");
+
+
+    // oram construction.
+    cmeter.start("NodeOramInit_send", get_sending_bytes(party_info));
+    cmeter.start("NodeOramInit_recv", get_receiving_bytes(party_info));
+    #ifdef MPI_APP
+    MPI_Barrier(MPI_COMM_WORLD);
+    #endif
+    timer.start("NodeOramInit");
+
+    if(role == 0) debug_info("Noram construction...");
+    secGraphEngine.node_edges_property_oram_initialization(noram_stash_size, noram_pack_size);
+    #ifdef MPI_APP
+    MPI_Barrier(MPI_COMM_WORLD);
+    #endif
+    timer.end("NodeOramInit");
+    cmeter.end("NodeOramInit_send", get_sending_bytes(party_info));
+    cmeter.end("NodeOramInit_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    if(role == 0) debug_info("Noram init success");
+
+    // run the statistic_func.
+    size_t node1 = 0;
+    boolIndex snode = boolIndex(node1, role);
+    boolIndex node1_ind = boolIndex(secGraphEngine.get_block_index(node1), role);
+    size_t upper_bound = 10;
+    boolIndex sec_upper_bound = boolIndex(upper_bound, role);
+
+    cmeter.start("statistic_send", get_sending_bytes(party_info));
+    cmeter.start("statistic_recv", get_receiving_bytes(party_info));
+    #ifdef MPI_APP
+    MPI_Barrier(MPI_COMM_WORLD);
+    #endif
+    timer.start("statistic");
+
+    aby3::si64Matrix statistics = outting_edge_range_statistics(snode, node1_ind, sec_upper_bound, secGraphEngine); 
+    #ifdef MPI_APP
+    MPI_Barrier(MPI_COMM_WORLD);
+    #endif
+    timer.end("statistic");
+    cmeter.end("statistic_send", get_sending_bytes(party_info));
+    cmeter.end("statistic_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    if(role == 0) debug_info("Statistics success");
+
+    // print the timer records.
+    communication_synchronize(party_info);
+    #ifdef MPI_APP
+    if((role == 0) && (rank == 0)){
+    #else
+    if(role == 0){
+    #endif
+        std::ofstream stream(record_file, std::ios::app);
+        secGraphEngine.print_configs(stream);
+        timer.print_total("milliseconds", stream);
+        // cmeter.print_total("MB", stream);
+        cmeter.print_total_per_party("MB", stream);
+    }
+
+    return 0;
+}
+
+int cycle_detection_profiling_edgelist(oc::CLP& cmd){
+
+    #ifdef MPI_APP
+    MPI_INIT
+    #else
+    CONFIG_INIT
+    if(role == 0) debug_info("in this function!!!!");
+    #endif
+    CommunicationMeter& cmeter = CommunicationMeter::getInstance();
+
+    // load graph.
+    std::string graph_data_folder = graph_folder + "adv_application/";
+    std::string file_prefix = "tmp";
+    std::string record_folder = base_folder + "record/cycle_detection/";
+    int record_counter = -1;
+
+    if(cmd.isSet("prefix")){
+        auto keys = cmd.getMany<std::string>("prefix");
+        file_prefix = keys[0];
+    }
+    else{
+        THROW_RUNTIME_ERROR("prefix must be set!");
+    }
+
+    if(cmd.isSet("rcounter")){
+        auto keys = cmd.getMany<int>("rcounter");
+        record_counter = keys[0];
+    }
+    else{
+        THROW_RUNTIME_ERROR("rcounter must be set!");
+    }
+
+    if(cmd.isSet("data_folder")){
+        auto keys = cmd.getMany<std::string>("data_folder");
+        graph_data_folder = keys[0];
+        if(role == 0) debug_info("data_folder: " + graph_data_folder);
+    }
+    if(cmd.isSet("record_folder")){
+        auto keys = cmd.getMany<std::string>("record_folder");
+        record_folder = keys[0];
+        if(role == 0) debug_info("record_folder: " + record_folder);
+    }
+
+    std::string meta_file = graph_data_folder + file_prefix + "_edge_list_meta.txt";
+    std::string graph_data_file = graph_data_folder + file_prefix + "_edge_list.txt";
+    std::string record_file = record_folder + file_prefix + "-" + std::to_string(record_counter) + ".txt";
+
+    // graph loading.
+    cmeter.start("GraphLoad_send", get_sending_bytes(party_info));
+    cmeter.start("GraphLoad_recv", get_receiving_bytes(party_info));
+    timer.start("GraphLoad");
+    plainGraphList plainGraph(meta_file, graph_data_file);
+    ListGraphQueryEngine listGraphEngine(party_info, plainGraph);
+    timer.end("GraphLoad");
+    cmeter.end("GraphLoad_send", get_sending_bytes(party_info));
+    cmeter.end("GraphLoad_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    // cycle detection.
+    size_t node1 = 1, node2 = 2, node3 = 3;
+    boolIndex node1_ind = boolIndex(node1, role);   
+    boolIndex node2_ind = boolIndex(node2, role);
+    boolIndex node3_ind = boolIndex(node3, role);
+
+    std::vector<std::pair<boolIndex, boolIndex>> target_edges(6);
+    target_edges[0] = {node1_ind, node2_ind};
+    target_edges[1] = {node2_ind, node3_ind};
+    target_edges[2] = {node3_ind, node1_ind};
+    target_edges[3] = {node2_ind, node1_ind};
+    target_edges[4] = {node3_ind, node2_ind};
+    target_edges[5] = {node1_ind, node3_ind};
+
+    std::vector<boolShare> edge_flags;
+
+    if(role == 0) debug_info("Cycle detection...");
+
+    cmeter.start("CycleDetection_send", get_sending_bytes(party_info));
+    cmeter.start("CycleDetection_recv", get_receiving_bytes(party_info));
+    #ifdef MPI_APP
+    MPI_Barrier(MPI_COMM_WORLD);
+    #endif
+    timer.start("CycleDetection");
+
+    for(auto& edge_info : target_edges){
+        auto& node1_index = edge_info.first;
+        auto& node2_index = edge_info.second;
+
+        boolShare flag = edge_existance(node1_index, node2_index, listGraphEngine);
+        edge_flags.push_back(flag);
+    }
+    #ifdef MPI_APP
+    MPI_Barrier(MPI_COMM_WORLD);
+    #endif
+    timer.end("CycleDetection");
+    cmeter.end("CycleDetection_send", get_sending_bytes(party_info));
+    cmeter.end("CycleDetection_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    if(role == 0) debug_info("Cycle detection success");
+
+    communication_synchronize(party_info);
+
+    // print the timer records.
+    #ifdef MPI_APP
+    if((role == 0) && (rank == 0)){
+    #else
+    if(role == 0){
+    #endif
+        std::ofstream stream(record_file, std::ios::app);
+        stream << "===== Edge list ====" <<std::endl;
+        listGraphEngine.print_configs(stream);
+        timer.print_total("milliseconds", stream);
+        // cmeter.print_total("MB", stream);
+        cmeter.print_total_per_party("MB", stream);
+    }
+
+    return 0;
+}
+
+int twohop_neighbor_profiling_edgelist(oc::CLP& cmd){
+
+    #ifdef MPI_APP
+    MPI_INIT
+    #else
+    CONFIG_INIT
+    if(role == 0) debug_info("in this function!!!!");
+    #endif
+    CommunicationMeter& cmeter = CommunicationMeter::getInstance();
+
+    // load graph.
+    std::string graph_data_folder = graph_folder + "adv_application/";
+    std::string file_prefix = "tmp";
+    std::string record_folder = base_folder + "record/cycle_detection/";
+    int record_counter = -1;
+
+    if(cmd.isSet("prefix")){
+        auto keys = cmd.getMany<std::string>("prefix");
+        file_prefix = keys[0];
+    }
+    else{
+        THROW_RUNTIME_ERROR("prefix must be set!");
+    }
+
+    if(cmd.isSet("rcounter")){
+        auto keys = cmd.getMany<int>("rcounter");
+        record_counter = keys[0];
+    }
+    else{
+        THROW_RUNTIME_ERROR("rcounter must be set!");
+    }
+
+    if(cmd.isSet("data_folder")){
+        auto keys = cmd.getMany<std::string>("data_folder");
+        graph_data_folder = keys[0];
+        if(role == 0) debug_info("data_folder: " + graph_data_folder);
+    }
+    if(cmd.isSet("record_folder")){
+        auto keys = cmd.getMany<std::string>("record_folder");
+        record_folder = keys[0];
+        if(role == 0) debug_info("record_folder: " + record_folder);
+    }
+
+    std::string meta_file = graph_data_folder + file_prefix + "_edge_list_meta.txt";
+    std::string graph_data_file = graph_data_folder + file_prefix + "_edge_list.txt";
+    std::string record_file = record_folder + file_prefix + "-" + std::to_string(record_counter) + ".txt";
+
+    // graph loading.
+    cmeter.start("GraphLoad_send", get_sending_bytes(party_info));
+    cmeter.start("GraphLoad_recv", get_receiving_bytes(party_info));
+    timer.start("GraphLoad");
+    plainGraphList plainGraph(meta_file, graph_data_file);
+    ListGraphQueryEngine listGraphEngine(party_info, plainGraph);
+    timer.end("GraphLoad");
+    cmeter.end("GraphLoad_send", get_sending_bytes(party_info));
+    cmeter.end("GraphLoad_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    if(role == 0) debug_info("Graph loaded successfully!");
+
+    // two-hop neighbors.
+    size_t node1 = 0;
+    boolIndex snode = boolIndex(node1, role);
+    
+    cmeter.start("twohop_neighbor_send", get_sending_bytes(party_info));
+    cmeter.start("twohop_neighbor_recv", get_receiving_bytes(party_info));
+    #ifdef MPI_APP
+    MPI_Barrier(MPI_COMM_WORLD);
+    #endif
+    timer.start("twohop_neighbor");    
+
+    aby3::sbMatrix direct_neighbors = outting_neighbors_sorted(snode, listGraphEngine);
+
+    if(role == 0) debug_info("get the first direct neighbors! size = " + std::to_string(direct_neighbors.rows()) + " x " + std::to_string(direct_neighbors.i64Size()));
+
+    aby3::i64Matrix direct_neighbors_plain(direct_neighbors.i64Size(), 1);
+    // enc.revealAll(runtime, direct_neighbors, direct_neighbors_plain).get();
+    large_data_decryption(role, direct_neighbors, direct_neighbors_plain, enc, runtime);
+
+
+    if(role == 0) debug_info("revealed the first direct neighbors!");
+
+    size_t neighbor_upper_bound = 10;
+    if(file_prefix.find("slashdot") == 0){
+        neighbor_upper_bound = 7;
+    }
+    if(file_prefix.find("dblp") == 0){
+        neighbor_upper_bound = 4;
+    }
+    if(file_prefix.find("twitter") == 0){
+        neighbor_upper_bound = 5;
+    }
+
+
+    if(role == 0) debug_info("in the second stage!");
+    size_t direct_neighbor_number = 0;
+    std::vector<size_t> direct_neighbors_list;
+    for(size_t i=0; i<direct_neighbors_plain.rows(); i++){
+        if(direct_neighbor_number >= neighbor_upper_bound){
+            break;
+        }
+        if(direct_neighbors_plain(i, 0) != 0){
+            direct_neighbor_number++;
+            direct_neighbors_list.push_back(i);
+        }
+    }
+    while(direct_neighbors_list.size() < neighbor_upper_bound){
+        direct_neighbors_list.push_back(0);
+    }
+
+    // 2-hop neighbor detection.
+    size_t neighbor_count = direct_neighbors_list.size();
+    std::vector<size_t> two_hop_neighbors_list;
+    for(auto& neighbor : direct_neighbors_list){
+        boolIndex neighbor_id_ = boolIndex(neighbor, role);
+        aby3::sbMatrix two_hop_neighbors = outting_neighbors_sorted(neighbor_id_, listGraphEngine); 
+        if(role == 0) debug_info("getting neighbors of " + std::to_string(neighbor_count) + " / " + std::to_string(direct_neighbor_number));
+    }
+
+    #ifdef MPI_APP
+    MPI_Barrier(MPI_COMM_WORLD);
+    #endif
+    timer.end("twohop_neighbor");
+    cmeter.end("twohop_neighbor_send", get_sending_bytes(party_info));
+    cmeter.end("twohop_neighbor_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    // print the timer records.
+    communication_synchronize(party_info);
+    #ifdef MPI_APP
+    if((role == 0) && (rank == 0)){
+    #else
+    if(role == 0){
+    #endif
+        std::ofstream stream(record_file, std::ios::app);
+        stream << "===== Edge list ====" <<std::endl;
+        debug_info("Direct neighbors of node " + std::to_string(direct_neighbor_number), stream);
+        listGraphEngine.print_configs(stream);
+        timer.print_total("milliseconds", stream);
+        // cmeter.print_total("MB", stream);
+        cmeter.print_total_per_party("MB", stream);
+    }
+
+    return 0;
+}
+
+int neighbor_statistics_profiling_edgelist(oc::CLP& cmd){
+
+    #ifdef MPI_APP
+    MPI_INIT
+    #else
+    CONFIG_INIT
+    if(role == 0) debug_info("in this function!!!!");
+    #endif
+    CommunicationMeter& cmeter = CommunicationMeter::getInstance();
+
+    // load graph.
+    std::string graph_data_folder = graph_folder + "adv_application/";
+    std::string file_prefix = "tmp";
+    std::string record_folder = base_folder + "record/cycle_detection/";
+    int record_counter = -1;
+
+    if(cmd.isSet("prefix")){
+        auto keys = cmd.getMany<std::string>("prefix");
+        file_prefix = keys[0];
+    }
+    else{
+        THROW_RUNTIME_ERROR("prefix must be set!");
+    }
+
+    if(cmd.isSet("rcounter")){
+        auto keys = cmd.getMany<int>("rcounter");
+        record_counter = keys[0];
+    }
+    else{
+        THROW_RUNTIME_ERROR("rcounter must be set!");
+    }
+
+    if(cmd.isSet("data_folder")){
+        auto keys = cmd.getMany<std::string>("data_folder");
+        graph_data_folder = keys[0];
+        if(role == 0) debug_info("data_folder: " + graph_data_folder);
+    }
+    if(cmd.isSet("record_folder")){
+        auto keys = cmd.getMany<std::string>("record_folder");
+        record_folder = keys[0];
+        if(role == 0) debug_info("record_folder: " + record_folder);
+    }
+
+    std::string meta_file = graph_data_folder + file_prefix + "_edge_list_meta.txt";
+    std::string graph_data_file = graph_data_folder + file_prefix + "_edge_list.txt";
+    std::string record_file = record_folder + file_prefix + "-" + std::to_string(record_counter) + ".txt";
+    std::string graph_property_file = graph_data_folder + file_prefix + "_edge_list_property.txt";
+
+    // graph loading.
+    cmeter.start("GraphLoad_send", get_sending_bytes(party_info));
+    cmeter.start("GraphLoad_recv", get_receiving_bytes(party_info));
+    timer.start("GraphLoad");
+    plainGraphList plainGraph(meta_file, graph_data_file);
+    ListGraphQueryEngine listGraphEngine(party_info, plainGraph);
+    listGraphEngine.add_property(party_info, graph_property_file);  
+    timer.end("GraphLoad");
+    cmeter.end("GraphLoad_send", get_sending_bytes(party_info));
+    cmeter.end("GraphLoad_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    // statistic analysis.
+    // run the statistic_func.
+    size_t node1 = 0;
+    boolIndex snode = boolIndex(node1, role);
+    size_t upper_bound = 10;
+    boolIndex sec_upper_bound = boolIndex(upper_bound, role);
+
+    cmeter.start("statistic_send", get_sending_bytes(party_info));
+    cmeter.start("statistic_recv", get_receiving_bytes(party_info));
+    timer.start("statistic");
+
+    aby3::si64Matrix statistics = outting_edge_range_statistics(snode, sec_upper_bound, listGraphEngine);
+
+    timer.end("statistic");
+    cmeter.end("statistic_send", get_sending_bytes(party_info));
+    cmeter.end("statistic_recv", get_receiving_bytes(party_info));
+    clear_sending_reveiving_bytes(party_info);
+
+    if(role == 0) debug_info("Statistics success");
+
+    // print the timer records.
+    communication_synchronize(party_info);
+    #ifdef MPI_APP
+    if((role == 0) && (rank == 0)){
+    #else
+    if(role == 0){
+    #endif
+        std::ofstream stream(record_file, std::ios::app);
+        stream << "===== Edge list ====" <<std::endl;
+        listGraphEngine.print_configs(stream);
+        timer.print_total("milliseconds", stream);
+        // cmeter.print_total("MB", stream);
+        cmeter.print_total_per_party("MB", stream);
+    }
+
+    return 0;
+}
+
+int permutation_network_profiling(oc::CLP& cmd){
+
+    CONFIG_INIT
+    if(role == 0) debug_info("permutation network profiling");
+    CommunicationMeter& cmeter = CommunicationMeter::getInstance();
+
+    // std::string record_folder = "/root/aby3/aby3-GORAM/record/permutation_network/";
+    // std::string file_prefix = "tmp";
+    SET_OR_DEFAULT(cmd, length, 1 << 10);
+    SET_OR_DEFAULT(cmd, unit_length, 1 << 4);
+    SET_STRING_OR_DEFAULT(cmd, record_folder, base_folder + "record/permutation_network/");
+    SET_STRING_OR_DEFAULT(cmd, file_prefix, "tmp");
+
+    // data construction.
+    aby3::i64Matrix pdata(length * unit_length, 1);
+    for(size_t i=0; i<length * unit_length; i++){
+        pdata(i, 0) = 0;
+    }
+
+    aby3::sbMatrix sdata(length * unit_length, 64);
+    large_data_encryption(role, pdata, sdata, enc, runtime);
+    
+    std::vector<aby3::sbMatrix> T(length);
+    for(size_t i=0; i<length; i++){
+        aby3::sbMatrix tmp(unit_length, 64);
+        std::memcpy(tmp.mShares[0].data(), sdata.mShares[0].data() + i * unit_length, unit_length);
+        std::memcpy(tmp.mShares[1].data(), sdata.mShares[1].data() + i * unit_length, unit_length);
+        T[i] = tmp;
+    }
+
+    sdata.resize(0, 0);
+
+    // profile the permutation network.
+    cmeter.start("PermutationNetwork_send", get_sending_bytes(party_info));
+    cmeter.start("PermutationNetwork_recv", get_receiving_bytes(party_info));
+    timer.start("PermutationNetwork");
+
+    permutation_network(T, role, T, enc, eval, runtime); 
+
+    timer.end("PermutationNetwork");    
+    cmeter.end("PermutationNetwork_send", get_sending_bytes(party_info));
+    cmeter.end("PermutationNetwork_recv", get_receiving_bytes(party_info));
+
+    communication_synchronize(party_info);
+
+    // print the timer records.
+    if(role == 0){
+        std::ofstream stream(record_folder + file_prefix + ".txt", std::ios::app);
+        timer.print_total("milliseconds", stream);
+        cmeter.print_total_per_party("MB", stream); 
+    }
+    return 0;
+}
+
+
+int shuffMem_profiling(oc::CLP& cmd){
+
+    CONFIG_INIT
+    if(role == 0) debug_info("shuffMem profiling");
+    CommunicationMeter& cmeter = CommunicationMeter::getInstance();
+
+    SET_OR_DEFAULT(cmd, length, 1 << 10);
+    SET_OR_DEFAULT(cmd, unit_length, 1 << 4);
+    SET_STRING_OR_DEFAULT(cmd, record_folder, base_folder + "record/shuffMem/");
+    SET_STRING_OR_DEFAULT(cmd, file_prefix, "tmp");
+
+    debug_info("length = " + std::to_string(length) + ", unit_length = " + std::to_string(unit_length));
+
+    // data construction.
+    aby3::i64Matrix pdata(length * unit_length, 1);
+    for(size_t i=0; i<length * unit_length; i++){
+        pdata(i, 0) = 0;
+    }
+
+    aby3::sbMatrix sdata(length * unit_length, 64);
+    large_data_encryption(role, pdata, sdata, enc, runtime);
+    
+    std::vector<aby3::sbMatrix> T(length);
+    for(size_t i=0; i<length; i++){
+        aby3::sbMatrix tmp(unit_length, 64);
+        std::memcpy(tmp.mShares[0].data(), sdata.mShares[0].data() + i * unit_length, unit_length);
+        std::memcpy(tmp.mShares[1].data(), sdata.mShares[1].data() + i * unit_length, unit_length);
+        T[i] = tmp;
+    }
+
+    debug_info("before resize");
+    sdata.resize(0, 0);
+
+    std::vector<aby3::si64> Pi(length);
+
+    // profile the permutation network.
+    cmeter.start("ShuffMem_send", get_sending_bytes(party_info));
+    cmeter.start("ShuffMem_recv", get_receiving_bytes(party_info));
+    timer.start("ShuffMem");
+
+    debug_info("start shuffMem...");
+    efficient_shuffle_with_random_permutation(T, role, T, Pi, enc, eval, runtime); 
+
+    timer.end("ShuffMem");    
+    cmeter.end("ShuffMem_send", get_sending_bytes(party_info));
+    cmeter.end("ShuffMem_recv", get_receiving_bytes(party_info));
+
+    communication_synchronize(party_info);
+
+    if(role == 0){
+        std::ofstream stream(record_folder + file_prefix + ".txt", std::ios::app);
+        timer.print_total("milliseconds", stream);
+        debug_info("print the communication records...");
+        cmeter.print_total_per_party("MB", stream); 
+    }
+
+    return 0;
+}
+
+
+int data_preparation(oc::CLP& cmd){
+
+    SET_STRING_OR_DEFAULT(cmd, data_folder, graph_folder);
+    SET_STRING_OR_DEFAULT(cmd, data_file_path, "tmp");
+    SET_STRING_OR_DEFAULT(cmd, meta_file_path, "meta");
+    SET_STRING_OR_DEFAULT(cmd, save_folder, graph_folder);
+    SET_OR_DEFAULT(cmd, N, 2);
+
+
+    data_file_path = data_folder + data_file_path;
+    meta_file_path = data_folder + meta_file_path;
+
+    std::ifstream meta_file(meta_file_path);
+    size_t v, e, b, k, l;
+    meta_file >> v >> e >> b >> k >> l;
+
+    std::vector<Edge> edges(b*b*l);
+
+    size_t sub_l = l / N;
+    size_t last_l = l - sub_l * (N-1);
+
+    std::vector<std::ofstream> provider_files(N);
+    for(int i=0; i<N; i++){
+        provider_files[i].open(save_folder + "provider_" + std::to_string(i) + ".txt");
+    }
+    std::vector<int> edges_num(N, 0);
+
+    std::ifstream file(data_file_path);
+    file.rdbuf()->pubsetbuf(nullptr, 0);
+    std::ios_base::sync_with_stdio(false);
+
+    size_t edge_idx = 0;
+    int src, dst;
+    while(file >> src >> dst){
+        size_t grid_idx = edge_idx / l;
+        size_t pos_in_grid = edge_idx % l;
+        size_t provider_idx = pos_in_grid % N;
+
+        if(src != 0 && dst != 0){
+            provider_files[provider_idx] << src << " " << dst << std::endl;
+            edges_num[provider_idx]++;
+        }
+        edge_idx += 1;
+    }
+
+    std::vector<std::ofstream> provider_meta_file(N);
+    for(int i=0; i<N; i++){
+        provider_files[i].close();
+        provider_meta_file[i].open(save_folder + "provider_" + std::to_string(i) + "_meta.txt");
+        provider_meta_file[i] << v << " " << edges_num[i] << " " << b << " " << k << std::endl;
+        provider_meta_file[i].close();
+    }
+
+    return 0;
+}
+
+
+int partition_initialization_profiling(oc::CLP& cmd){
+
+    Timer& timer = Timer::getInstance(); \
+    timer.clear_records();
+
+    std::string graph_data_folder = graph_folder;
+    std::string file_path = "tmp";
+    std::string meta_file_path = "meta";
+    std::string record_folder = base_folder + "record/partition_initialization/";
+    std::string record_file = "tmp";
+
+    if(cmd.isSet("data_folder")){
+        auto keys = cmd.getMany<std::string>("data_folder");
+        graph_data_folder = keys[0];
+    }
+
+    if(cmd.isSet("file_path")){
+        auto keys = cmd.getMany<std::string>("file_path");
+        file_path = keys[0];
+    }
+
+    if(cmd.isSet("meta_file_path")){
+        auto keys = cmd.getMany<std::string>("meta_file_path");
+        meta_file_path = keys[0];
+    }
+
+    if(cmd.isSet("record_folder")){
+        auto keys = cmd.getMany<std::string>("record_folder");
+        record_folder = keys[0];
+    }
+
+    if(cmd.isSet("record_file")){
+        auto keys = cmd.getMany<std::string>("record_file");
+        record_file = keys[0];
+    }
+
+    file_path = graph_data_folder + file_path;
+    meta_file_path = graph_data_folder + meta_file_path;
+    record_file = record_folder + record_file;
+
+    debug_info("file_path = " + file_path);
+    debug_info("meta_file_path = " + meta_file_path);
+
+    // load the meta data.
+    std::ifstream meta_file(meta_file_path);
+    size_t v, e, b, k;
+
+    meta_file >> v >> e >> b >> k;
+
+    std::vector<Edge> edges;
+    std::vector<std::vector<Edge>> grids(b*b);
+
+    timer.start("data_load");
+
+    int fd = open(file_path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        std::cerr << "failed to open file.\n";
+        return -1;
+    }
+    
+    struct stat sb;
+    if (fstat(fd, &sb) < 0) {
+        std::cerr << "fstat failed\n";
+        close(fd);
+        return -1;
+    }
+    
+    char* data = (char*)mmap(nullptr, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (data == MAP_FAILED) {
+        std::cerr << "mmap failed\n";
+        close(fd);
+        return -1;
+    }
+
+    const int num_threads = std::thread::hardware_concurrency();
+    std::vector<std::thread> threads;
+    std::vector<std::vector<Edge>> thread_edges(num_threads);
+
+    size_t chunk_size = sb.st_size / num_threads;
+
+    auto adjust_start = [data, file_size = sb.st_size](char* ptr) -> char* {
+        while (ptr < data + file_size && *ptr != '\n') {
+            ++ptr;
+        }
+        if (ptr < data + file_size) ++ptr;  // skip.
+        return ptr;
+    };
+
+    auto adjust_end = [data](char* ptr) -> char* {
+        while (ptr > data && *(ptr - 1) != '\n') {
+            --ptr;
+        }
+        return ptr;
+    };
+
+    // using multi-threads.
+    for (int t = 0; t < num_threads; t++) {
+        char* chunk_start = data + t * chunk_size;
+        char* chunk_end = (t == num_threads - 1) ? data + sb.st_size : data + (t + 1) * chunk_size;
+        
+        if (t > 0) {
+            chunk_start = adjust_start(chunk_start);
+        }
+        if (t < num_threads - 1) {
+            chunk_end = adjust_end(chunk_end);
+        }
+        
+        threads.emplace_back([=, &thread_edges, k, b]() {
+            char* cur = chunk_start;
+            while (cur < chunk_end) {
+                while (cur < chunk_end && !isdigit(*cur)) cur++;
+                if (cur >= chunk_end) break;
+                
+                int src = 0;
+                while (cur < chunk_end && isdigit(*cur)) {
+                    src = src * 10 + (*cur - '0');
+                    cur++;
+                }
+                while (cur < chunk_end && !isdigit(*cur)) cur++;
+                if (cur >= chunk_end) break;
+                
+                int dst = 0;
+                while (cur < chunk_end && isdigit(*cur)) {
+                    dst = dst * 10 + (*cur - '0');
+                    cur++;
+                }
+                
+                size_t grid_index = (src / k) * b + (dst / k);
+                thread_edges[t].push_back({src, dst, grid_index});
+            }
+        });
+    }
+    
+    for (auto& thread : threads) {
+        thread.join();
+    }
+    
+    for (auto& vec : thread_edges) {
+        edges.insert(edges.end(), 
+                     std::make_move_iterator(vec.begin()),
+                     std::make_move_iterator(vec.end()));
+    }
+    
+    munmap(data, sb.st_size);
+    close(fd);
+
+    timer.end("data_load");
+    
+    timer.start("sort");
+    std::sort(edges.begin(), edges.end(), 
+        [](const Edge& a, const Edge& b) {
+            return a.grid_idx < b.grid_idx;
+        });
+    timer.end("sort");
+
+    timer.start("partition");
+    for(const auto& edge : edges){
+        grids[edge.grid_idx].push_back(edge);
+    }
+    timer.end("partition");
+
+    edges.clear();
+
+    timer.start("normalize");
+    // find the maximum partition size.
+    size_t max_size = std::max_element(grids.begin(), grids.end(),
+    [](const auto& a, const auto& b) {
+        return a.size() < b.size();
+    })->size();
+
+    // normalize the partition size.
+    Edge zero_edge = {0, 0, 0};
+    #pragma omp parallel for
+    for(auto& grid : grids) {
+        grid.resize(max_size, zero_edge);
+    }
+    timer.end("normalize");
+
+    // secret sharing split.
+    timer.start("secret_share");
+    {
+    std::vector<int> share1(b * b * max_size * 2);
+    std::vector<int> share2(b * b * max_size * 2);
+    std::vector<int> share3(b * b * max_size * 2);
+
+    size_t total_size = b * b * max_size * 2;
+
+    // random generator.
+    const int num_threads = omp_get_max_threads();
+    std::vector<std::mt19937> generators(num_threads);
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        generators[tid].seed(std::random_device{}());
+    }
+
+    const int MOD = 1 << 30;
+    const int CHUNK_SIZE = 1024; // cache-friendly.
+
+    // generate the randomness in parallel.
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        std::uniform_int_distribution<int> dis(1, MOD);
+        
+        #pragma omp for schedule(static, CHUNK_SIZE)
+        for (size_t i = 0; i < total_size; i++) {
+            share1[i] = dis(generators[tid]);
+        }
+
+        #pragma omp for schedule(static, CHUNK_SIZE)
+        for (size_t i = 0; i < total_size; i++) {
+            share2[i] = dis(generators[tid]);
+        }
+    }
+
+    // pre-compute the mask val.
+    const int MOD_MASK = MOD - 1;
+    const bool IS_MOD_POWER_OF_TWO = (MOD & (MOD - 1)) == 0;
+
+    #pragma omp parallel
+    {
+        #pragma omp for schedule(dynamic, num_threads)
+        for (size_t grid_idx = 0; grid_idx < grids.size(); grid_idx++) {
+            const auto& grid = grids[grid_idx];
+            size_t base_idx = grid_idx * max_size;
+            
+            for (size_t edge_idx = 0; edge_idx < grid.size(); edge_idx++) {
+                size_t i = (base_idx + edge_idx) * 2;
+                int temp1 = grid[edge_idx].src - share1[i] - share2[i];
+                int temp2 = grid[edge_idx].dst - share1[i+1] - share2[i+1];
+                
+                if (IS_MOD_POWER_OF_TWO) {
+                    share3[i] = temp1 & MOD_MASK;
+                    share3[i+1] = temp2 & MOD_MASK;
+                } else {
+                    temp1 = (temp1 % MOD + MOD);
+                    temp2 = (temp2 % MOD + MOD);
+                    share3[i] = (temp1 >= MOD) ? temp1 - MOD : temp1;
+                    share3[i+1] = (temp2 >= MOD) ? temp2 - MOD : temp2;
+                }
+            }
+        }
+    }
+    }
+    timer.end("secret_share");
+
+    // print the records.
+    std::ofstream stream(record_file, std::ios::app);
+    timer.print_total("milliseconds", stream);
+    stream << "partition size = " << b << " x " << b << " x " << max_size << std::endl;
+
+    return 0;
+}
+
+
+int partition_transmission_profiling(oc::CLP& cmd){
+
+    Timer& timer = Timer::getInstance();
+    timer.clear_records();
+
+    // assign role and setup the communication.
+    SET_OR_DEFAULT(cmd, role, 0); // 0 for server and 1 for data provider.
+    SET_OR_DEFAULT(cmd, N, 1); // the total number of dat providers.
+    SET_OR_DEFAULT(cmd, provider_id, -1);
+    SET_STRING_OR_DEFAULT(cmd, server_ip, "127.0.0.1");
+    SET_STRING_OR_DEFAULT(cmd, data_folder, graph_folder);
+    SET_STRING_OR_DEFAULT(cmd, data_file_path, "tmp");
+    SET_STRING_OR_DEFAULT(cmd, meta_file_path, "meta");
+    SET_OR_DEFAULT(cmd, n_plus, -1);
+
+    data_file_path = data_folder + data_file_path;
+    meta_file_path = data_folder + meta_file_path;
+
+    int base_port = 11001;
+    size_t chunk_size = 1 << 22;
+
+    if(role == 0){ // server side computation.
+        // setup the communication.
+        boost::asio::io_context io_context;
+        std::vector<std::thread> server_threads;
+
+        for (int i = 0; i < N; ++i) {
+            int port = base_port + i;
+            server_threads.emplace_back([port, &io_context, i, chunk_size]() {
+                // std::ofstream pfile("/root/GORAM-ABY3/aby3/server_debug-" + std::to_string(i)+".txt", std::ios_base::app);
+
+                // debug_info("Server starting on port " + std::to_string(port), pfile);
+
+                boost::asio::ip::tcp::acceptor acceptor(io_context, boost::asio::ip::tcp::endpoint(boost::asio::ip::tcp::v4(), port));
+
+                // debug_info("Server listensing on port" + std::to_string(port), pfile);
+
+                boost::asio::ip::tcp::socket socket(io_context);
+                acceptor.accept(socket);
+                // debug_info("Connection established with provider " + std::to_string(i) + " on port " + std::to_string(port), pfile);
+
+                // Receive key for authentication
+                char buffer[1024];
+                size_t length = socket.read_some(boost::asio::buffer(buffer));
+                std::string received_hmac(buffer, length);
+                // debug_info("Received HMAC from provider " + std::to_string(i) + " = " + received_hmac, pfile);
+
+                // authentication.
+                std::string shared_key = "shared_key";
+                std::string message = "message";
+                unsigned char expected_hmac[EVP_MAX_MD_SIZE];
+                unsigned int hmac_length;
+
+                HMAC(EVP_sha256(), shared_key.c_str(), shared_key.length(),
+                    reinterpret_cast<const unsigned char*>(message.c_str()), message.length(),
+                    expected_hmac, &hmac_length);
+
+                // Compare received HMAC with expected HMAC
+                // if (received_hmac != std::string(reinterpret_cast<char*>(expected_hmac), hmac_length)) {
+                //     std::cerr << "Invalid HMAC from provider " << i << " on port " << port << ". Closing connection.\n";
+                // }
+
+                bool val = (received_hmac != std::string(reinterpret_cast<char*>(expected_hmac), hmac_length));
+                
+                // debug_info("Secure channel established on port " + std::to_string(port) + ".", pfile);
+
+                // Receive data
+                size_t total_length;
+                boost::asio::read(socket, boost::asio::buffer(&total_length, sizeof(total_length)));
+
+                // debug_info("Received total data length: " + std::to_string(total_length), pfile);
+
+                // std::vector<int> received_data;
+                // received_data.reserve(total_length);
+                std::vector<std::vector<int>> reveived_data;
+
+                std::vector<int> data_buffer(chunk_size);
+                size_t received_count = 0;
+
+                while(received_count < total_length){
+                    size_t remaining_length = total_length - received_count;
+                    size_t current_chunk_size = std::min(chunk_size, remaining_length);
+
+                    // size_t length = socket.read(boost::asio::buffer(data_buffer.data(), current_chunk_size * sizeof(int)));
+                    boost::asio::read(socket, boost::asio::buffer(data_buffer.data(), current_chunk_size * sizeof(int)));
+                    // size_t received_integers = current_chunk_size;
+
+                    // received_data.insert(received_data.end(), data_buffer.begin(), data_buffer.begin() + received_integers);
+                    reveived_data.push_back(std::vector<int>(data_buffer.begin(), data_buffer.begin() + current_chunk_size));
+                    received_count += current_chunk_size;
+
+                    // debug_info("Received " + std::to_string(received_count) + " / " + std::to_string(total_length), pfile);
+                }
+
+            });
+        }
+
+        io_context.run();
+
+        timer.start("server");
+        for (auto& thread : server_threads) {
+            thread.join();
+        }
+        timer.end("server");
+        std::ofstream stream("/scratch1/data/server_timer-" + std::to_string(n_plus) + ".txt", std::ios::app);
+        timer.print_total("milliseconds", stream);
+    }
+    else{ // data provider.
+        if(provider_id < 0) {
+            std::cerr << "error id " << provider_id << std::endl;
+        }
+
+        // std::ofstream pfile("/root/GORAM-ABY3/aby3/provider_debug-" + std::to_string(provider_id)+".txt", std::ios_base::app);
+
+        timer.start("provider_channel");
+        // setup the channel.
+        boost::asio::io_context io_context;
+        int port = base_port + provider_id;
+        boost::asio::ip::tcp::socket socket(io_context);
+
+        bool connected = false;
+        size_t attempts = 0;
+        while (!connected && attempts < 5) {
+            try {
+                socket.connect(boost::asio::ip::tcp::endpoint(boost::asio::ip::address::from_string(server_ip), port));
+                connected = true;
+                // std::cout << "Connected to server on port " << port << std::endl;
+                // debug_info("Connected to server on port " + std::to_string(port), pfile);
+            } catch (const boost::system::system_error& e) {
+                // std::cerr << "Connection attempt " << attempts + 1 << " failed: " << e.what() << std::endl;
+                // debug_info("Connection attempt " + std::to_string(attempts + 1) + " failed: " + e.what(), pfile);
+                std::this_thread::sleep_for(std::chrono::seconds(1));  // 等待1秒后重试
+                attempts++;
+            }
+        }
+
+        // debug_info("Connected to server on port " + std::to_string(port), pfile);
+        timer.end("provider_channel");
+        // send the authentication key.
+        // std::string key = "provider_key";
+        timer.start("provider_authentication");
+        char auth_key[1024];
+        std::fill_n(auth_key, 1024, 'A'); // 用'A'填充
+
+        // 加入一些特征字符以便识别
+        const char* marker = "provider_key";
+        std::copy(marker, marker + strlen(marker), auth_key);
+
+        // 转换为string用于传输
+        std::string key(auth_key, 1024);
+        boost::asio::write(socket, boost::asio::buffer(key));
+        // debug_info("provider " + std::to_string(provider_id) + " sent key", pfile);
+        timer.end("provider_authentication");
+
+        // send the data length.
+        timer.start("provider_data");
+        size_t total_length;
+        std::ifstream meta_file(meta_file_path);
+        meta_file >> total_length;
+
+        boost::asio::write(socket, boost::asio::buffer(&total_length, sizeof(total_length)));
+        // debug_info("Provider sent total data length: " + std::to_string(total_length) + " integers.", pfile);
+
+        std::ifstream data_file(data_file_path, std::ios::binary);
+        // if(!data_file.is_open()){
+        //     debug_info("Failed to open data file: " + data_file_path, pfile);
+        //     return -1;
+        // }
+
+        // send the data.
+        size_t sent_count = 0;
+        std::vector<int> data_buffer(chunk_size);
+
+        while(sent_count < total_length){
+            size_t remaining_size = total_length - sent_count;
+            int current_chunk_size = std::min(chunk_size, remaining_size);
+
+            data_file.read(reinterpret_cast<char*>(data_buffer.data()), current_chunk_size * sizeof(int));
+            size_t read_count = data_file.gcount() / sizeof(int);
+
+            // if (read_count != current_chunk_size) {
+            //     // Data size mismatch, adjust current_chunk_size
+            //     // current_chunk_size = read_count;
+            //     debug_info("Data size mismatch, adjust current_chunk_size | read_count - " + std::to_string(read_count) + " | chunk_size = " + std::to_string(current_chunk_size), pfile);
+            // }
+
+            // send data chunk;
+            boost::asio::write(socket, boost::asio::buffer(data_buffer.data(), current_chunk_size * sizeof(int)));
+            sent_count += current_chunk_size;
+
+            // debug_info("Provider send " + std::to_string(sent_count) + " / " + std::to_string(total_length), pfile);
+        }
+
+        data_file.close();
+        timer.end("provider_data");
+
+        // print the records.
+        if(provider_id == 0){
+            std::ofstream stream("/scratch1/data/provider_timer-" + std::to_string(n_plus) + ".txt", std::ios::app);
+            timer.print_total("milliseconds", stream);
+        }
+    }
+    
+
+    return 0;
+}
+
+
+int random_share_generation(oc::CLP& cmd){
+
+    SET_STRING_OR_DEFAULT(cmd, data_file_path, "tmp");
+    SET_STRING_OR_DEFAULT(cmd, meta_file_path, "meta");
+    SET_OR_DEFAULT(cmd, total_length, 1024);
+
+    // generate the data.
+    std::ofstream meta_file(meta_file_path);
+    meta_file << total_length << std::endl;
+
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<int> dis(std::numeric_limits<int>::min(), std::numeric_limits<int>::max());
+    
+    try {
+        // 打开文件用于二进制写入
+        std::ofstream file(data_file_path, std::ios::binary);
+        if (!file) {
+            std::cerr << "can not open: " << data_file_path << std::endl;
+            return false;
+        }
+
+        // 分块写入以提高性能
+        const size_t chunk_size = 1024 * 1024; // 1MB chunks
+        std::vector<int> buffer(std::min(chunk_size, total_length));
+        
+        size_t remaining = total_length;
+        while (remaining > 0) {
+            // 确定当前块大小
+            size_t current_chunk = std::min(chunk_size, remaining);
+            buffer.resize(current_chunk);
+            
+            // 生成随机数
+            for (size_t i = 0; i < current_chunk; ++i) {
+                buffer[i] = dis(gen);
+            }
+            
+            // 写入文件
+            file.write(reinterpret_cast<const char*>(buffer.data()), current_chunk * sizeof(int));
+
+            remaining -= current_chunk;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "An error occurred: " << e.what() << std::endl;
+        return false;
+    }
+
+    return 0;
+}
