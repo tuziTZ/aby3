@@ -3,7 +3,8 @@
 #include <map>
 #include <mpi.h>
 #include "aby3-GORAM/benchmark.h"
-#include "aby3-BSPN/BSPNTest.h"
+#include "aby3-BSPN/FlatBSPN.h"
+#include "aby3-BSPN/MultiplierPreprocessing.h"
 
 using namespace oc;
 using namespace aby3;
@@ -11,8 +12,13 @@ using namespace aby3;
 int main(int argc, char** argv) {
   oc::CLP cmd(argc, argv);
 
-  if(cmd.isSet("bspn_test")){
-    BSPN_test(cmd);
+  if(cmd.isSet("bspn_multiplier_preprocess")){
+    BSPN_multiplier_preprocess(cmd);
+    return 0;
+  }
+
+  if(cmd.isSet("bspn_flat_eval")){
+    BSPN_flat_eval(cmd);
     return 0;
   }
 

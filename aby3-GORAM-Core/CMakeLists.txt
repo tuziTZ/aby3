@@ -6,19 +6,25 @@ include_directories("/usr/include/mpich")
 
 #######################################
 # json
-if(NOT TARGET jsoncpp)
-
-    find_path(JSON_INCLUDE_DIR 
+find_package(jsoncpp CONFIG QUIET)
+if(TARGET JsonCpp::JsonCpp)
+    set(ABY3_GORAM_CORE_JSONCPP_TARGET JsonCpp::JsonCpp)
+else()
+    find_path(JSON_INCLUDE_DIR
       NAMES "json/json.h"
       REQUIRED)
-    if(NOT EXISTS ${JSON_INCLUDE_DIR})
-        message(FATAL_ERROR "failed to find json")
-    endif()
+    find_library(JSONCPP_LIBRARY
+      NAMES jsoncpp
+      REQUIRED)
     message(STATUS "In aby3-GORAM-Core, JSON_INCLUDE_DIR=${JSON_INCLUDE_DIR}")
-    add_library(json INTERFACE IMPORTED)
-    target_include_directories(json INTERFACE 
-                    $<BUILD_INTERFACE:${JSON_INCLUDE_DIR}>
-                    $<INSTALL_INTERFACE:>)
+    if(NOT TARGET jsoncpp_fallback)
+        add_library(jsoncpp_fallback INTERFACE)
+        target_include_directories(jsoncpp_fallback INTERFACE
+                        $<BUILD_INTERFACE:${JSON_INCLUDE_DIR}>
+                        $<INSTALL_INTERFACE:>)
+        target_link_libraries(jsoncpp_fallback INTERFACE ${JSONCPP_LIBRARY})
+    endif()
+    set(ABY3_GORAM_CORE_JSONCPP_TARGET jsoncpp_fallback)
 endif()
 
 #######################################
@@ -37,7 +43,7 @@ if(NOT TARGET mpi)
                     $<INSTALL_INTERFACE:>)
 endif()
 
-target_link_libraries(aby3-GORAM-Core aby3 jsoncpp mpi)
+target_link_libraries(aby3-GORAM-Core aby3 ${ABY3_GORAM_CORE_JSONCPP_TARGET} mpi)
 
 
 # file(GLOB_RECURSE SRCS *.cpp)
