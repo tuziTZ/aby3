@@ -84,6 +84,8 @@ struct FlatFactorSpec {
     std::vector<int> relevant_scope;
     std::vector<int> feature_inverted_scope;
     std::vector<std::vector<FlatEvidenceInterval>> evidence;
+    std::uint64_t public_feature_count = 0;
+    std::uint64_t public_evidence_count = 0;
     std::uint64_t total_rows = 0;
 };
 
@@ -105,6 +107,7 @@ struct FlatBSPNSecureContext {
 struct FlatBSPNSecretHostPayload {
     f64Matrix<kFlatBSPNDecimal> node_cardinalities;
     f64Matrix<kFlatBSPNDecimal> node_inv_cardinalities;
+    i64Matrix node_scopes;
     f64Matrix<kFlatBSPNDecimal> weights;
     f64Matrix<kFlatBSPNDecimal> bucket_values;
     f64Matrix<kFlatBSPNDecimal> bucket_lowers;
@@ -115,6 +118,7 @@ struct FlatBSPNSecretHostPayload {
 struct FlatBSPNSecretSharedPayload {
     sf64Matrix<kFlatBSPNDecimal> node_cardinalities;
     sf64Matrix<kFlatBSPNDecimal> node_inv_cardinalities;
+    si64Matrix node_scopes;
     sf64Matrix<kFlatBSPNDecimal> weights;
     sf64Matrix<kFlatBSPNDecimal> bucket_values;
     sf64Matrix<kFlatBSPNDecimal> bucket_lowers;
@@ -148,6 +152,14 @@ struct FlatDenseSecretFactorBinding {
     std::vector<std::uint8_t> feature_scope;
     std::vector<std::uint8_t> relevant_scope;
     std::vector<std::uint8_t> feature_inverted_scope;
+    std::vector<std::uint8_t> has_evidence;
+    std::vector<std::uint64_t> interval_counts;
+    std::vector<std::vector<double>> lower_bounds;
+    std::vector<std::vector<double>> upper_bounds;
+    std::vector<std::vector<std::uint8_t>> has_lower;
+    std::vector<std::vector<std::uint8_t>> has_upper;
+    std::vector<std::vector<std::uint8_t>> open_lower;
+    std::vector<std::vector<std::uint8_t>> open_upper;
 };
 
 struct FlatSecureQueryPayload {
@@ -221,6 +233,7 @@ private:
     std::vector<double> bucket_values_;
     std::vector<double> node_cardinalities_;
     std::vector<double> node_inv_cardinalities_;
+    std::vector<std::uint8_t> node_scopes_;
     std::vector<std::uint8_t> leaf_bitmaps_;
     FlatBSPNSecretHostPayload secret_host_payload_;
     FlatBSPNSecretSharedPayload secret_shared_payload_;
