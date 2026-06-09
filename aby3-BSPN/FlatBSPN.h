@@ -112,7 +112,6 @@ struct FlatBSPNSecretHostPayload {
     f64Matrix<kFlatBSPNDecimal> bucket_values;
     f64Matrix<kFlatBSPNDecimal> bucket_lowers;
     f64Matrix<kFlatBSPNDecimal> bucket_uppers;
-    i64Matrix leaf_bitmaps;
 };
 
 struct FlatBSPNSecretSharedPayload {
@@ -123,7 +122,6 @@ struct FlatBSPNSecretSharedPayload {
     sf64Matrix<kFlatBSPNDecimal> bucket_values;
     sf64Matrix<kFlatBSPNDecimal> bucket_lowers;
     sf64Matrix<kFlatBSPNDecimal> bucket_uppers;
-    si64Matrix leaf_bitmaps;
     std::vector<sbMatrix> dense_bucket_bitmaps;
     bool dense_bucket_bitmaps_loaded = false;
     bool loaded = false;
@@ -215,6 +213,9 @@ public:
     void load_public_manifest(const std::string& manifest_path);
     void load_secret_payload();
     void load_secret_payload(const FlatBSPNSecureContext& context);
+    sbMatrix share_bucket_bitmap_stack(
+        const std::vector<std::uint32_t>& bucket_indices,
+        const FlatBSPNSecureContext& context) const;
 
     const FlatBSPNManifest& manifest() const { return manifest_; }
     const std::vector<FlatBSPNNodeRecord>& nodes() const { return nodes_; }
