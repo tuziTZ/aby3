@@ -64,6 +64,9 @@ struct FlatBSPNManifest {
     std::uint64_t node_cardinality_count = 0;
     std::uint64_t node_inv_cardinality_count = 0;
     std::string secret_payload_dir = "secret";
+    std::string secret_payload_encoding;
+    std::string secure_share_payload_dir = "secret_shares";
+    std::vector<std::uint32_t> secure_multiplier_bucket_indices;
 };
 
 struct FlatEvidenceInterval {
@@ -112,6 +115,7 @@ struct FlatBSPNSecretHostPayload {
     f64Matrix<kFlatBSPNDecimal> bucket_values;
     f64Matrix<kFlatBSPNDecimal> bucket_lowers;
     f64Matrix<kFlatBSPNDecimal> bucket_uppers;
+    i64Matrix leaf_bitmaps;
 };
 
 struct FlatBSPNSecretSharedPayload {
@@ -122,6 +126,7 @@ struct FlatBSPNSecretSharedPayload {
     sf64Matrix<kFlatBSPNDecimal> bucket_values;
     sf64Matrix<kFlatBSPNDecimal> bucket_lowers;
     sf64Matrix<kFlatBSPNDecimal> bucket_uppers;
+    si64Matrix leaf_bitmaps;
     std::vector<sbMatrix> dense_bucket_bitmaps;
     bool dense_bucket_bitmaps_loaded = false;
     bool loaded = false;
@@ -236,6 +241,9 @@ private:
     std::vector<double> node_inv_cardinalities_;
     std::vector<std::uint8_t> node_scopes_;
     std::vector<std::uint8_t> leaf_bitmaps_;
+    std::vector<int> secure_bucket_offsets_;
+    std::vector<sbMatrix> secure_multiplier_bucket_bitmaps_;
+    bool secure_share_payload_loaded_ = false;
     FlatBSPNSecretHostPayload secret_host_payload_;
     FlatBSPNSecretSharedPayload secret_shared_payload_;
 };
