@@ -273,6 +273,23 @@ double reveal_scaled_denominator(
     return reveal_fixed_scalar(value.denominator, context) * value.denominator_scale;
 }
 
+void synchronize_secure_parties(const FlatBSPNSecureContext& context) {
+    if (!context.has_runtime()) {
+        throw std::runtime_error("FlatBSPNSecureContext runtime is not initialized.");
+    }
+    std::uint64_t token = 0;
+    std::uint64_t from_prev = 0;
+    std::uint64_t from_next = 0;
+    auto send_next = context.runtime->mComm.mNext.asyncSendFuture(&token, 1);
+    auto send_prev = context.runtime->mComm.mPrev.asyncSendFuture(&token, 1);
+    auto recv_prev = context.runtime->mComm.mPrev.asyncRecv(&from_prev, 1);
+    auto recv_next = context.runtime->mComm.mNext.asyncRecv(&from_next, 1);
+    recv_prev.get();
+    recv_next.get();
+    send_next.get();
+    send_prev.get();
+}
+
 struct SecureBoundFactor {
     std::string model_id;
     std::string manifest_path;
@@ -284,6 +301,7 @@ struct SecureBundleExecutionResult {
     SecureRationalShare result_rational;
     bool has_result = false;
     double root_division_payload_scale = 1.0;
+    bool root_division_scale_denominator_payload = false;
     json debug_output;
 };
 
@@ -732,6 +750,29 @@ SecureRationalShare make_secure_rational(
     return out;
 }
 
+SecureRationalShare make_secure_public_scaled_constant(
+    double value,
+    const FlatBSPNSecureContext& context) {
+    if (std::abs(value) <= 1e-12) {
+        return make_secure_rational(0.0, 1.0, context);
+    }
+    SecureRationalShare out = make_secure_rational(value < 0.0 ? -1.0 : 1.0, 1.0, context);
+    out.numerator_scale = std::abs(value);
+    return out;
+}
+
+json secure_rational_debug_json(
+    const SecureRationalShare& value,
+    const FlatBSPNSecureContext& context) {
+    const double numerator = reveal_scaled_numerator(value, context);
+    const double denominator = reveal_scaled_denominator(value, context);
+    return {
+        {"numerator", numerator},
+        {"denominator", denominator},
+        {"value", std::abs(denominator) <= 1e-12 ? 0.0 : numerator / denominator},
+    };
+}
+
 SecureRationalShare normalize_secure_rational_scales(SecureRationalShare value) {
     const double common_scale = std::max(
         std::max(std::abs(value.numerator_scale), std::abs(value.denominator_scale)),
@@ -907,20 +948,26 @@ sf64Matrix<kFlatBSPNDecimal> secure_count_reciprocal_newton_scaled(
 SecureRationalShare normalize_factor_root_rational(
     const SecureRationalShare& value,
     const FlatBSPNSecureContext& context,
-    double public_payload_scale = 1.0) {
-    // Newton reciprocal starts from 1, so scale the root rational payload into
-    // a small public unit before the single online division. The numerator and
-    // denominator are scaled equally, preserving the represented value while
-    // avoiding divergence for query-level denominators in the hundreds/thousands.
+    double public_payload_scale = 1.0,
+    bool scale_denominator_payload = false) {
+    // The final scalar conversion multiplies the numerator payload by the
+    // reciprocal of the denominator payload. Keep the denominator close to the
+    // original probability-like unit for Newton convergence, and shrink only
+    // the numerator payload when public scaling has made it too large.
     const double payload_scale =
         std::isfinite(public_payload_scale) && public_payload_scale > 0.0
             ? public_payload_scale
             : 1.0;
-    const auto scaled_value = scale_secure_rational_public(
-        value,
-        payload_scale,
-        context);
-    if (context.debug_reveal) {
+    SecureRationalShare scaled_value = value;
+    if (payload_scale != 1.0) {
+        scaled_value.numerator = secure_mul_public_fixed(value.numerator, payload_scale, context);
+        scaled_value.numerator_scale = value.numerator_scale / payload_scale;
+        if (scale_denominator_payload) {
+            scaled_value.denominator = secure_mul_public_fixed(value.denominator, payload_scale, context);
+            scaled_value.denominator_scale = value.denominator_scale / payload_scale;
+        }
+    }
+    if (context.debug_internal_reveal) {
         const double denominator = reveal_scaled_denominator(scaled_value, context);
         if (!std::isfinite(denominator) || std::abs(denominator) <= 1e-12) {
             throw std::runtime_error("Secure factor root denominator is too small for root-only division.");
@@ -937,6 +984,11 @@ SecureRationalShare normalize_factor_root_rational(
     };
 }
 
+bool has_large_public_rational_scale(const SecureRationalShare& value) {
+    return std::abs(value.numerator_scale) > 1000000.0 ||
+           std::abs(value.denominator_scale) > 1000000.0;
+}
+
 SecureRationalShare multiply_secure_rational(
     const SecureRationalShare& lhs,
     const SecureRationalShare& rhs,
@@ -948,10 +1000,17 @@ SecureRationalShare multiply_secure_rational(
         out.denominator = share_fixed_scalar<kFlatBSPNDecimal>(1.0, 0, context);
         out.denominator_scale = 1.0;
         out.denominator_is_one = true;
+        if (has_large_public_rational_scale(lhs) || has_large_public_rational_scale(rhs)) {
+            return out;
+        }
         return normalize_secure_rational_scales(std::move(out));
     } else {
         out.denominator = secure_mul_fixed(lhs.denominator, rhs.denominator, context);
         out.denominator_scale = lhs.denominator_scale * rhs.denominator_scale;
+    }
+    out.denominator_is_one = false;
+    if (has_large_public_rational_scale(lhs) || has_large_public_rational_scale(rhs)) {
+        return out;
     }
     out = normalize_secure_rational_scales(std::move(out));
     const auto lhs_non_unit = rational_non_unit_denominator_flag(lhs, context);
@@ -1999,6 +2058,11 @@ SecureBoundFactor bind_secure_factor_from_secure_bundle(
     bound.factor.relevant_scope.assign(total_columns, 0);
     bound.factor.feature_inverted_scope.assign(total_columns, 0);
     bound.factor.total_rows = factor_doc.value("total_rows", model.manifest().total_rows);
+    if (bound.factor.total_rows != model.manifest().total_rows) {
+        throw std::runtime_error(
+            "Secure bundle factor total_rows does not match model sample_total_rows for model " +
+            bound.model_id);
+    }
 
     const std::string secret_factor_id = factor_doc.value("secret_factor_id", std::string());
     if (!secret_factor_id.empty()) {
@@ -2010,6 +2074,40 @@ SecureBoundFactor bind_secure_factor_from_secure_bundle(
     }
 
     return bound;
+}
+
+bool factor_array_has_large_public_scale(const json& factors_doc) {
+    double max_public_constant = 0.0;
+    double max_eval_rows = 0.0;
+    for (const auto& factor_doc : factors_doc) {
+        const std::string factor_kind = factor_doc.value("factor_kind", std::string());
+        if (factor_kind == "CONSTANT") {
+            max_public_constant = std::max(
+                max_public_constant,
+                std::abs(factor_doc.value("public_constant_value", 0.0)));
+        } else {
+            max_eval_rows = std::max(
+                max_eval_rows,
+                static_cast<double>(factor_doc.value("total_rows", std::uint64_t(0))));
+        }
+    }
+    return max_eval_rows > 0.0 && max_public_constant > max_eval_rows * 16.0;
+}
+
+bool aggregate_term_has_large_public_scale(const json& term_doc) {
+    if (term_doc.contains("expectation_plan") &&
+        factor_array_has_large_public_scale(term_doc["expectation_plan"].value("factors", json::array()))) {
+        return true;
+    }
+    if (term_doc.contains("numerator_plan") &&
+        factor_array_has_large_public_scale(term_doc["numerator_plan"].value("factors", json::array()))) {
+        return true;
+    }
+    if (term_doc.contains("denominator_plan") &&
+        factor_array_has_large_public_scale(term_doc["denominator_plan"].value("factors", json::array()))) {
+        return true;
+    }
+    return false;
 }
 
 SecureRationalShare weighted_sum_secure_rational(
@@ -3595,7 +3693,11 @@ SecureBundleExecutionResult evaluate_secure_bundle_impl_secure(
             SecureRationalShare factor_value = make_secure_rational(1.0, 1.0, context);
             SecureIndicatorEvalStats indicator_stats;
             if (bound.factor.factor_kind == "CONSTANT") {
-                factor_value = make_secure_rational(bound.factor.public_constant_value, 1.0, context);
+                if (std::abs(bound.factor.public_constant_value) > 1000000.0) {
+                    factor_value = make_secure_public_scaled_constant(bound.factor.public_constant_value, context);
+                } else {
+                    factor_value = make_secure_rational(bound.factor.public_constant_value, 1.0, context);
+                }
 	            } else if (bound.factor.factor_kind == "INDICATOR_EXPECTATION" ||
 	                       bound.factor.factor_kind == "EXPECTATION") {
 	                auto model_it = model_cache.find(bound.manifest_path);
@@ -3646,10 +3748,10 @@ SecureBundleExecutionResult evaluate_secure_bundle_impl_secure(
                 constexpr double kSecureD16IndicatorCalibration = 1.0054;
                 factor_value.numerator_scale *= kSecureD16IndicatorCalibration;
             }
-            if (factor_debug != nullptr && context.debug_reveal) {
+            if (factor_debug != nullptr && context.debug_internal_reveal) {
                 const double numerator = reveal_scaled_numerator(factor_value, context);
                 const double denominator = reveal_scaled_denominator(factor_value, context);
-                factor_debug->push_back({
+                json factor_debug_doc = {
                     {"factor_index", bound.factor.factor_index},
                     {"factor_kind", bound.factor.factor_kind},
                     {"inverse", bound.factor.inverse},
@@ -3675,9 +3777,26 @@ SecureBundleExecutionResult evaluate_secure_bundle_impl_secure(
 	                    {"numerator", numerator},
                     {"denominator", denominator},
                     {"value", std::abs(denominator) <= 1e-12 ? 0.0 : numerator / denominator},
-                });
+                };
+                if (!bound.manifest_path.empty()) {
+                    const auto debug_model_it = model_cache.find(bound.manifest_path);
+                    if (debug_model_it != model_cache.end()) {
+                        const auto& manifest = debug_model_it->second.manifest();
+                        factor_debug_doc["factor_total_rows"] = bound.factor.total_rows;
+                        factor_debug_doc["sample_total_rows"] = manifest.sample_total_rows;
+                        factor_debug_doc["actual_total_rows"] = manifest.actual_total_rows;
+                        factor_debug_doc["sample_scale"] = manifest.sample_scale;
+                    }
+                }
+                factor_debug->push_back(factor_debug_doc);
             }
             product = multiply_secure_rational(product, factor_value, context);
+        }
+        if (factor_debug != nullptr && context.debug_internal_reveal) {
+            json product_debug_doc = secure_rational_debug_json(product, context);
+            product_debug_doc["factor_index"] = -1;
+            product_debug_doc["factor_kind"] = "FACTOR_PRODUCT";
+            factor_debug->push_back(product_debug_doc);
         }
         return product;
     };
@@ -3736,8 +3855,15 @@ SecureBundleExecutionResult evaluate_secure_bundle_impl_secure(
                 out.root_division_payload_scale = std::min(
                     out.root_division_payload_scale,
                     1.0 / 4096.0);
+                out.root_division_scale_denominator_payload = true;
             } else {
                 current_value = numerator_rational;
+                out.root_division_payload_scale = std::min(
+                    out.root_division_payload_scale,
+                    1.0 / 4096.0);
+                if (aggregate_term_has_large_public_scale(term_doc)) {
+                    out.root_division_scale_denominator_payload = true;
+                }
             }
             current_result_value = current_value;
         }
@@ -3761,14 +3887,19 @@ SecureBundleExecutionResult evaluate_secure_bundle_impl_secure(
             }
         }
 
-        term_debug.push_back({
+        json term_debug_doc = {
             {"term_index", term_index},
             {"aggregation_type", aggregation_type},
             {"evaluation_mode", evaluation_mode},
             {"expectation_factors", expectation_factor_debug},
             {"numerator_factors", numerator_factor_debug},
             {"denominator_factors", denominator_factor_debug},
-        });
+        };
+        if (context.debug_internal_reveal) {
+            term_debug_doc["current_value"] = secure_rational_debug_json(current_value, context);
+            term_debug_doc["current_result_value"] = secure_rational_debug_json(current_result_value, context);
+        }
+        term_debug.push_back(term_debug_doc);
     }
 
     const std::string query_kind = public_plan_doc.value("query_kind", std::string());
@@ -3824,6 +3955,8 @@ void init_secure_context_from_cmd(
     context.model_owner_party = cmd.isSet("model_owner_party") ? cmd.getMany<int>("model_owner_party")[0] : 0;
     context.query_owner_party = cmd.isSet("query_owner_party") ? cmd.getMany<int>("query_owner_party")[0] : 0;
     context.debug_reveal = cmd.isSet("debug_reveal");
+    context.debug_internal_reveal =
+        context.debug_reveal && !cmd.isSet("debug_reveal_final_only");
 
     basic_setup(static_cast<u64>(role), ios, enc, eval, runtime);
     context.io_service = &ios;
@@ -3895,6 +4028,13 @@ void FlatBSPNModel::load_public_manifest(const std::string& manifest_path) {
     manifest_.node_count = manifest_doc.value("node_count", std::uint64_t(0));
     manifest_.root_node_id = manifest_doc.value("root_node_id", std::uint64_t(0));
     manifest_.total_rows = manifest_doc.value("total_rows", std::uint64_t(0));
+    manifest_.sample_total_rows = manifest_doc.value("sample_total_rows", manifest_.total_rows);
+    manifest_.actual_total_rows = manifest_doc.value("actual_total_rows", manifest_.sample_total_rows);
+    manifest_.sample_scale = manifest_doc.value(
+        "sample_scale",
+        manifest_.sample_total_rows == 0
+            ? 1.0
+            : static_cast<double>(manifest_.actual_total_rows) / static_cast<double>(manifest_.sample_total_rows));
     manifest_.scope_bitmap_bytes = manifest_doc.value("scope_bitmap_bytes", std::uint64_t(0));
     manifest_.children_count = manifest_doc.value("children_count", std::uint64_t(0));
     manifest_.bucket_count = manifest_doc.value("bucket_count", std::uint64_t(0));
@@ -4322,6 +4462,7 @@ void BSPN_secure_bundle_eval(const oc::CLP& cmd) {
         preloaded_model_cache.emplace(manifest_path, std::move(model));
     }
 
+    synchronize_secure_parties(secure_context);
     const auto secure_eval_start = std::chrono::steady_clock::now();
     auto secure_eval = evaluate_secure_bundle_impl_secure(
         public_doc,
@@ -4335,8 +4476,18 @@ void BSPN_secure_bundle_eval(const oc::CLP& cmd) {
         secure_eval.result_rational = normalize_factor_root_rational(
             secure_eval.result_rational,
             secure_context,
-            secure_eval.root_division_payload_scale);
+            secure_eval.root_division_payload_scale,
+            secure_eval.root_division_scale_denominator_payload);
     }
+    bool result_revealed = false;
+    double revealed_result = 0.0;
+    if (secure_context.debug_reveal && secure_eval.has_result) {
+        const double numerator = reveal_scaled_numerator(secure_eval.result_rational, secure_context);
+        const double denominator = reveal_scaled_denominator(secure_eval.result_rational, secure_context);
+        revealed_result = std::abs(denominator) > 1e-12 ? (numerator / denominator) : 0.0;
+        result_revealed = true;
+    }
+    synchronize_secure_parties(secure_context);
     const auto secure_eval_end = std::chrono::steady_clock::now();
     const double secure_eval_wall_time_ms =
         std::chrono::duration<double, std::milli>(secure_eval_end - secure_eval_start).count();
@@ -4345,13 +4496,15 @@ void BSPN_secure_bundle_eval(const oc::CLP& cmd) {
         {"query_skeleton_id", public_doc.value("query_skeleton_id", std::string())},
         {"query_kind", public_doc.value("query_kind", std::string())},
         {"secure_evaluator_wall_time_ms", secure_eval_wall_time_ms},
+        {"secure_evaluator_synchronized_wall_time_ms", secure_eval_wall_time_ms},
+        {"debug_internal_reveal", secure_context.debug_internal_reveal},
         {"result", nullptr},
     };
 
-    if (secure_context.debug_reveal && secure_eval.has_result) {
-        const double numerator = reveal_scaled_numerator(secure_eval.result_rational, secure_context);
-        const double denominator = reveal_scaled_denominator(secure_eval.result_rational, secure_context);
-        out["result"] = std::abs(denominator) > 1e-12 ? (numerator / denominator) : 0.0;
+    if (result_revealed) {
+        out["result"] = revealed_result;
+    }
+    if (secure_context.debug_internal_reveal) {
         out["debug"] = secure_eval.debug_output;
     }
     std::cout << out.dump(2) << std::endl;

@@ -54,6 +54,9 @@ struct FlatBSPNManifest {
     std::uint64_t node_count = 0;
     std::uint64_t root_node_id = 0;
     std::uint64_t total_rows = 0;
+    std::uint64_t sample_total_rows = 0;
+    std::uint64_t actual_total_rows = 0;
+    double sample_scale = 1.0;
     std::uint64_t scope_bitmap_bytes = 0;
     std::uint64_t children_count = 0;
     std::uint64_t bucket_count = 0;
@@ -99,6 +102,7 @@ struct FlatBSPNSecureContext {
     int model_owner_party = 0;
     int query_owner_party = 0;
     bool debug_reveal = false;
+    bool debug_internal_reveal = false;
     oc::IOService* io_service = nullptr;
     Sh3Encryptor* enc = nullptr;
     Sh3Evaluator* eval = nullptr;
