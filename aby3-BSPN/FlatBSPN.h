@@ -136,22 +136,6 @@ struct FlatBSPNSecretSharedPayload {
     bool loaded = false;
 };
 
-struct FlatDensePredicateBinding {
-    std::string slot_id;
-    std::string source_kind;
-    std::string table_id;
-    std::string column_id;
-    std::string operator_kind;
-    std::uint64_t interval_count = 0;
-    bool has_evidence = false;
-    std::vector<double> lower_bounds;
-    std::vector<double> upper_bounds;
-    std::vector<std::uint8_t> has_lower;
-    std::vector<std::uint8_t> has_upper;
-    std::vector<std::uint8_t> open_lower;
-    std::vector<std::uint8_t> open_upper;
-};
-
 struct FlatDenseSecretFactorBinding {
     std::string secret_factor_id;
     int factor_index = -1;
@@ -173,11 +157,9 @@ struct FlatSecureQueryPayload {
     std::string payload_version;
     std::string query_skeleton_id;
     std::string binding_layout_kind;
-    std::uint64_t slot_count = 0;
     std::uint64_t max_interval_count = 0;
     std::uint64_t factor_count = 0;
     std::uint64_t max_factor_column_count = 0;
-    std::vector<FlatDensePredicateBinding> predicate_slot_bindings;
     std::vector<FlatDenseSecretFactorBinding> secret_factor_bindings;
 };
 

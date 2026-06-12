@@ -1399,68 +1399,6 @@ std::map<std::string, std::string> load_model_manifest_map(
     return out;
 }
 
-FlatDensePredicateBinding dense_binding_from_legacy_json(const json& binding_doc) {
-    FlatDensePredicateBinding binding;
-    binding.slot_id = binding_doc.value("slot_id", std::string());
-    binding.source_kind = binding_doc.value("source_kind", std::string());
-    binding.table_id = binding_doc.value("table_id", std::string());
-    binding.column_id = binding_doc.value("column_id", std::string());
-    binding.operator_kind = binding_doc.value("operator_kind", std::string());
-
-    const bool open_lower = binding_doc.value("open_lower", false);
-    const bool open_upper = binding_doc.value("open_upper", false);
-    const auto& intervals = binding_doc.value("intervals", json::array());
-    binding.interval_count = static_cast<std::uint64_t>(intervals.size());
-    binding.has_evidence = binding.interval_count != 0;
-    for (const auto& interval_item : intervals) {
-        const bool has_lower = interval_item.is_array() && interval_item.size() == 2 && !interval_item[0].is_null();
-        const bool has_upper = interval_item.is_array() && interval_item.size() == 2 && !interval_item[1].is_null();
-        binding.lower_bounds.push_back(has_lower ? interval_item[0].get<double>() : 0.0);
-        binding.upper_bounds.push_back(has_upper ? interval_item[1].get<double>() : 0.0);
-        binding.has_lower.push_back(static_cast<std::uint8_t>(has_lower ? 1 : 0));
-        binding.has_upper.push_back(static_cast<std::uint8_t>(has_upper ? 1 : 0));
-        binding.open_lower.push_back(static_cast<std::uint8_t>((open_lower && has_lower) ? 1 : 0));
-        binding.open_upper.push_back(static_cast<std::uint8_t>((open_upper && has_upper) ? 1 : 0));
-    }
-    return binding;
-}
-
-FlatDensePredicateBinding dense_binding_from_json(const json& binding_doc, std::size_t max_interval_count) {
-    FlatDensePredicateBinding binding;
-    binding.slot_id = binding_doc.value("slot_id", std::string());
-    binding.source_kind = binding_doc.value("source_kind", std::string());
-    binding.table_id = binding_doc.value("table_id", std::string());
-    binding.column_id = binding_doc.value("column_id", std::string());
-    binding.operator_kind = binding_doc.value("operator_kind", std::string());
-    binding.interval_count = binding_doc.value("interval_count", std::uint64_t(0));
-    binding.has_evidence = binding_doc.value("has_evidence", 0) != 0;
-
-    auto read_u8_vector = [&](const char* key) {
-        std::vector<std::uint8_t> out;
-        for (const auto& item : binding_doc.value(key, json::array())) {
-            out.push_back(static_cast<std::uint8_t>(item.get<int>()));
-        }
-        out.resize(max_interval_count, 0);
-        return out;
-    };
-    auto read_double_vector = [&](const char* key) {
-        std::vector<double> out;
-        for (const auto& item : binding_doc.value(key, json::array())) {
-            out.push_back(item.get<double>());
-        }
-        out.resize(max_interval_count, 0.0);
-        return out;
-    };
-
-    binding.lower_bounds = read_double_vector("lower_bounds");
-    binding.upper_bounds = read_double_vector("upper_bounds");
-    binding.has_lower = read_u8_vector("has_lower");
-    binding.has_upper = read_u8_vector("has_upper");
-    binding.open_lower = read_u8_vector("open_lower");
-    binding.open_upper = read_u8_vector("open_upper");
-    return binding;
-}
-
 FlatDenseSecretFactorBinding dense_secret_factor_from_json(const json& binding_doc, std::size_t max_column_count) {
     FlatDenseSecretFactorBinding binding;
     binding.secret_factor_id = binding_doc.value("secret_factor_id", std::string());
@@ -1529,52 +1467,13 @@ FlatSecureQueryPayload parse_secure_query_payload_doc(const json& doc) {
     payload.payload_version = doc.value("payload_version", std::string());
     payload.query_skeleton_id = doc.value("query_skeleton_id", std::string());
     payload.binding_layout_kind = doc.value("binding_layout_kind", std::string());
-
-    if (doc.contains("slot_payload_shape") && doc["slot_payload_shape"].is_object()) {
-        payload.slot_count = doc["slot_payload_shape"].value("slot_count", std::uint64_t(0));
-        payload.max_interval_count = doc["slot_payload_shape"].value("max_interval_count", std::uint64_t(0));
+    if (payload.binding_layout_kind != "DENSE_FACTOR_COLUMNS_V1") {
+        throw std::runtime_error("Secure query payload must use DENSE_FACTOR_COLUMNS_V1.");
     }
     if (doc.contains("factor_payload_shape") && doc["factor_payload_shape"].is_object()) {
         payload.factor_count = doc["factor_payload_shape"].value("factor_count", std::uint64_t(0));
         payload.max_factor_column_count = doc["factor_payload_shape"].value("max_column_count", std::uint64_t(0));
-        payload.max_interval_count = std::max<std::uint64_t>(
-            payload.max_interval_count,
-            doc["factor_payload_shape"].value("max_interval_count", std::uint64_t(0)));
-    }
-
-    if (doc.contains("predicate_slot_bindings_dense") && doc["predicate_slot_bindings_dense"].is_array()) {
-        if (payload.max_interval_count == 0) {
-            for (const auto& binding_doc : doc["predicate_slot_bindings_dense"]) {
-                payload.max_interval_count = std::max<std::uint64_t>(
-                    payload.max_interval_count,
-                    static_cast<std::uint64_t>(binding_doc.value("interval_count", 0)));
-            }
-        }
-        for (const auto& binding_doc : doc["predicate_slot_bindings_dense"]) {
-            payload.predicate_slot_bindings.push_back(
-                dense_binding_from_json(binding_doc, static_cast<std::size_t>(payload.max_interval_count)));
-        }
-    } else if (doc.contains("predicate_slot_bindings") && doc["predicate_slot_bindings"].is_array()) {
-        for (const auto& binding_doc : doc["predicate_slot_bindings"]) {
-            payload.predicate_slot_bindings.push_back(dense_binding_from_legacy_json(binding_doc));
-        }
-        for (const auto& binding : payload.predicate_slot_bindings) {
-            payload.max_interval_count = std::max<std::uint64_t>(
-                payload.max_interval_count,
-                static_cast<std::uint64_t>(binding.lower_bounds.size()));
-        }
-        for (auto& binding : payload.predicate_slot_bindings) {
-            binding.lower_bounds.resize(payload.max_interval_count, 0.0);
-            binding.upper_bounds.resize(payload.max_interval_count, 0.0);
-            binding.has_lower.resize(payload.max_interval_count, 0);
-            binding.has_upper.resize(payload.max_interval_count, 0);
-            binding.open_lower.resize(payload.max_interval_count, 0);
-            binding.open_upper.resize(payload.max_interval_count, 0);
-        }
-    }
-
-    if (payload.slot_count == 0) {
-        payload.slot_count = static_cast<std::uint64_t>(payload.predicate_slot_bindings.size());
+        payload.max_interval_count = doc["factor_payload_shape"].value("max_interval_count", std::uint64_t(0));
     }
     if (doc.contains("secret_factor_bindings_dense") && doc["secret_factor_bindings_dense"].is_array()) {
         if (payload.max_factor_column_count == 0) {
@@ -4236,13 +4135,13 @@ FlatSecureQueryPayload load_secure_query_payload_json(const std::string& payload
 
 FlatSecureQueryTensorPayload build_secure_query_tensor_payload(const FlatSecureQueryPayload& payload) {
     FlatSecureQueryTensorPayload tensors;
-    const std::size_t slot_count = static_cast<std::size_t>(payload.slot_count);
     const std::size_t max_interval_count = static_cast<std::size_t>(payload.max_interval_count);
     const std::size_t factor_count = static_cast<std::size_t>(payload.factor_count);
     const std::size_t max_factor_columns = static_cast<std::size_t>(payload.max_factor_column_count);
-    const bool factor_column_layout = payload.binding_layout_kind == "DENSE_FACTOR_COLUMNS_V1";
-    const std::size_t evidence_row_count =
-        factor_column_layout ? factor_count * max_factor_columns : slot_count;
+    if (payload.binding_layout_kind != "DENSE_FACTOR_COLUMNS_V1") {
+        throw std::runtime_error("Secure query payload tensors require DENSE_FACTOR_COLUMNS_V1.");
+    }
+    const std::size_t evidence_row_count = factor_count * max_factor_columns;
 
     tensors.lower_bounds = f64Matrix<kFlatBSPNDecimal>(evidence_row_count, max_interval_count);
     tensors.upper_bounds = f64Matrix<kFlatBSPNDecimal>(evidence_row_count, max_interval_count);
@@ -4268,27 +4167,6 @@ FlatSecureQueryTensorPayload build_secure_query_tensor_payload(const FlatSecureQ
     tensors.feature_inverted_scope.setZero();
     tensors.factor_column_counts.setZero();
 
-    for (std::size_t slot_idx = 0; !factor_column_layout && slot_idx < payload.predicate_slot_bindings.size() && slot_idx < slot_count; ++slot_idx) {
-        const auto& binding = payload.predicate_slot_bindings[slot_idx];
-        tensors.has_evidence(static_cast<u64>(slot_idx), 0) = binding.has_evidence ? 1 : 0;
-        tensors.interval_counts(static_cast<u64>(slot_idx), 0) = static_cast<i64>(binding.interval_count);
-
-        for (std::size_t interval_idx = 0; interval_idx < max_interval_count; ++interval_idx) {
-            const double lower = interval_idx < binding.lower_bounds.size() ? binding.lower_bounds[interval_idx] : 0.0;
-            const double upper = interval_idx < binding.upper_bounds.size() ? binding.upper_bounds[interval_idx] : 0.0;
-            tensors.lower_bounds(static_cast<u64>(slot_idx), static_cast<u64>(interval_idx)) = lower;
-            tensors.upper_bounds(static_cast<u64>(slot_idx), static_cast<u64>(interval_idx)) = upper;
-            tensors.has_lower(static_cast<u64>(slot_idx), static_cast<u64>(interval_idx)) =
-                interval_idx < binding.has_lower.size() ? static_cast<i64>(binding.has_lower[interval_idx]) : 0;
-            tensors.has_upper(static_cast<u64>(slot_idx), static_cast<u64>(interval_idx)) =
-                interval_idx < binding.has_upper.size() ? static_cast<i64>(binding.has_upper[interval_idx]) : 0;
-            tensors.open_lower(static_cast<u64>(slot_idx), static_cast<u64>(interval_idx)) =
-                interval_idx < binding.open_lower.size() ? static_cast<i64>(binding.open_lower[interval_idx]) : 0;
-            tensors.open_upper(static_cast<u64>(slot_idx), static_cast<u64>(interval_idx)) =
-                interval_idx < binding.open_upper.size() ? static_cast<i64>(binding.open_upper[interval_idx]) : 0;
-        }
-    }
-
     for (std::size_t factor_idx = 0; factor_idx < payload.secret_factor_bindings.size() && factor_idx < factor_count; ++factor_idx) {
         const auto& binding = payload.secret_factor_bindings[factor_idx];
         tensors.factor_column_counts(static_cast<u64>(factor_idx), 0) = static_cast<i64>(binding.column_count);
@@ -4300,39 +4178,37 @@ FlatSecureQueryTensorPayload build_secure_query_tensor_payload(const FlatSecureQ
             tensors.feature_inverted_scope(static_cast<u64>(factor_idx), static_cast<u64>(col_idx)) =
                 col_idx < binding.feature_inverted_scope.size() ? static_cast<i64>(binding.feature_inverted_scope[col_idx]) : 0;
         }
-        if (factor_column_layout) {
-            for (std::size_t col_idx = 0; col_idx < max_factor_columns; ++col_idx) {
-                const std::size_t evidence_row = factor_idx * max_factor_columns + col_idx;
-                tensors.has_evidence(static_cast<u64>(evidence_row), 0) =
-                    col_idx < binding.has_evidence.size() ? static_cast<i64>(binding.has_evidence[col_idx]) : 0;
-                tensors.interval_counts(static_cast<u64>(evidence_row), 0) =
-                    col_idx < binding.interval_counts.size() ? static_cast<i64>(binding.interval_counts[col_idx]) : 0;
-                for (std::size_t interval_idx = 0; interval_idx < max_interval_count; ++interval_idx) {
-                    tensors.lower_bounds(static_cast<u64>(evidence_row), static_cast<u64>(interval_idx)) =
-                        col_idx < binding.lower_bounds.size() && interval_idx < binding.lower_bounds[col_idx].size()
-                            ? binding.lower_bounds[col_idx][interval_idx]
-                            : 0.0;
-                    tensors.upper_bounds(static_cast<u64>(evidence_row), static_cast<u64>(interval_idx)) =
-                        col_idx < binding.upper_bounds.size() && interval_idx < binding.upper_bounds[col_idx].size()
-                            ? binding.upper_bounds[col_idx][interval_idx]
-                            : 0.0;
-                    tensors.has_lower(static_cast<u64>(evidence_row), static_cast<u64>(interval_idx)) =
-                        col_idx < binding.has_lower.size() && interval_idx < binding.has_lower[col_idx].size()
-                            ? static_cast<i64>(binding.has_lower[col_idx][interval_idx])
-                            : 0;
-                    tensors.has_upper(static_cast<u64>(evidence_row), static_cast<u64>(interval_idx)) =
-                        col_idx < binding.has_upper.size() && interval_idx < binding.has_upper[col_idx].size()
-                            ? static_cast<i64>(binding.has_upper[col_idx][interval_idx])
-                            : 0;
-                    tensors.open_lower(static_cast<u64>(evidence_row), static_cast<u64>(interval_idx)) =
-                        col_idx < binding.open_lower.size() && interval_idx < binding.open_lower[col_idx].size()
-                            ? static_cast<i64>(binding.open_lower[col_idx][interval_idx])
-                            : 0;
-                    tensors.open_upper(static_cast<u64>(evidence_row), static_cast<u64>(interval_idx)) =
-                        col_idx < binding.open_upper.size() && interval_idx < binding.open_upper[col_idx].size()
-                            ? static_cast<i64>(binding.open_upper[col_idx][interval_idx])
-                            : 0;
-                }
+        for (std::size_t col_idx = 0; col_idx < max_factor_columns; ++col_idx) {
+            const std::size_t evidence_row = factor_idx * max_factor_columns + col_idx;
+            tensors.has_evidence(static_cast<u64>(evidence_row), 0) =
+                col_idx < binding.has_evidence.size() ? static_cast<i64>(binding.has_evidence[col_idx]) : 0;
+            tensors.interval_counts(static_cast<u64>(evidence_row), 0) =
+                col_idx < binding.interval_counts.size() ? static_cast<i64>(binding.interval_counts[col_idx]) : 0;
+            for (std::size_t interval_idx = 0; interval_idx < max_interval_count; ++interval_idx) {
+                tensors.lower_bounds(static_cast<u64>(evidence_row), static_cast<u64>(interval_idx)) =
+                    col_idx < binding.lower_bounds.size() && interval_idx < binding.lower_bounds[col_idx].size()
+                        ? binding.lower_bounds[col_idx][interval_idx]
+                        : 0.0;
+                tensors.upper_bounds(static_cast<u64>(evidence_row), static_cast<u64>(interval_idx)) =
+                    col_idx < binding.upper_bounds.size() && interval_idx < binding.upper_bounds[col_idx].size()
+                        ? binding.upper_bounds[col_idx][interval_idx]
+                        : 0.0;
+                tensors.has_lower(static_cast<u64>(evidence_row), static_cast<u64>(interval_idx)) =
+                    col_idx < binding.has_lower.size() && interval_idx < binding.has_lower[col_idx].size()
+                        ? static_cast<i64>(binding.has_lower[col_idx][interval_idx])
+                        : 0;
+                tensors.has_upper(static_cast<u64>(evidence_row), static_cast<u64>(interval_idx)) =
+                    col_idx < binding.has_upper.size() && interval_idx < binding.has_upper[col_idx].size()
+                        ? static_cast<i64>(binding.has_upper[col_idx][interval_idx])
+                        : 0;
+                tensors.open_lower(static_cast<u64>(evidence_row), static_cast<u64>(interval_idx)) =
+                    col_idx < binding.open_lower.size() && interval_idx < binding.open_lower[col_idx].size()
+                        ? static_cast<i64>(binding.open_lower[col_idx][interval_idx])
+                        : 0;
+                tensors.open_upper(static_cast<u64>(evidence_row), static_cast<u64>(interval_idx)) =
+                    col_idx < binding.open_upper.size() && interval_idx < binding.open_upper[col_idx].size()
+                        ? static_cast<i64>(binding.open_upper[col_idx][interval_idx])
+                        : 0;
             }
         }
     }
@@ -4344,18 +4220,15 @@ FlatSecureQueryPayload empty_secure_query_payload_from_public_doc(const json& pu
     FlatSecureQueryPayload payload;
     payload.query_skeleton_id = public_doc.value("query_skeleton_id", std::string());
     payload.binding_layout_kind = public_doc.value("binding_layout_kind", std::string());
+    if (payload.binding_layout_kind != "DENSE_FACTOR_COLUMNS_V1") {
+        throw std::runtime_error("Public secure plan must use DENSE_FACTOR_COLUMNS_V1.");
+    }
     if (public_doc.contains("secret_tensor_shape") && public_doc["secret_tensor_shape"].is_object()) {
         const auto& shape_doc = public_doc["secret_tensor_shape"];
-        if (shape_doc.contains("slot_payload_shape") && shape_doc["slot_payload_shape"].is_object()) {
-            payload.slot_count = shape_doc["slot_payload_shape"].value("slot_count", std::uint64_t(0));
-            payload.max_interval_count = shape_doc["slot_payload_shape"].value("max_interval_count", std::uint64_t(0));
-        }
         if (shape_doc.contains("factor_payload_shape") && shape_doc["factor_payload_shape"].is_object()) {
             payload.factor_count = shape_doc["factor_payload_shape"].value("factor_count", std::uint64_t(0));
             payload.max_factor_column_count = shape_doc["factor_payload_shape"].value("max_column_count", std::uint64_t(0));
-            payload.max_interval_count = std::max<std::uint64_t>(
-                payload.max_interval_count,
-                shape_doc["factor_payload_shape"].value("max_interval_count", std::uint64_t(0)));
+            payload.max_interval_count = shape_doc["factor_payload_shape"].value("max_interval_count", std::uint64_t(0));
         }
     }
     return payload;
@@ -4463,7 +4336,8 @@ void BSPN_secure_bundle_eval(const oc::CLP& cmd) {
     }
 
     synchronize_secure_parties(secure_context);
-    const auto secure_eval_start = std::chrono::steady_clock::now();
+    const auto secure_total_start = std::chrono::steady_clock::now();
+    const auto secure_core_start = std::chrono::steady_clock::now();
     auto secure_eval = evaluate_secure_bundle_impl_secure(
         public_doc,
         secure_payload,
@@ -4479,24 +4353,35 @@ void BSPN_secure_bundle_eval(const oc::CLP& cmd) {
             secure_eval.root_division_payload_scale,
             secure_eval.root_division_scale_denominator_payload);
     }
+    const auto secure_core_end = std::chrono::steady_clock::now();
     bool result_revealed = false;
     double revealed_result = 0.0;
+    double final_reveal_wall_time_ms = 0.0;
     if (secure_context.debug_reveal && secure_eval.has_result) {
+        const auto reveal_start = std::chrono::steady_clock::now();
         const double numerator = reveal_scaled_numerator(secure_eval.result_rational, secure_context);
         const double denominator = reveal_scaled_denominator(secure_eval.result_rational, secure_context);
         revealed_result = std::abs(denominator) > 1e-12 ? (numerator / denominator) : 0.0;
         result_revealed = true;
+        const auto reveal_end = std::chrono::steady_clock::now();
+        final_reveal_wall_time_ms =
+            std::chrono::duration<double, std::milli>(reveal_end - reveal_start).count();
     }
     synchronize_secure_parties(secure_context);
-    const auto secure_eval_end = std::chrono::steady_clock::now();
-    const double secure_eval_wall_time_ms =
-        std::chrono::duration<double, std::milli>(secure_eval_end - secure_eval_start).count();
+    const auto secure_total_end = std::chrono::steady_clock::now();
+    const double secure_core_wall_time_ms =
+        std::chrono::duration<double, std::milli>(secure_core_end - secure_core_start).count();
+    const double secure_total_wall_time_ms =
+        std::chrono::duration<double, std::milli>(secure_total_end - secure_total_start).count();
 
     json out = {
         {"query_skeleton_id", public_doc.value("query_skeleton_id", std::string())},
         {"query_kind", public_doc.value("query_kind", std::string())},
-        {"secure_evaluator_wall_time_ms", secure_eval_wall_time_ms},
-        {"secure_evaluator_synchronized_wall_time_ms", secure_eval_wall_time_ms},
+        {"secure_evaluator_core_wall_time_ms", secure_core_wall_time_ms},
+        {"secure_evaluator_final_reveal_wall_time_ms", final_reveal_wall_time_ms},
+        {"secure_evaluator_total_wall_time_ms", secure_total_wall_time_ms},
+        {"secure_evaluator_wall_time_ms", secure_core_wall_time_ms},
+        {"secure_evaluator_synchronized_wall_time_ms", secure_total_wall_time_ms},
         {"debug_internal_reveal", secure_context.debug_internal_reveal},
         {"result", nullptr},
     };
