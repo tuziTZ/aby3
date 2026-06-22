@@ -26,4 +26,3 @@ target_link_libraries(frontend aby3-GORAM)
 
 find_package(MPI REQUIRED)  
 target_link_libraries(frontend MPI::MPI_CXX)
-

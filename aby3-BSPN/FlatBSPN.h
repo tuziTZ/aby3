@@ -63,11 +63,17 @@ struct FlatBSPNManifest {
     std::uint64_t weights_count = 0;
     std::uint64_t leaf_bitmap_bytes = 0;
     std::uint64_t leaf_bucket_width = 0;
+    std::uint64_t max_leaf_bucket_width = 0;
     std::uint64_t leaf_node_count = 0;
+    std::uint64_t real_bucket_count = 0;
+    std::uint64_t padding_bucket_count = 0;
     std::uint64_t node_cardinality_count = 0;
     std::uint64_t node_inv_cardinality_count = 0;
+    std::uint64_t payload_layout_version = 0;
+    std::string bucket_padding_scope = "global";
     std::string secret_payload_dir = "secret";
     std::string secret_payload_encoding;
+    bool secure_multiplier_materialized = false;
     std::string secure_share_payload_dir = "secret_shares";
     std::vector<std::uint32_t> secure_multiplier_bucket_indices;
 };

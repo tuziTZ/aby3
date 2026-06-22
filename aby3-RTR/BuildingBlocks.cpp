@@ -3,6 +3,9 @@
 #include <fstream>
 #include <string>
 #include <bitset>
+#include <array>
+#include <cstdlib>
+#include <sstream>
 
 #include <aby3/sh3/Sh3BinaryEvaluator.h>
 #include <aby3/Circuit/CircuitLibrary.h>
@@ -15,6 +18,53 @@ using namespace oc;
 #define P1_IP "127.0.0.1"
 
 static int BASEPORT=6000;
+
+struct Aby3NetworkConfig {
+  std::array<std::string, 3> hosts;
+  int basicBasePort;
+  int multiBasePort;
+};
+
+static std::array<std::string, 3> parse_hosts_env(const char* value) {
+  std::array<std::string, 3> hosts = { "127.0.0.1", "127.0.0.1", "127.0.0.1" };
+  if (value == nullptr || *value == '\0') {
+    return hosts;
+  }
+
+  std::stringstream stream(value);
+  std::string item;
+  for (std::size_t idx = 0; idx < hosts.size() && std::getline(stream, item, ','); ++idx) {
+    if (!item.empty()) {
+      hosts[idx] = item;
+    }
+  }
+  return hosts;
+}
+
+static int parse_port_env(const char* value, int fallback) {
+  if (value == nullptr || *value == '\0') {
+    return fallback;
+  }
+
+  char* end = nullptr;
+  const long parsed = std::strtol(value, &end, 10);
+  if (end == value || *end != '\0' || parsed <= 0 || parsed > 65533) {
+    return fallback;
+  }
+  return static_cast<int>(parsed);
+}
+
+static Aby3NetworkConfig network_config_from_env() {
+  Aby3NetworkConfig config;
+  config.hosts = parse_hosts_env(std::getenv("ABY3_PARTY_HOSTS"));
+  config.basicBasePort = parse_port_env(std::getenv("ABY3_BASIC_BASE_PORT"), 1213);
+  config.multiBasePort = parse_port_env(std::getenv("ABY3_MULTI_BASE_PORT"), BASEPORT);
+  return config;
+}
+
+static std::string endpoint(const std::string& host, int port) {
+  return host + ":" + std::to_string(port);
+}
 
 double synchronized_time(int pIdx, double& time_slot, Sh3Runtime &runtime){
   // double sync_time = time_slot;
@@ -111,29 +161,25 @@ void multi_processor_setup(u64 partyIdx, int rank, IOService &ios, Sh3Encryptor 
 void multi_processor_setup(u64 partyIdx, int rank, IOService &ios, Sh3Encryptor &enc, Sh3Evaluator &eval, Sh3Runtime &runtime){
   CommPkg comm;
   string fport, sport, tport;
+  const auto net = network_config_from_env();
+  const int basePort = net.multiBasePort + 3 * rank;
   switch (partyIdx) {
     case 0:
-      fport = std::to_string(BASEPORT + 3*rank);
-      sport = std::to_string(BASEPORT + 3*rank + 1);
-      comm.mNext = Session(ios, "127.0.0.1:"+fport, SessionMode::Server, "01")
+      comm.mNext = Session(ios, endpoint(net.hosts[0], basePort), SessionMode::Server, "01")
                        .addChannel();
-      comm.mPrev = Session(ios, "127.0.0.1:"+sport, SessionMode::Server, "02")
+      comm.mPrev = Session(ios, endpoint(net.hosts[0], basePort + 1), SessionMode::Server, "02")
                        .addChannel();
       break;
     case 1:
-      fport = std::to_string(BASEPORT + 3*rank);
-      tport = std::to_string(BASEPORT + 3*rank + 2);
-      comm.mNext = Session(ios, "127.0.0.1:"+tport, SessionMode::Server, "12")
+      comm.mNext = Session(ios, endpoint(net.hosts[1], basePort + 2), SessionMode::Server, "12")
                        .addChannel();
-      comm.mPrev = Session(ios, "127.0.0.1:"+fport, SessionMode::Client, "01")
+      comm.mPrev = Session(ios, endpoint(net.hosts[0], basePort), SessionMode::Client, "01")
                        .addChannel();
       break;
     default:
-      sport = std::to_string(BASEPORT + 3*rank + 1);
-      tport = std::to_string(BASEPORT + 3*rank + 2);
-      comm.mNext = Session(ios, "127.0.0.1:"+sport, SessionMode::Client, "02")
+      comm.mNext = Session(ios, endpoint(net.hosts[0], basePort + 1), SessionMode::Client, "02")
                        .addChannel();
-      comm.mPrev = Session(ios, "127.0.0.1:"+tport, SessionMode::Client, "12")
+      comm.mPrev = Session(ios, endpoint(net.hosts[1], basePort + 2), SessionMode::Client, "12")
                        .addChannel();
       break;
   }
@@ -150,23 +196,25 @@ void multi_processor_setup(u64 partyIdx, int rank, IOService &ios, Sh3Encryptor 
 void basic_setup(u64 partyIdx, IOService &ios, Sh3Encryptor &enc, Sh3Evaluator &eval,
            Sh3Runtime &runtime) {
   CommPkg comm;
+  const auto net = network_config_from_env();
+  const int basePort = net.basicBasePort;
   switch (partyIdx) {
     case 0:
-      comm.mNext = Session(ios, "127.0.0.1:1213", SessionMode::Server, "01")
+      comm.mNext = Session(ios, endpoint(net.hosts[0], basePort), SessionMode::Server, "01")
                        .addChannel();
-      comm.mPrev = Session(ios, "127.0.0.1:1214", SessionMode::Server, "02")
+      comm.mPrev = Session(ios, endpoint(net.hosts[0], basePort + 1), SessionMode::Server, "02")
                        .addChannel();
       break;
     case 1:
-      comm.mNext = Session(ios, "127.0.0.1:1215", SessionMode::Server, "12")
+      comm.mNext = Session(ios, endpoint(net.hosts[1], basePort + 2), SessionMode::Server, "12")
                        .addChannel();
-      comm.mPrev = Session(ios, "127.0.0.1:1213", SessionMode::Client, "01")
+      comm.mPrev = Session(ios, endpoint(net.hosts[0], basePort), SessionMode::Client, "01")
                        .addChannel();
       break;
     default:
-      comm.mNext = Session(ios, "127.0.0.1:1214", SessionMode::Client, "02")
+      comm.mNext = Session(ios, endpoint(net.hosts[0], basePort + 1), SessionMode::Client, "02")
                        .addChannel();
-      comm.mPrev = Session(ios, "127.0.0.1:1215", SessionMode::Client, "12")
+      comm.mPrev = Session(ios, endpoint(net.hosts[1], basePort + 2), SessionMode::Client, "12")
                        .addChannel();
       break;
   }

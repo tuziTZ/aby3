@@ -2,15 +2,19 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -18,11 +22,17 @@
 #include "../aby3-Basic/BuildingBlocks.h"
 #include "../aby3-GORAM-Core/Basics.h"
 #include "../aby3-GORAM-Core/Sort.h"
+#include <nlohmann/json.hpp>
 
 using namespace aby3;
 using namespace oc;
 
 namespace {
+
+using json = nlohmann::json;
+
+constexpr int kMultiplierFixedDecimalBits = 16;
+constexpr i64 kMultiplierFixedOne = static_cast<i64>(1) << kMultiplierFixedDecimalBits;
 
 struct NormalizedKey {
     i64 value = 0;
@@ -32,6 +42,7 @@ struct NormalizedKey {
 struct MultiplierPreprocessConfig {
     std::string pk_csv_path;
     std::string fk_csv_path;
+    std::string secure_leaf_plan_path;
     u64 pk_key_column = 0;
     u64 fk_key_column = 0;
     double fk_sample_rate = 1.0;
@@ -438,6 +449,153 @@ void write_binary_vector(const std::string& path, const std::vector<T>& values)
     }
 }
 
+void ensure_dir(const std::string& path)
+{
+    if (path.empty()) {
+        return;
+    }
+    if (::mkdir(path.c_str(), 0775) != 0 && errno != EEXIST) {
+        throw std::runtime_error("Failed to create directory " + path + ": " + std::strerror(errno));
+    }
+}
+
+void write_share_pair_matrix(const std::string& path, const si64Matrix& values)
+{
+    std::ofstream output(path, std::ios::binary);
+    if (!output.is_open()) {
+        throw std::runtime_error("Failed to open share output file: " + path);
+    }
+    for (u64 row = 0; row < values.rows(); ++row) {
+        const i64 lhs = values.mShares[0](row, 0);
+        const i64 rhs = values.mShares[1](row, 0);
+        output.write(reinterpret_cast<const char*>(&lhs), sizeof(i64));
+        output.write(reinterpret_cast<const char*>(&rhs), sizeof(i64));
+    }
+}
+
+std::vector<i64> read_i64_records(const std::string& path)
+{
+    std::ifstream input(path, std::ios::binary);
+    if (!input.is_open()) {
+        throw std::runtime_error("Failed to open share input file: " + path);
+    }
+    input.seekg(0, std::ios::end);
+    const std::streamsize bytes = input.tellg();
+    input.seekg(0, std::ios::beg);
+    if (bytes < 0 || bytes % static_cast<std::streamsize>(sizeof(i64)) != 0) {
+        throw std::runtime_error("Malformed int64 share file: " + path);
+    }
+    std::vector<i64> out(static_cast<std::size_t>(bytes / sizeof(i64)));
+    if (!out.empty()) {
+        input.read(reinterpret_cast<char*>(out.data()), bytes);
+    }
+    return out;
+}
+
+si64Matrix read_share_pair_matrix(const std::string& path, u64 rows)
+{
+    const auto raw = read_i64_records(path);
+    if (raw.size() != static_cast<std::size_t>(rows) * 2) {
+        throw std::runtime_error("Share pair file row count mismatch: " + path);
+    }
+    si64Matrix out(rows, 1);
+    for (u64 row = 0; row < rows; ++row) {
+        out.mShares[0](row, 0) = raw[static_cast<std::size_t>(row) * 2];
+        out.mShares[1](row, 0) = raw[static_cast<std::size_t>(row) * 2 + 1];
+    }
+    return out;
+}
+
+sbMatrix read_bool_share_pair_matrix(const std::string& path, u64 rows, u64 bit_count = 1)
+{
+    const auto raw = read_i64_records(path);
+    if (raw.size() != static_cast<std::size_t>(rows) * 2) {
+        throw std::runtime_error("Boolean share pair file row count mismatch: " + path);
+    }
+    sbMatrix out(rows, bit_count);
+    for (u64 row = 0; row < rows; ++row) {
+        out.mShares[0](row, 0) = raw[static_cast<std::size_t>(row) * 2];
+        out.mShares[1](row, 0) = raw[static_cast<std::size_t>(row) * 2 + 1];
+    }
+    for (u64 row = 0; row < rows; ++row) {
+        for (u64 col = 1; col < static_cast<u64>(out.mShares[0].cols()); ++col) {
+            out.mShares[0](row, col) = 0;
+            out.mShares[1](row, col) = 0;
+        }
+    }
+    return out;
+}
+
+void write_bool_share_pair_matrix(const std::string& path, const sbMatrix& values)
+{
+    std::ofstream output(path, std::ios::binary);
+    if (!output.is_open()) {
+        throw std::runtime_error("Failed to open boolean share output file: " + path);
+    }
+    for (u64 row = 0; row < values.rows(); ++row) {
+        const i64 lhs = values.mShares[0](row, 0);
+        const i64 rhs = values.mShares[1](row, 0);
+        output.write(reinterpret_cast<const char*>(&lhs), sizeof(i64));
+        output.write(reinterpret_cast<const char*>(&rhs), sizeof(i64));
+    }
+}
+
+si64Matrix public_i64_column(i64 value, u64 rows, int role)
+{
+    si64Matrix out(rows, 1);
+    out.mShares[0].setZero();
+    out.mShares[1].setZero();
+    if (role == 0) {
+        out.mShares[0].setConstant(value);
+    } else if (role == 1) {
+        out.mShares[1].setConstant(value);
+    } else if (role != 2) {
+        throw std::runtime_error("Invalid ABY3 role.");
+    }
+    return out;
+}
+
+si64Matrix public_i64_scalar(i64 value, int role)
+{
+    return public_i64_column(value, 1, role);
+}
+
+sbMatrix bool_row_slice(const sbMatrix& src, u64 row_begin, u64 row_count)
+{
+    sbMatrix out(row_count, src.bitCount());
+    for (u64 row = 0; row < row_count; ++row) {
+        for (u64 col = 0; col < static_cast<u64>(src.mShares[0].cols()); ++col) {
+            out.mShares[0](row, col) = src.mShares[0](row_begin + row, col);
+            out.mShares[1](row, col) = src.mShares[1](row_begin + row, col);
+        }
+    }
+    return out;
+}
+
+sbMatrix bool_repeat_row(const sbMatrix& src, u64 source_row, u64 rows)
+{
+    sbMatrix out(rows, src.bitCount());
+    for (u64 row = 0; row < rows; ++row) {
+        for (u64 col = 0; col < static_cast<u64>(src.mShares[0].cols()); ++col) {
+            out.mShares[0](row, col) = src.mShares[0](source_row, col);
+            out.mShares[1](row, col) = src.mShares[1](source_row, col);
+        }
+    }
+    return out;
+}
+
+si64Matrix repeat_shared_row(const si64Matrix& src, u64 source_row, u64 rows)
+{
+    si64Matrix out(rows, src.cols());
+    for (u64 row = 0; row < rows; ++row) {
+        for (u64 col = 0; col < src.cols(); ++col) {
+            out.mShares[0](row, col) = src.mShares[0](source_row, col);
+            out.mShares[1](row, col) = src.mShares[1](source_row, col);
+        }
+    }
+    return out;
+}
+
 void write_text_file(const std::string& path, const std::string& content)
 {
     std::ofstream output(path);
@@ -492,6 +650,43 @@ void write_reference_manifest(
     write_text_file(manifest_path, content.str());
 }
 
+void write_secure_shared_values_manifest(
+    const MultiplierPreprocessConfig& config,
+    size_t pk_row_count,
+    size_t fk_row_count,
+    const std::string& artifact_dir)
+{
+    const std::string manifest_path = artifact_dir + "/manifest.json";
+    std::ostringstream content;
+    content << "{\n";
+    content << "  \"format_name\": \"BSPN_MULTIPLIER_PAYLOAD\",\n";
+    content << "  \"format_version\": 2,\n";
+    content << "  \"mode\": \"secure_shared_values\",\n";
+    content << "  \"relationship_id\": \"" << json_escape(config.relationship_id) << "\",\n";
+    content << "  \"pk_csv_path\": \"" << json_escape(config.pk_csv_path) << "\",\n";
+    content << "  \"fk_csv_path\": \"" << json_escape(config.fk_csv_path) << "\",\n";
+    content << "  \"pk_key_column\": " << config.pk_key_column << ",\n";
+    content << "  \"fk_key_column\": " << config.fk_key_column << ",\n";
+    content << "  \"fk_sample_rate\": " << std::setprecision(17) << config.fk_sample_rate << ",\n";
+    content << "  \"pk_row_count\": " << pk_row_count << ",\n";
+    content << "  \"fk_row_count\": " << fk_row_count << ",\n";
+    content << "  \"fixed_decimal_bits\": " << kMultiplierFixedDecimalBits << ",\n";
+    content << "  \"pk_input_party\": " << config.pk_input_party << ",\n";
+    content << "  \"fk_input_party\": " << config.fk_input_party << ",\n";
+    content << "  \"share_kind\": \"ABY3_REPLICATED_PAIR_I64\",\n";
+    content << "  \"secure_core_status\": \"sorted_segmented_scan_count_no_reveal\",\n";
+    content << "  \"role_paths\": {\n";
+    for (int role = 0; role < 3; ++role) {
+        content << "    \"" << role << "\": {";
+        content << "\"mu_path\": \"" << json_escape(artifact_dir + "/role_" + std::to_string(role) + "/mu.shares.bin") << "\", ";
+        content << "\"mu_nn_path\": \"" << json_escape(artifact_dir + "/role_" + std::to_string(role) + "/mu_nn.shares.bin") << "\"}";
+        content << (role == 2 ? "\n" : ",\n");
+    }
+    content << "  }\n";
+    content << "}\n";
+    write_text_file(manifest_path, content.str());
+}
+
 MultiplierPreprocessConfig parse_config(const CLP& cmd)
 {
     MultiplierPreprocessConfig config;
@@ -510,9 +705,18 @@ MultiplierPreprocessConfig parse_config(const CLP& cmd)
         return static_cast<u64>(cmd.getMany<u64>(key)[0]);
     };
 
-    config.pk_csv_path = read_required_string("pk_csv");
-    config.fk_csv_path = read_required_string("fk_csv");
-    config.output_prefix = read_required_string("output_prefix");
+    if (cmd.isSet("multiplier_mode")) {
+        config.mode = cmd.getMany<std::string>("multiplier_mode")[0];
+    }
+
+    if (config.mode == "secure_leaf_materialize") {
+        config.secure_leaf_plan_path = read_required_string("secure_leaf_plan_json");
+        config.output_prefix = read_required_string("output_prefix");
+    } else {
+        config.pk_csv_path = read_required_string("pk_csv");
+        config.fk_csv_path = read_required_string("fk_csv");
+        config.output_prefix = read_required_string("output_prefix");
+    }
     config.relationship_id = cmd.isSet("relationship_id")
         ? cmd.getMany<std::string>("relationship_id")[0]
         : "unknown_relationship";
@@ -522,10 +726,6 @@ MultiplierPreprocessConfig parse_config(const CLP& cmd)
 
     if (cmd.isSet("fk_sample_rate")) {
         config.fk_sample_rate = cmd.getMany<double>("fk_sample_rate")[0];
-    }
-
-    if (cmd.isSet("multiplier_mode")) {
-        config.mode = cmd.getMany<std::string>("multiplier_mode")[0];
     }
 
     if (cmd.isSet("role")) {
@@ -637,7 +837,8 @@ void build_secure_sorted_multiplier_rows(
     u64 n_fk,
     u64 padded,
     si64Matrix& sec_key,
-    std::vector<si64Matrix>& payloads_out)
+    std::vector<si64Matrix>& payloads_out,
+    bool include_group_key = false)
 {
     const u64 pad_rows = padded - n_pk - n_fk;
     const int sort_input_party = config.pk_input_party;
@@ -648,12 +849,14 @@ void build_secure_sorted_multiplier_rows(
     i64Matrix plain_pk_is_null(n_pk, 1);
     i64Matrix plain_pk_valid(n_pk, 1);
     i64Matrix plain_pk_fk_contrib(n_pk, 1);
+    i64Matrix plain_pk_group_key(n_pk, 1);
     plain_pk_key.setZero();
     plain_pk_table_id.setZero();
     plain_pk_row_id.setZero();
     plain_pk_is_null.setZero();
     plain_pk_valid.setZero();
     plain_pk_fk_contrib.setZero();
+    plain_pk_group_key.setZero();
 
     i64Matrix plain_fk_key(n_fk, 1);
     i64Matrix plain_fk_table_id(n_fk, 1);
@@ -661,12 +864,14 @@ void build_secure_sorted_multiplier_rows(
     i64Matrix plain_fk_is_null(n_fk, 1);
     i64Matrix plain_fk_valid(n_fk, 1);
     i64Matrix plain_fk_contrib(n_fk, 1);
+    i64Matrix plain_fk_group_key(n_fk, 1);
     plain_fk_key.setZero();
     plain_fk_table_id.setZero();
     plain_fk_row_id.setZero();
     plain_fk_is_null.setZero();
     plain_fk_valid.setZero();
     plain_fk_contrib.setZero();
+    plain_fk_group_key.setZero();
 
     i64Matrix plain_pad_key(pad_rows, 1);
     i64Matrix plain_pad_table_id(pad_rows, 1);
@@ -674,12 +879,14 @@ void build_secure_sorted_multiplier_rows(
     i64Matrix plain_pad_is_null(pad_rows, 1);
     i64Matrix plain_pad_valid(pad_rows, 1);
     i64Matrix plain_pad_fk_contrib(pad_rows, 1);
+    i64Matrix plain_pad_group_key(pad_rows, 1);
     plain_pad_key.setZero();
     plain_pad_table_id.setConstant(2);
     plain_pad_row_id.setZero();
     plain_pad_is_null.setConstant(1);
     plain_pad_valid.setZero();
     plain_pad_fk_contrib.setZero();
+    plain_pad_group_key.setZero();
 
     i64 min_non_null_key = 0;
     bool have_non_null_key = false;
@@ -717,6 +924,19 @@ void build_secure_sorted_multiplier_rows(
         }
         return static_cast<i64>(composite);
     };
+    auto encode_group_key = [&](const NormalizedKey& key) -> i64 {
+        if (key.is_null || !have_non_null_key) {
+            return 0;
+        }
+        const __int128 base = static_cast<__int128>(1) +
+            static_cast<__int128>(key.value) -
+            static_cast<__int128>(min_non_null_key);
+        if (base < static_cast<__int128>(std::numeric_limits<i64>::min()) ||
+            base > static_cast<__int128>(std::numeric_limits<i64>::max())) {
+            throw std::runtime_error("secure multiplier group key overflowed int64 range.");
+        }
+        return static_cast<i64>(base);
+    };
 
     if (role == sort_input_party) {
         for (u64 i = 0; i < n_pk; ++i) {
@@ -725,6 +945,7 @@ void build_secure_sorted_multiplier_rows(
             plain_pk_row_id(i, 0) = static_cast<i64>(i);
             plain_pk_is_null(i, 0) = pk_keys[static_cast<size_t>(i)].is_null ? 1 : 0;
             plain_pk_valid(i, 0) = 1;
+            plain_pk_group_key(i, 0) = encode_group_key(pk_keys[static_cast<size_t>(i)]);
         }
         for (u64 i = 0; i < n_fk; ++i) {
             plain_fk_key(i, 0) = encode_key(
@@ -736,6 +957,7 @@ void build_secure_sorted_multiplier_rows(
             plain_fk_is_null(i, 0) = fk_keys[static_cast<size_t>(i)].is_null ? 1 : 0;
             plain_fk_valid(i, 0) = 1;
             plain_fk_contrib(i, 0) = fk_keys[static_cast<size_t>(i)].is_null ? 0 : 1;
+            plain_fk_group_key(i, 0) = encode_group_key(fk_keys[static_cast<size_t>(i)]);
         }
         for (u64 i = 0; i < pad_rows; ++i) {
             plain_pad_key(i, 0) = static_cast<i64>(n_pk + n_fk + i);
@@ -749,12 +971,14 @@ void build_secure_sorted_multiplier_rows(
     si64Matrix sec_pk_is_null;
     si64Matrix sec_pk_valid;
     si64Matrix sec_pk_fk_contrib;
+    si64Matrix sec_pk_group_key;
     secure_share_i64_column(role, sort_input_party, plain_pk_key, sec_pk_key, enc, runtime);
     secure_share_i64_column(role, sort_input_party, plain_pk_table_id, sec_pk_table_id, enc, runtime);
     secure_share_i64_column(role, sort_input_party, plain_pk_row_id, sec_pk_row_id, enc, runtime);
     secure_share_i64_column(role, sort_input_party, plain_pk_is_null, sec_pk_is_null, enc, runtime);
     secure_share_i64_column(role, sort_input_party, plain_pk_valid, sec_pk_valid, enc, runtime);
     secure_share_i64_column(role, sort_input_party, plain_pk_fk_contrib, sec_pk_fk_contrib, enc, runtime);
+    secure_share_i64_column(role, sort_input_party, plain_pk_group_key, sec_pk_group_key, enc, runtime);
 
     si64Matrix sec_fk_key;
     si64Matrix sec_fk_table_id;
@@ -762,12 +986,14 @@ void build_secure_sorted_multiplier_rows(
     si64Matrix sec_fk_is_null;
     si64Matrix sec_fk_valid;
     si64Matrix sec_fk_fk_contrib;
+    si64Matrix sec_fk_group_key;
     secure_share_i64_column(role, sort_input_party, plain_fk_key, sec_fk_key, enc, runtime);
     secure_share_i64_column(role, sort_input_party, plain_fk_table_id, sec_fk_table_id, enc, runtime);
     secure_share_i64_column(role, sort_input_party, plain_fk_row_id, sec_fk_row_id, enc, runtime);
     secure_share_i64_column(role, sort_input_party, plain_fk_is_null, sec_fk_is_null, enc, runtime);
     secure_share_i64_column(role, sort_input_party, plain_fk_valid, sec_fk_valid, enc, runtime);
     secure_share_i64_column(role, sort_input_party, plain_fk_contrib, sec_fk_fk_contrib, enc, runtime);
+    secure_share_i64_column(role, sort_input_party, plain_fk_group_key, sec_fk_group_key, enc, runtime);
 
     si64Matrix sec_pad_key;
     si64Matrix sec_pad_table_id;
@@ -775,12 +1001,14 @@ void build_secure_sorted_multiplier_rows(
     si64Matrix sec_pad_is_null;
     si64Matrix sec_pad_valid;
     si64Matrix sec_pad_fk_contrib;
+    si64Matrix sec_pad_group_key;
     secure_share_i64_column(role, sort_input_party, plain_pad_key, sec_pad_key, enc, runtime);
     secure_share_i64_column(role, sort_input_party, plain_pad_table_id, sec_pad_table_id, enc, runtime);
     secure_share_i64_column(role, sort_input_party, plain_pad_row_id, sec_pad_row_id, enc, runtime);
     secure_share_i64_column(role, sort_input_party, plain_pad_is_null, sec_pad_is_null, enc, runtime);
     secure_share_i64_column(role, sort_input_party, plain_pad_valid, sec_pad_valid, enc, runtime);
     secure_share_i64_column(role, sort_input_party, plain_pad_fk_contrib, sec_pad_fk_contrib, enc, runtime);
+    secure_share_i64_column(role, sort_input_party, plain_pad_group_key, sec_pad_group_key, enc, runtime);
 
     sec_key = concat_shared_row_blocks({sec_pk_key, sec_fk_key, sec_pad_key});
     si64Matrix sec_table_id = concat_shared_row_blocks({sec_pk_table_id, sec_fk_table_id, sec_pad_table_id});
@@ -788,10 +1016,12 @@ void build_secure_sorted_multiplier_rows(
     si64Matrix sec_is_null = concat_shared_row_blocks({sec_pk_is_null, sec_fk_is_null, sec_pad_is_null});
     si64Matrix sec_valid = concat_shared_row_blocks({sec_pk_valid, sec_fk_valid, sec_pad_valid});
     si64Matrix sec_fk_contrib = concat_shared_row_blocks({sec_pk_fk_contrib, sec_fk_fk_contrib, sec_pad_fk_contrib});
+    si64Matrix sec_group_key = concat_shared_row_blocks({sec_pk_group_key, sec_fk_group_key, sec_pad_group_key});
 
+    const u64 payload_cols = include_group_key ? 6 : 5;
     payloads_out.resize(static_cast<size_t>(padded));
     for (u64 row = 0; row < padded; ++row) {
-        si64Matrix payload(5, 1);
+        si64Matrix payload(payload_cols, 1);
         payload.mShares[0](0, 0) = sec_table_id.mShares[0](row, 0);
         payload.mShares[1](0, 0) = sec_table_id.mShares[1](row, 0);
         payload.mShares[0](1, 0) = sec_row_id.mShares[0](row, 0);
@@ -802,9 +1032,165 @@ void build_secure_sorted_multiplier_rows(
         payload.mShares[1](3, 0) = sec_valid.mShares[1](row, 0);
         payload.mShares[0](4, 0) = sec_fk_contrib.mShares[0](row, 0);
         payload.mShares[1](4, 0) = sec_fk_contrib.mShares[1](row, 0);
+        if (include_group_key) {
+            payload.mShares[0](5, 0) = sec_group_key.mShares[0](row, 0);
+            payload.mShares[1](5, 0) = sec_group_key.mShares[1](row, 0);
+        }
         payloads_out[static_cast<size_t>(row)] = std::move(payload);
     }
     quick_sort_with_other_elements(sec_key, payloads_out, role, enc, eval, runtime, config.secure_sort_min_size);
+}
+
+si64Matrix payload_column_to_matrix(const std::vector<si64Matrix>& payloads, u64 column_idx)
+{
+    si64Matrix out(static_cast<u64>(payloads.size()), 1);
+    for (u64 row = 0; row < static_cast<u64>(payloads.size()); ++row) {
+        if (column_idx >= payloads[static_cast<std::size_t>(row)].rows()) {
+            throw std::runtime_error("Sorted multiplier payload column index is out of bounds.");
+        }
+        out.mShares[0](row, 0) = payloads[static_cast<std::size_t>(row)].mShares[0](column_idx, 0);
+        out.mShares[1](row, 0) = payloads[static_cast<std::size_t>(row)].mShares[1](column_idx, 0);
+    }
+    return out;
+}
+
+std::vector<si64Matrix> column_to_payload_vector(const si64Matrix& column)
+{
+    std::vector<si64Matrix> out(static_cast<std::size_t>(column.rows()));
+    for (u64 row = 0; row < column.rows(); ++row) {
+        si64Matrix payload(1, 1);
+        payload.mShares[0](0, 0) = column.mShares[0](row, 0);
+        payload.mShares[1](0, 0) = column.mShares[1](row, 0);
+        out[static_cast<std::size_t>(row)] = std::move(payload);
+    }
+    return out;
+}
+
+sbMatrix shared_false_bool_matrix(u64 rows, u64 bit_count, int role)
+{
+    sbMatrix out(rows, bit_count);
+    bool_init_false(role, out);
+    return out;
+}
+
+sbMatrix bool_and_matrix_columns(
+    sbMatrix lhs,
+    sbMatrix rhs,
+    int role,
+    Sh3Encryptor& enc,
+    Sh3Evaluator& eval,
+    Sh3Runtime& runtime)
+{
+    sbMatrix out(lhs.rows(), lhs.bitCount());
+    bool_cipher_and(role, lhs, rhs, out, enc, eval, runtime);
+    return out;
+}
+
+si64Matrix segmented_prefix_sum(
+    const si64Matrix& values,
+    const sbMatrix& same_previous,
+    int role,
+    Sh3Encryptor& enc,
+    Sh3Evaluator& eval,
+    Sh3Runtime& runtime)
+{
+    si64Matrix sums = values;
+    sbMatrix links = same_previous;
+    const u64 rows = values.rows();
+    for (u64 offset = 1; offset < rows; offset <<= 1) {
+        si64Matrix shifted_sums(rows, 1);
+        shifted_sums.mShares[0].setZero();
+        shifted_sums.mShares[1].setZero();
+        sbMatrix shifted_links = shared_false_bool_matrix(rows, links.bitCount(), role);
+        for (u64 row = offset; row < rows; ++row) {
+            shifted_sums.mShares[0](row, 0) = sums.mShares[0](row - offset, 0);
+            shifted_sums.mShares[1](row, 0) = sums.mShares[1](row - offset, 0);
+            for (u64 col = 0; col < static_cast<u64>(links.mShares[0].cols()); ++col) {
+                shifted_links.mShares[0](row, col) = links.mShares[0](row - offset, col);
+                shifted_links.mShares[1](row, col) = links.mShares[1](row - offset, col);
+            }
+        }
+        auto candidate = sums + shifted_sums;
+        auto select_flag = links;
+        sums = select_si64_by_bool(candidate, sums, select_flag, role, enc, eval, runtime);
+        links = bool_and_matrix_columns(links, shifted_links, role, enc, eval, runtime);
+    }
+    return sums;
+}
+
+si64Matrix segmented_suffix_sum(
+    const si64Matrix& values,
+    const sbMatrix& same_next,
+    int role,
+    Sh3Encryptor& enc,
+    Sh3Evaluator& eval,
+    Sh3Runtime& runtime)
+{
+    si64Matrix sums = values;
+    sbMatrix links = same_next;
+    const u64 rows = values.rows();
+    for (u64 offset = 1; offset < rows; offset <<= 1) {
+        si64Matrix shifted_sums(rows, 1);
+        shifted_sums.mShares[0].setZero();
+        shifted_sums.mShares[1].setZero();
+        sbMatrix shifted_links = shared_false_bool_matrix(rows, links.bitCount(), role);
+        for (u64 row = 0; row + offset < rows; ++row) {
+            shifted_sums.mShares[0](row, 0) = sums.mShares[0](row + offset, 0);
+            shifted_sums.mShares[1](row, 0) = sums.mShares[1](row + offset, 0);
+            for (u64 col = 0; col < static_cast<u64>(links.mShares[0].cols()); ++col) {
+                shifted_links.mShares[0](row, col) = links.mShares[0](row + offset, col);
+                shifted_links.mShares[1](row, col) = links.mShares[1](row + offset, col);
+            }
+        }
+        auto candidate = sums + shifted_sums;
+        auto select_flag = links;
+        sums = select_si64_by_bool(candidate, sums, select_flag, role, enc, eval, runtime);
+        links = bool_and_matrix_columns(links, shifted_links, role, enc, eval, runtime);
+    }
+    return sums;
+}
+
+sbMatrix adjacent_group_equal_flags(
+    si64Matrix& group_key,
+    bool compare_previous,
+    int role,
+    Sh3Evaluator& eval,
+    Sh3Runtime& runtime)
+{
+    const u64 rows = group_key.rows();
+    si64Matrix lhs(rows, 1);
+    si64Matrix rhs(rows, 1);
+    lhs.mShares[0].setZero();
+    lhs.mShares[1].setZero();
+    rhs.mShares[0].setZero();
+    rhs.mShares[1].setZero();
+    for (u64 row = 0; row < rows; ++row) {
+        lhs.mShares[0](row, 0) = group_key.mShares[0](row, 0);
+        lhs.mShares[1](row, 0) = group_key.mShares[1](row, 0);
+        if (compare_previous) {
+            if (row == 0) {
+                continue;
+            }
+            rhs.mShares[0](row, 0) = group_key.mShares[0](row - 1, 0);
+            rhs.mShares[1](row, 0) = group_key.mShares[1](row - 1, 0);
+        } else {
+            if (row + 1 >= rows) {
+                continue;
+            }
+            rhs.mShares[0](row, 0) = group_key.mShares[0](row + 1, 0);
+            rhs.mShares[1](row, 0) = group_key.mShares[1](row + 1, 0);
+        }
+    }
+    sbMatrix out;
+    cipher_eq(role, lhs, rhs, out, eval, runtime);
+    if (rows > 0) {
+        const u64 boundary_row = compare_previous ? 0 : rows - 1;
+        for (u64 col = 0; col < static_cast<u64>(out.mShares[0].cols()); ++col) {
+            out.mShares[0](boundary_row, col) = 0;
+            out.mShares[1](boundary_row, col) = 0;
+        }
+    }
+    return out;
 }
 
 void run_secure_multiplier_scaffold(const MultiplierPreprocessConfig& config)
@@ -902,6 +1288,140 @@ void run_secure_multiplier_scaffold(const MultiplierPreprocessConfig& config)
     if (config.role == 0) {
         const std::string scaffold_path = config.output_prefix + ".secure_scaffold.json";
         write_secure_scaffold_manifest(config, shape, scaffold_path);
+    }
+}
+
+void run_secure_multiplier_shared_values(const MultiplierPreprocessConfig& config)
+{
+    if (config.role < 0 || config.role > 2) {
+        throw std::runtime_error("secure_shared_values mode requires --role in {0,1,2}.");
+    }
+    if (config.pk_input_party < 0 || config.pk_input_party > 2) {
+        throw std::runtime_error("secure_shared_values mode requires --pk_input_party in {0,1,2}.");
+    }
+    if (config.fk_input_party < 0 || config.fk_input_party > 2) {
+        throw std::runtime_error("secure_shared_values mode requires --fk_input_party in {0,1,2}.");
+    }
+    if (config.fk_sample_rate <= 0.0) {
+        throw std::runtime_error("FK sample rate must be positive.");
+    }
+
+    IOService ios;
+    Sh3Encryptor enc;
+    Sh3Evaluator eval;
+    Sh3Runtime runtime;
+    basic_setup(static_cast<u64>(config.role), ios, enc, eval, runtime);
+
+    std::vector<NormalizedKey> pk_keys;
+    std::vector<NormalizedKey> fk_keys;
+    u64 n_pk = 0;
+    u64 n_fk = 0;
+
+    const int sort_input_party = config.pk_input_party;
+    if (config.role == sort_input_party) {
+        pk_keys = load_key_column_csv(config.pk_csv_path, config.pk_key_column, config.pk_has_header);
+        fk_keys = load_key_column_csv(config.fk_csv_path, config.fk_key_column, config.fk_has_header);
+        n_pk = static_cast<u64>(pk_keys.size());
+        n_fk = static_cast<u64>(fk_keys.size());
+    }
+
+    sync_value_from_party(config.role, sort_input_party, runtime, n_pk);
+    sync_value_from_party(config.role, sort_input_party, runtime, n_fk);
+
+    const u64 padded = roundUpToPowerOfTwo(n_pk + n_fk);
+    si64Matrix sec_key;
+    std::vector<si64Matrix> sorted_payloads;
+    build_secure_sorted_multiplier_rows(
+        config,
+        config.role,
+        pk_keys,
+        fk_keys,
+        enc,
+        eval,
+        runtime,
+        n_pk,
+        n_fk,
+        padded,
+        sec_key,
+        sorted_payloads,
+        true);
+
+    auto table_id = payload_column_to_matrix(sorted_payloads, 0);
+    auto row_id = payload_column_to_matrix(sorted_payloads, 1);
+    auto fk_contrib = payload_column_to_matrix(sorted_payloads, 4);
+    auto group_key = payload_column_to_matrix(sorted_payloads, 5);
+
+    auto same_previous = adjacent_group_equal_flags(group_key, true, config.role, eval, runtime);
+    auto same_next = adjacent_group_equal_flags(group_key, false, config.role, eval, runtime);
+    auto prefix_counts = segmented_prefix_sum(fk_contrib, same_previous, config.role, enc, eval, runtime);
+    auto suffix_counts = segmented_suffix_sum(fk_contrib, same_next, config.role, enc, eval, runtime);
+    auto sorted_group_counts = prefix_counts + suffix_counts - fk_contrib;
+
+    auto zero_sorted = public_i64_column(0, padded, config.role);
+    sbMatrix is_pk_row;
+    cipher_eq(config.role, table_id, zero_sorted, is_pk_row, eval, runtime);
+
+    si64Matrix non_pk_sort_key(padded, 1);
+    non_pk_sort_key.mShares[0].setZero();
+    non_pk_sort_key.mShares[1].setZero();
+    for (u64 row = 0; row < padded; ++row) {
+        const i64 public_key = static_cast<i64>(n_pk + row);
+        if (config.role == 0) {
+            non_pk_sort_key.mShares[0](row, 0) = public_key;
+        } else if (config.role == 1) {
+            non_pk_sort_key.mShares[1](row, 0) = public_key;
+        }
+    }
+    auto sort_back_key = select_si64_by_bool(row_id, non_pk_sort_key, is_pk_row, config.role, enc, eval, runtime);
+    auto sorted_count_payloads = column_to_payload_vector(sorted_group_counts);
+    quick_sort_with_other_elements(
+        sort_back_key,
+        sorted_count_payloads,
+        config.role,
+        enc,
+        eval,
+        runtime,
+        config.secure_sort_min_size);
+
+    si64Matrix counts(n_pk, 1);
+    for (u64 row = 0; row < n_pk; ++row) {
+        counts.mShares[0](row, 0) = sorted_count_payloads[static_cast<std::size_t>(row)].mShares[0](0, 0);
+        counts.mShares[1](row, 0) = sorted_count_payloads[static_cast<std::size_t>(row)].mShares[1](0, 0);
+    }
+
+    const i64 fixed_scale = static_cast<i64>(std::llround(
+        static_cast<double>(kMultiplierFixedOne) / config.fk_sample_rate));
+    si64Matrix mu_fixed(n_pk, 1);
+    for (u64 row = 0; row < n_pk; ++row) {
+        mu_fixed.mShares[0](row, 0) = counts.mShares[0](row, 0) * fixed_scale;
+        mu_fixed.mShares[1](row, 0) = counts.mShares[1](row, 0) * fixed_scale;
+    }
+
+    auto zero_counts = shared_zero_int_matrix(n_pk, 1);
+    sbMatrix is_zero_count;
+    cipher_eq(config.role, counts, zero_counts, is_zero_count, eval, runtime);
+    const auto one_scalar = share_int_scalar(kMultiplierFixedOne, 0, enc, runtime, config.role);
+    const auto one_rows = repeat_int_scalar_rows(one_scalar, n_pk);
+    si64Matrix mu_nn_fixed = select_si64_by_bool(
+        one_rows,
+        mu_fixed,
+        is_zero_count,
+        config.role,
+        enc,
+        eval,
+        runtime);
+
+    ensure_dir(config.output_prefix);
+    const std::string role_dir = config.output_prefix + "/role_" + std::to_string(config.role);
+    ensure_dir(role_dir);
+    write_share_pair_matrix(role_dir + "/mu.shares.bin", mu_fixed);
+    write_share_pair_matrix(role_dir + "/mu_nn.shares.bin", mu_nn_fixed);
+    if (config.role == 0) {
+        write_secure_shared_values_manifest(
+            config,
+            static_cast<std::size_t>(n_pk),
+            static_cast<std::size_t>(n_fk),
+            config.output_prefix);
     }
 }
 
@@ -1024,6 +1544,306 @@ void run_secure_multiplier_reveal(const MultiplierPreprocessConfig& config)
     }
 }
 
+std::string dirname_from_path(const std::string& path)
+{
+    const auto pos = path.find_last_of("/\\");
+    if (pos == std::string::npos) {
+        return ".";
+    }
+    return path.substr(0, pos);
+}
+
+std::string join_path(const std::string& base, const std::string& child)
+{
+    if (child.empty()) {
+        return base;
+    }
+    if (!child.empty() && child.front() == '/') {
+        return child;
+    }
+    if (base.empty() || base == ".") {
+        return child;
+    }
+    if (base.back() == '/') {
+        return base + child;
+    }
+    return base + "/" + child;
+}
+
+json read_json_file(const std::string& path)
+{
+    std::ifstream input(path);
+    if (!input.is_open()) {
+        throw std::runtime_error("Failed to open json file: " + path);
+    }
+    json doc;
+    input >> doc;
+    return doc;
+}
+
+sbMatrix bool_and_matrix(sbMatrix lhs, sbMatrix rhs, int role, Sh3Encryptor& enc, Sh3Evaluator& eval, Sh3Runtime& runtime)
+{
+    sbMatrix out(lhs.rows(), lhs.bitCount());
+    bool_cipher_and(role, lhs, rhs, out, enc, eval, runtime);
+    return out;
+}
+
+sbMatrix bool_or_matrix(sbMatrix lhs, sbMatrix rhs, int role, Sh3Encryptor& enc, Sh3Evaluator& eval, Sh3Runtime& runtime)
+{
+    sbMatrix out(lhs.rows(), lhs.bitCount());
+    bool_cipher_or(role, lhs, rhs, out, enc, eval, runtime);
+    return out;
+}
+
+sbMatrix bool_not_matrix(sbMatrix value, int role)
+{
+    sbMatrix out(value.rows(), value.bitCount());
+    bool_cipher_not(role, value, out);
+    return out;
+}
+
+si64Matrix bool_to_arith_matrix(sbMatrix value, int role, Sh3Encryptor& enc, Sh3Evaluator& eval, Sh3Runtime& runtime)
+{
+    si64Matrix out(value.rows(), 1);
+    out.mShares[0].setZero();
+    out.mShares[1].setZero();
+    bool2arith(role, value, out, enc, eval, runtime);
+    return out;
+}
+
+si64Matrix arith_mul_bool(const si64Matrix& value, sbMatrix flag, int role, Sh3Encryptor& enc, Sh3Evaluator& eval, Sh3Runtime& runtime)
+{
+    auto flag_arith = bool_to_arith_matrix(flag, role, enc, eval, runtime);
+    si64Matrix out(value.rows(), value.cols());
+    out.mShares[0].setZero();
+    out.mShares[1].setZero();
+    cipher_mul(role, value, flag_arith, out, eval, enc, runtime);
+    return out;
+}
+
+si64Matrix secure_lookup_by_secret_index(
+    const si64Matrix& values_by_pk,
+    const si64Matrix& sample_pk_rows,
+    int role,
+    Sh3Encryptor& enc,
+    Sh3Evaluator& eval,
+    Sh3Runtime& runtime)
+{
+    si64Matrix out(sample_pk_rows.rows(), 1);
+    out.mShares[0].setZero();
+    out.mShares[1].setZero();
+    for (u64 pk_row = 0; pk_row < values_by_pk.rows(); ++pk_row) {
+        auto sample_pk_rows_copy = sample_pk_rows;
+        auto public_pk = public_i64_column(static_cast<i64>(pk_row), sample_pk_rows.rows(), role);
+        sbMatrix is_row;
+        cipher_eq(role, sample_pk_rows_copy, public_pk, is_row, eval, runtime);
+        auto repeated_value = repeat_shared_row(values_by_pk, pk_row, sample_pk_rows.rows());
+        auto contribution = arith_mul_bool(repeated_value, is_row, role, enc, eval, runtime);
+        out = out + contribution;
+    }
+    return out;
+}
+
+struct MaterializedLeafResult {
+    std::uint64_t leaf_node_id = 0;
+    std::uint64_t product_group_id = 0;
+    std::uint64_t bucket_count = 0;
+};
+
+MaterializedLeafResult materialize_one_secure_leaf(
+    const json& leaf_doc,
+    const std::string& plan_base_dir,
+    const std::string& output_prefix,
+    u64 total_rows,
+    int role,
+    Sh3Encryptor& enc,
+    Sh3Evaluator& eval,
+    Sh3Runtime& runtime)
+{
+    const std::uint64_t leaf_node_id = leaf_doc.value("leaf_node_id", std::uint64_t(0));
+    const std::uint64_t product_group_id = leaf_doc.value("product_group_id", std::uint64_t(0));
+    const std::string artifact_dir = leaf_doc.value("multiplier_artifact_dir", std::string());
+    if (artifact_dir.empty()) {
+        throw std::runtime_error("Secure leaf plan is missing multiplier_artifact_dir.");
+    }
+    const auto artifact_manifest = read_json_file(join_path(artifact_dir, "manifest.json"));
+    const u64 pk_row_count = artifact_manifest.value("pk_row_count", std::uint64_t(0));
+    const std::string kind = leaf_doc.value("multiplier_kind", std::string("mu"));
+    const std::string multiplier_file = kind == "mu_nn" ? "mu_nn.shares.bin" : "mu.shares.bin";
+    const std::string role_name = "role_" + std::to_string(role);
+    const auto multiplier_values = read_share_pair_matrix(
+        join_path(join_path(artifact_dir, role_name), multiplier_file),
+        pk_row_count);
+
+    const std::string role_share_template = leaf_doc.value("role_share_dir", std::string());
+    (void)role_share_template;
+    const std::string plan_role_dir = join_path(join_path(plan_base_dir, "secure_leaf_plan"), role_name);
+    const auto membership = read_bool_share_pair_matrix(
+        join_path(plan_role_dir, leaf_doc.value("membership_share_file", std::string())),
+        total_rows,
+        1);
+    const auto sample_pk_rows = read_share_pair_matrix(
+        join_path(plan_role_dir, leaf_doc.value("sample_pk_rows_share_file", std::string())),
+        total_rows);
+    auto values = secure_lookup_by_secret_index(
+        multiplier_values,
+        sample_pk_rows,
+        role,
+        enc,
+        eval,
+        runtime);
+
+    sbMatrix boundaries(total_rows, 1);
+    for (u64 row_i = 0; row_i < total_rows; ++row_i) {
+        auto active_i = bool_row_slice(membership, row_i, 1);
+        sbMatrix has_prior(1, 1);
+        bool_init_false(role, has_prior);
+        auto value_i = int_row_slice(values, row_i, 1);
+        for (u64 row_j = 0; row_j < row_i; ++row_j) {
+            auto value_j = int_row_slice(values, row_j, 1);
+            sbMatrix same_value;
+            cipher_eq(role, value_i, value_j, same_value, eval, runtime);
+            auto active_j = bool_row_slice(membership, row_j, 1);
+            auto active_same = bool_and_matrix(same_value, active_j, role, enc, eval, runtime);
+            has_prior = bool_or_matrix(has_prior, active_same, role, enc, eval, runtime);
+        }
+        auto no_prior = bool_not_matrix(has_prior, role);
+        auto boundary = bool_and_matrix(active_i, no_prior, role, enc, eval, runtime);
+        boundaries.mShares[0](row_i, 0) = boundary.mShares[0](0, 0);
+        boundaries.mShares[1](row_i, 0) = boundary.mShares[1](0, 0);
+    }
+
+    auto boundary_arith = bool_to_arith_matrix(boundaries, role, enc, eval, runtime);
+    si64Matrix bucket_count_shared(1, 1);
+    bucket_count_shared.mShares[0].setZero();
+    bucket_count_shared.mShares[1].setZero();
+    si64Matrix ranks(total_rows, 1);
+    ranks.mShares[0].setZero();
+    ranks.mShares[1].setZero();
+    i64 lhs_running = 0;
+    i64 rhs_running = 0;
+    for (u64 row = 0; row < total_rows; ++row) {
+        lhs_running += boundary_arith.mShares[0](row, 0);
+        rhs_running += boundary_arith.mShares[1](row, 0);
+        ranks.mShares[0](row, 0) = lhs_running;
+        ranks.mShares[1](row, 0) = rhs_running;
+    }
+    bucket_count_shared.mShares[0](0, 0) = lhs_running;
+    bucket_count_shared.mShares[1](0, 0) = rhs_running;
+    i64Matrix bucket_count_plain(1, 1);
+    enc.revealAll(runtime, bucket_count_shared, bucket_count_plain).get();
+    const i64 revealed_count = bucket_count_plain(0, 0);
+    if (revealed_count < 0 || static_cast<u64>(revealed_count) > total_rows) {
+        throw std::runtime_error("Materialized secure leaf produced invalid bucket count.");
+    }
+    const u64 bucket_count = static_cast<u64>(revealed_count);
+
+    si64Matrix bucket_values(bucket_count, 1);
+    bucket_values.mShares[0].setZero();
+    bucket_values.mShares[1].setZero();
+    sbMatrix bucket_bitmaps(bucket_count * total_rows, 1);
+    for (u64 row = 0; row < bucket_bitmaps.rows(); ++row) {
+        bucket_bitmaps.mShares[0](row, 0) = 0;
+        bucket_bitmaps.mShares[1](row, 0) = 0;
+    }
+
+    for (u64 bucket_idx = 0; bucket_idx < bucket_count; ++bucket_idx) {
+        auto public_rank = public_i64_column(static_cast<i64>(bucket_idx + 1), total_rows, role);
+        sbMatrix rank_matches;
+        cipher_eq(role, ranks, public_rank, rank_matches, eval, runtime);
+        auto representative_rows = bool_and_matrix(rank_matches, boundaries, role, enc, eval, runtime);
+        auto selected_values = arith_mul_bool(values, representative_rows, role, enc, eval, runtime);
+        bucket_values.mShares[0](bucket_idx, 0) = selected_values.mShares[0].sum();
+        bucket_values.mShares[1](bucket_idx, 0) = selected_values.mShares[1].sum();
+
+        auto repeated_bucket_value = repeat_shared_row(bucket_values, bucket_idx, total_rows);
+        sbMatrix value_matches;
+        cipher_eq(role, values, repeated_bucket_value, value_matches, eval, runtime);
+        auto active_value_matches = bool_and_matrix(value_matches, membership, role, enc, eval, runtime);
+        const u64 out_begin = bucket_idx * total_rows;
+        for (u64 row = 0; row < total_rows; ++row) {
+            bucket_bitmaps.mShares[0](out_begin + row, 0) = active_value_matches.mShares[0](row, 0);
+            bucket_bitmaps.mShares[1](out_begin + row, 0) = active_value_matches.mShares[1](row, 0);
+        }
+    }
+
+    ensure_dir(output_prefix);
+    const std::string role_dir = join_path(output_prefix, role_name);
+    ensure_dir(role_dir);
+    const std::string leaf_prefix = "leaf_" + std::to_string(leaf_node_id);
+    write_share_pair_matrix(join_path(role_dir, leaf_prefix + ".bucket_values.shares.bin"), bucket_values);
+    write_share_pair_matrix(join_path(role_dir, leaf_prefix + ".bucket_lowers.shares.bin"), bucket_values);
+    write_share_pair_matrix(join_path(role_dir, leaf_prefix + ".bucket_uppers.shares.bin"), bucket_values);
+    write_bool_share_pair_matrix(join_path(role_dir, leaf_prefix + ".leaf_bitmaps.shares.bin"), bucket_bitmaps);
+
+    MaterializedLeafResult result;
+    result.leaf_node_id = leaf_node_id;
+    result.product_group_id = product_group_id;
+    result.bucket_count = bucket_count;
+    return result;
+}
+
+void write_secure_leaf_counts_manifest(
+    const std::string& output_prefix,
+    const std::vector<MaterializedLeafResult>& leaves,
+    u64 total_rows)
+{
+    std::ostringstream content;
+    content << "{\n";
+    content << "  \"format_name\": \"BSPN_SECURE_MULTIPLIER_LEAF_COUNTS\",\n";
+    content << "  \"format_version\": 1,\n";
+    content << "  \"total_rows\": " << total_rows << ",\n";
+    content << "  \"leaves\": [\n";
+    for (std::size_t idx = 0; idx < leaves.size(); ++idx) {
+        const auto& leaf = leaves[idx];
+        content << "    {";
+        content << "\"leaf_node_id\": " << leaf.leaf_node_id << ", ";
+        content << "\"product_group_id\": " << leaf.product_group_id << ", ";
+        content << "\"real_bucket_count\": " << leaf.bucket_count << ", ";
+        content << "\"bucket_values_share_file\": \"leaf_" << leaf.leaf_node_id << ".bucket_values.shares.bin\", ";
+        content << "\"bucket_lowers_share_file\": \"leaf_" << leaf.leaf_node_id << ".bucket_lowers.shares.bin\", ";
+        content << "\"bucket_uppers_share_file\": \"leaf_" << leaf.leaf_node_id << ".bucket_uppers.shares.bin\", ";
+        content << "\"leaf_bitmaps_share_file\": \"leaf_" << leaf.leaf_node_id << ".leaf_bitmaps.shares.bin\"";
+        content << "}" << (idx + 1 == leaves.size() ? "\n" : ",\n");
+    }
+    content << "  ],\n";
+    content << "  \"role_share_dir\": \"role_{role}\"\n";
+    content << "}\n";
+    write_text_file(join_path(output_prefix, "secure_leaf_counts.json"), content.str());
+}
+
+void run_secure_leaf_materialize(const MultiplierPreprocessConfig& config)
+{
+    if (config.role < 0 || config.role > 2) {
+        throw std::runtime_error("secure_leaf_materialize mode requires --role in {0,1,2}.");
+    }
+    IOService ios;
+    Sh3Encryptor enc;
+    Sh3Evaluator eval;
+    Sh3Runtime runtime;
+    basic_setup(static_cast<u64>(config.role), ios, enc, eval, runtime);
+
+    const auto plan = read_json_file(config.secure_leaf_plan_path);
+    const u64 total_rows = plan.value("total_rows", std::uint64_t(0));
+    const std::string plan_base_dir = dirname_from_path(config.secure_leaf_plan_path);
+    std::vector<MaterializedLeafResult> results;
+    for (const auto& leaf_doc : plan.value("leaves", json::array())) {
+        results.push_back(materialize_one_secure_leaf(
+            leaf_doc,
+            plan_base_dir,
+            config.output_prefix,
+            total_rows,
+            config.role,
+            enc,
+            eval,
+            runtime));
+    }
+    if (config.role == 0) {
+        ensure_dir(config.output_prefix);
+        write_secure_leaf_counts_manifest(config.output_prefix, results, total_rows);
+    }
+}
+
 }  // namespace
 
 int BSPN_multiplier_preprocess(const CLP& cmd)
@@ -1040,10 +1860,21 @@ int BSPN_multiplier_preprocess(const CLP& cmd)
         return 0;
     }
 
+    if (config.mode == "secure_shared_values") {
+        run_secure_multiplier_shared_values(config);
+        return 0;
+    }
+
     if (config.mode == "secure_reveal") {
         run_secure_multiplier_reveal(config);
         return 0;
     }
 
-    throw std::runtime_error("Unsupported --multiplier_mode. Use reference, secure_scaffold, or secure_reveal.");
+    if (config.mode == "secure_leaf_materialize") {
+        run_secure_leaf_materialize(config);
+        return 0;
+    }
+
+    throw std::runtime_error(
+        "Unsupported --multiplier_mode. Use reference, secure_scaffold, secure_shared_values, secure_leaf_materialize, or secure_reveal.");
 }
