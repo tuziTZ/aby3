@@ -66,6 +66,7 @@ struct FlatBSPNManifest {
     std::uint64_t max_leaf_bucket_width = 0;
     std::uint64_t leaf_node_count = 0;
     std::uint64_t real_bucket_count = 0;
+    bool has_real_bucket_count = false;
     std::uint64_t padding_bucket_count = 0;
     std::uint64_t node_cardinality_count = 0;
     std::uint64_t node_inv_cardinality_count = 0;
@@ -76,6 +77,13 @@ struct FlatBSPNManifest {
     bool secure_multiplier_materialized = false;
     std::string secure_share_payload_dir = "secret_shares";
     std::vector<std::uint32_t> secure_multiplier_bucket_indices;
+    bool has_leaf_row_values = false;
+    std::vector<std::uint32_t> leaf_row_value_node_ids;
+    std::vector<std::uint64_t> leaf_row_value_offsets;
+    std::uint64_t leaf_row_value_total_rows = 0;
+    std::vector<std::uint32_t> secure_multiplier_leaf_row_value_node_ids;
+    std::vector<std::uint64_t> secure_multiplier_leaf_row_value_offsets;
+    std::uint64_t secure_multiplier_leaf_row_value_total_rows = 0;
 };
 
 struct FlatEvidenceInterval {
@@ -125,6 +133,7 @@ struct FlatBSPNSecretHostPayload {
     f64Matrix<kFlatBSPNDecimal> bucket_values;
     f64Matrix<kFlatBSPNDecimal> bucket_lowers;
     f64Matrix<kFlatBSPNDecimal> bucket_uppers;
+    f64Matrix<kFlatBSPNDecimal> leaf_row_values;
     i64Matrix leaf_bitmaps;
 };
 
@@ -136,6 +145,9 @@ struct FlatBSPNSecretSharedPayload {
     sf64Matrix<kFlatBSPNDecimal> bucket_values;
     sf64Matrix<kFlatBSPNDecimal> bucket_lowers;
     sf64Matrix<kFlatBSPNDecimal> bucket_uppers;
+    sf64Matrix<kFlatBSPNDecimal> leaf_row_values;
+    std::vector<std::int64_t> leaf_row_value_offset_by_node;
+    bool leaf_row_values_loaded = false;
     si64Matrix leaf_bitmaps;
     std::vector<sbMatrix> dense_bucket_bitmaps;
     bool dense_bucket_bitmaps_loaded = false;

@@ -59,6 +59,36 @@ int parse_bspn_port_env(const char* value, int fallback) {
     return static_cast<int>(parsed);
 }
 
+std::uint64_t parse_bspn_u64_env(const char* name, std::uint64_t fallback) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || *value == '\0') {
+        return fallback;
+    }
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    if (end == value || *end != '\0' || parsed == 0) {
+        return fallback;
+    }
+    return static_cast<std::uint64_t>(parsed);
+}
+
+std::uint64_t bspn_max_stacked_bitmap_rows() {
+    return parse_bspn_u64_env("BSPN_MAX_STACKED_BITMAP_ROWS", std::uint64_t(1) << 20);
+}
+
+std::uint64_t bspn_bitmap_share_rows_per_chunk() {
+    return parse_bspn_u64_env("BSPN_BITMAP_SHARE_ROWS_PER_CHUNK", std::uint64_t(1) << 20);
+}
+
+bool bspn_use_row_value_eval() {
+    const char* value = std::getenv("BSPN_USE_ROW_VALUE_EVAL");
+    if (value == nullptr || *value == '\0') {
+        return true;
+    }
+    const std::string normalized(value);
+    return normalized != "0" && normalized != "false" && normalized != "FALSE" && normalized != "off";
+}
+
 BSPNNetworkConfig bspn_network_config_from_env() {
     BSPNNetworkConfig config;
     config.hosts = parse_bspn_hosts_env(std::getenv("ABY3_PARTY_HOSTS"));
@@ -396,6 +426,17 @@ si64Matrix share_int_scalar(
     return shared;
 }
 
+si64Matrix repeat_int_scalar_matrix(const si64Matrix& scalar, u64 rows, u64 cols) {
+    si64Matrix out(rows, cols);
+    for (u64 row = 0; row < rows; ++row) {
+        for (u64 col = 0; col < cols; ++col) {
+            out.mShares[0](row, col) = scalar.mShares[0](0, 0);
+            out.mShares[1](row, col) = scalar.mShares[1](0, 0);
+        }
+    }
+    return out;
+}
+
 double reveal_fixed_scalar(
     const sf64Matrix<kFlatBSPNDecimal>& shared,
     const FlatBSPNSecureContext& context) {
@@ -467,6 +508,7 @@ struct SecureBundleExecutionResult {
     double root_division_payload_scale = 1.0;
     bool root_division_scale_denominator_payload = false;
     json debug_output;
+    json timing_profile;
 };
 
 struct SecureIndicatorEvalStats {
@@ -476,6 +518,7 @@ struct SecureIndicatorEvalStats {
     std::uint64_t phase1_match_batches = 0;
     std::uint64_t phase2_count_batches = 0;
     std::uint64_t phase3_batch_b2a_calls = 0;
+    std::uint64_t row_value_eval_used = 0;
     std::uint64_t leaf_product_groups = 0;
     std::uint64_t leaf_product_nodes = 0;
     double sum_node_ms = 0.0;
@@ -487,6 +530,32 @@ struct SecureIndicatorEvalStats {
     double phase3_numerator_ms = 0.0;
     double final_combine_ms = 0.0;
 };
+
+json secure_indicator_stats_json(const SecureIndicatorEvalStats& stats) {
+    return {
+        {"internal_reciprocal_calls", stats.internal_reciprocal_calls},
+        {"factor_root_divisions", stats.factor_root_divisions},
+        {"phase1_batch_dot_calls", stats.phase1_batch_dot_calls},
+        {"phase1_match_batches", stats.phase1_match_batches},
+        {"phase2_count_batches", stats.phase2_count_batches},
+        {"phase3_batch_b2a_calls", stats.phase3_batch_b2a_calls},
+        {"row_value_eval_used", stats.row_value_eval_used},
+        {"leaf_product_groups", stats.leaf_product_groups},
+        {"leaf_product_nodes", stats.leaf_product_nodes},
+        {"max_stacked_bitmap_rows", bspn_max_stacked_bitmap_rows()},
+        {"bitmap_share_rows_per_chunk", bspn_bitmap_share_rows_per_chunk()},
+        {"timing_ms", {
+            {"sum_node", stats.sum_node_ms},
+            {"product_sum", stats.product_sum_ms},
+            {"phase1_match", stats.phase1_match_ms},
+            {"phase1_local_ids", stats.phase1_local_ids_ms},
+            {"phase2_intersection", stats.phase2_intersection_ms},
+            {"phase2_count", stats.phase2_count_ms},
+            {"phase3_numerator", stats.phase3_numerator_ms},
+            {"final_combine", stats.final_combine_ms},
+        }},
+    };
+}
 
 using SteadyClock = std::chrono::steady_clock;
 using SteadyTimePoint = SteadyClock::time_point;
@@ -512,6 +581,16 @@ sf64Matrix<kFlatBSPNDecimal> si64_to_sf64(
 sf64Matrix<kFlatBSPNDecimal> secure_mul_fixed(
     const sf64Matrix<kFlatBSPNDecimal>& lhs,
     const sf64Matrix<kFlatBSPNDecimal>& rhs,
+    const FlatBSPNSecureContext& context);
+
+sf64Matrix<kFlatBSPNDecimal> secure_mul_fixed_same_shape(
+    const sf64Matrix<kFlatBSPNDecimal>& lhs,
+    const sf64Matrix<kFlatBSPNDecimal>& rhs,
+    const FlatBSPNSecureContext& context);
+
+sf64Matrix<kFlatBSPNDecimal> fixed_mul_bool_same_shape(
+    const sf64Matrix<kFlatBSPNDecimal>& values,
+    sbMatrix flags,
     const FlatBSPNSecureContext& context);
 
 boolShare row0_bool_share(const sbMatrix& mat);
@@ -541,6 +620,32 @@ sf64Matrix<kFlatBSPNDecimal> fixed_row_slice(
     sf64Matrix<kFlatBSPNDecimal> out(row_count, src.cols());
     out[0] = src[0].block(row_begin, 0, row_count, src.cols());
     out[1] = src[1].block(row_begin, 0, row_count, src.cols());
+    return out;
+}
+
+sf64Matrix<kFlatBSPNDecimal> gather_fixed_rows(
+    const sf64Matrix<kFlatBSPNDecimal>& src,
+    const std::vector<std::uint32_t>& rows) {
+    sf64Matrix<kFlatBSPNDecimal> out(static_cast<u64>(rows.size()), src.cols());
+    #pragma omp parallel for schedule(static)
+    for (std::int64_t idx = 0; idx < static_cast<std::int64_t>(rows.size()); ++idx) {
+        const auto src_row = rows[static_cast<std::size_t>(idx)];
+        for (u64 col = 0; col < static_cast<u64>(src.cols()); ++col) {
+            out[0](static_cast<u64>(idx), col) = src[0](src_row, col);
+            out[1](static_cast<u64>(idx), col) = src[1](src_row, col);
+        }
+    }
+    return out;
+}
+
+sf64Matrix<kFlatBSPNDecimal> stack_fixed_scalars(
+    const std::vector<sf64Matrix<kFlatBSPNDecimal>>& values) {
+    sf64Matrix<kFlatBSPNDecimal> out(static_cast<u64>(values.size()), 1);
+    #pragma omp parallel for schedule(static)
+    for (std::int64_t idx = 0; idx < static_cast<std::int64_t>(values.size()); ++idx) {
+        out[0](static_cast<u64>(idx), 0) = values[static_cast<std::size_t>(idx)][0](0, 0);
+        out[1](static_cast<u64>(idx), 0) = values[static_cast<std::size_t>(idx)][1](0, 0);
+    }
     return out;
 }
 
@@ -690,6 +795,15 @@ sf64Matrix<kFlatBSPNDecimal> bool_scalar_to_fixed(
     return si64_to_sf64(as_int);
 }
 
+sf64Matrix<kFlatBSPNDecimal> bool_matrix_to_fixed_same_shape(
+    const sbMatrix& flags,
+    const FlatBSPNSecureContext& context) {
+    sbMatrix flags_copy = flags;
+    si64Matrix as_int(flags.rows(), 1);
+    bool2arith(context.role, flags_copy, as_int, *(context.enc), *(context.eval), *(context.runtime));
+    return si64_to_sf64(as_int);
+}
+
 sf64Matrix<kFlatBSPNDecimal> select_fixed_by_bool(
     const sf64Matrix<kFlatBSPNDecimal>& true_value,
     const sf64Matrix<kFlatBSPNDecimal>& false_value,
@@ -699,6 +813,46 @@ sf64Matrix<kFlatBSPNDecimal> select_fixed_by_bool(
     auto delta = true_value - false_value;
     auto selected_delta = secure_mul_fixed(delta, flag_fixed, context);
     return false_value + selected_delta;
+}
+
+sf64Matrix<kFlatBSPNDecimal> select_fixed_by_bool_same_shape(
+    const sf64Matrix<kFlatBSPNDecimal>& true_value,
+    const sf64Matrix<kFlatBSPNDecimal>& false_value,
+    const sbMatrix& flags,
+    const FlatBSPNSecureContext& context) {
+    if (true_value.rows() != false_value.rows() || true_value.cols() != false_value.cols() ||
+        true_value.rows() != flags.rows()) {
+        throw std::runtime_error("select_fixed_by_bool_same_shape shape mismatch.");
+    }
+    auto flag_fixed = bool_matrix_to_fixed_same_shape(flags, context);
+    auto delta = true_value - false_value;
+    auto selected_delta = secure_mul_fixed_same_shape(delta, flag_fixed, context);
+    return false_value + selected_delta;
+}
+
+sbMatrix stack_bool_scalars(const std::vector<sbMatrix>& values) {
+    if (values.empty()) {
+        sbMatrix out(0, 1);
+        bool_init_false(0, out);
+        return out;
+    }
+    const u64 bit_count = values.front().bitCount();
+    const u64 share_cols = values.front().mShares[0].cols();
+    for (const auto& value : values) {
+        if (value.rows() != 1 || value.bitCount() != bit_count) {
+            throw std::runtime_error("Boolean scalar shapes do not match for stacking.");
+        }
+    }
+    sbMatrix out(values.size(), bit_count);
+    #pragma omp parallel for schedule(static)
+    for (std::int64_t idx = 0; idx < static_cast<std::int64_t>(values.size()); ++idx) {
+        const auto& value = values[static_cast<std::size_t>(idx)];
+        for (u64 col = 0; col < share_cols; ++col) {
+            out.mShares[0](static_cast<u64>(idx), col) = value.mShares[0](0, col);
+            out.mShares[1](static_cast<u64>(idx), col) = value.mShares[1](0, col);
+        }
+    }
+    return out;
 }
 
 sbMatrix rational_non_unit_denominator_flag(
@@ -1000,6 +1154,40 @@ sf64Matrix<kFlatBSPNDecimal> secure_mul_fixed_same_shape(
         *(context.eval),
         *(context.enc),
         *(context.runtime));
+    return out;
+}
+
+sf64Matrix<kFlatBSPNDecimal> fixed_mul_bool_same_shape(
+    const sf64Matrix<kFlatBSPNDecimal>& values,
+    sbMatrix flags,
+    const FlatBSPNSecureContext& context) {
+    if (values.rows() != flags.rows() || values.cols() != 1) {
+        throw std::runtime_error("fixed_mul_bool_same_shape expects fixed column values and one flag per row.");
+    }
+    si64Matrix value_int(values.rows(), values.cols());
+    value_int.mShares[0] = values[0];
+    value_int.mShares[1] = values[1];
+
+    si64Matrix flag_int(flags.rows(), 1);
+    flag_int.mShares[0].setZero();
+    flag_int.mShares[1].setZero();
+    bool2arith(context.role, flags, flag_int, *(context.enc), *(context.eval), *(context.runtime));
+
+    si64Matrix selected_int(values.rows(), values.cols());
+    selected_int.mShares[0].setZero();
+    selected_int.mShares[1].setZero();
+    cipher_mul(
+        context.role,
+        value_int,
+        flag_int,
+        selected_int,
+        *(context.eval),
+        *(context.enc),
+        *(context.runtime));
+
+    sf64Matrix<kFlatBSPNDecimal> out(values.rows(), values.cols());
+    out[0] = selected_int.mShares[0];
+    out[1] = selected_int.mShares[1];
     return out;
 }
 
@@ -1746,6 +1934,11 @@ si64Matrix sum_boolean_masks_to_int_batched(
         if (mask.rows() != mask_rows || mask.bitCount() != bit_count) {
             throw std::runtime_error("Boolean mask shapes do not match for batched count.");
         }
+    }
+    #pragma omp parallel for schedule(static)
+    for (std::int64_t mask_idx_signed = 0; mask_idx_signed < static_cast<std::int64_t>(masks.size()); ++mask_idx_signed) {
+        const auto mask_idx = static_cast<std::size_t>(mask_idx_signed);
+        const auto& mask = masks[mask_idx];
         const u64 row_begin = static_cast<u64>(mask_idx) * mask_rows;
         for (u64 row = 0; row < mask_rows; ++row) {
             for (u64 col = 0; col < share_cols; ++col) {
@@ -1762,7 +1955,9 @@ si64Matrix sum_boolean_masks_to_int_batched(
     }
 
     si64Matrix counts(static_cast<u64>(masks.size()), 1);
-    for (std::size_t mask_idx = 0; mask_idx < masks.size(); ++mask_idx) {
+    #pragma omp parallel for schedule(static)
+    for (std::int64_t mask_idx_signed = 0; mask_idx_signed < static_cast<std::int64_t>(masks.size()); ++mask_idx_signed) {
+        const auto mask_idx = static_cast<std::size_t>(mask_idx_signed);
         const u64 row_begin = static_cast<u64>(mask_idx) * mask_rows;
         counts.mShares[0](static_cast<u64>(mask_idx), 0) =
             stacked_int.mShares[0].block(row_begin, 0, mask_rows, 1).sum();
@@ -1813,7 +2008,7 @@ std::vector<sf64Matrix<kFlatBSPNDecimal>> compute_leaf_target_numerator_sums_gro
     const u64 mask_rows = shape_mask.rows();
     const u64 bit_count = shape_mask.bitCount();
     const u64 share_cols = shape_mask.mShares[0].cols();
-    constexpr u64 kMaxStackedBitmapRows = 1 << 20;
+    const u64 kMaxStackedBitmapRows = bspn_max_stacked_bitmap_rows();
     const std::size_t buckets_per_chunk = static_cast<std::size_t>(
         std::max<u64>(1, kMaxStackedBitmapRows / std::max<u64>(1, mask_rows)));
 
@@ -1833,6 +2028,15 @@ std::vector<sf64Matrix<kFlatBSPNDecimal>> compute_leaf_target_numerator_sums_gro
                 final_ids.rows() != mask_rows || final_ids.bitCount() != bit_count) {
                 throw std::runtime_error("Bucket/final id mask shape mismatch in group numerator batch.");
             }
+        }
+
+        #pragma omp parallel for schedule(static)
+        for (std::int64_t local_bucket_idx_signed = 0; local_bucket_idx_signed < static_cast<std::int64_t>(chunk_bucket_count); ++local_bucket_idx_signed) {
+            const auto local_bucket_idx = static_cast<std::size_t>(local_bucket_idx_signed);
+            const auto& bucket_ref = bucket_refs[chunk_begin + local_bucket_idx];
+            const auto& bucket_bitmap =
+                model.secret_shared_payload().dense_bucket_bitmaps[bucket_ref.bucket_index];
+            const auto& final_ids = final_ids_by_product[bucket_ref.product_idx];
             const u64 row_begin = static_cast<u64>(local_bucket_idx) * mask_rows;
             for (u64 row = 0; row < mask_rows; ++row) {
                 for (u64 col = 0; col < share_cols; ++col) {
@@ -1862,7 +2066,9 @@ std::vector<sf64Matrix<kFlatBSPNDecimal>> compute_leaf_target_numerator_sums_gro
 
         si64Matrix overlap_counts_int(static_cast<u64>(chunk_bucket_count), 1);
         sf64Matrix<kFlatBSPNDecimal> bucket_values(static_cast<u64>(chunk_bucket_count), 1);
-        for (std::size_t local_bucket_idx = 0; local_bucket_idx < chunk_bucket_count; ++local_bucket_idx) {
+        #pragma omp parallel for schedule(static)
+        for (std::int64_t local_bucket_idx_signed = 0; local_bucket_idx_signed < static_cast<std::int64_t>(chunk_bucket_count); ++local_bucket_idx_signed) {
+            const auto local_bucket_idx = static_cast<std::size_t>(local_bucket_idx_signed);
             const u64 row_begin = static_cast<u64>(local_bucket_idx) * mask_rows;
             overlap_counts_int.mShares[0](static_cast<u64>(local_bucket_idx), 0) =
                 overlap_int.mShares[0].block(row_begin, 0, mask_rows, 1).sum();
@@ -1886,11 +2092,106 @@ std::vector<sf64Matrix<kFlatBSPNDecimal>> compute_leaf_target_numerator_sums_gro
             *(context.enc),
             *(context.runtime));
 
+        std::vector<i64> chunk_sum0(leaf_children.size(), 0);
+        std::vector<i64> chunk_sum1(leaf_children.size(), 0);
         for (std::size_t local_bucket_idx = 0; local_bucket_idx < chunk_bucket_count; ++local_bucket_idx) {
-            auto& numerator_sum = numerator_sums[bucket_refs[chunk_begin + local_bucket_idx].child_idx];
-            numerator_sum[0](0, 0) += bucket_contributions[0](static_cast<u64>(local_bucket_idx), 0);
-            numerator_sum[1](0, 0) += bucket_contributions[1](static_cast<u64>(local_bucket_idx), 0);
+            const auto child_idx = bucket_refs[chunk_begin + local_bucket_idx].child_idx;
+            chunk_sum0[child_idx] += bucket_contributions[0](static_cast<u64>(local_bucket_idx), 0);
+            chunk_sum1[child_idx] += bucket_contributions[1](static_cast<u64>(local_bucket_idx), 0);
         }
+        for (std::size_t child_idx = 0; child_idx < leaf_children.size(); ++child_idx) {
+            if (chunk_sum0[child_idx] == 0 && chunk_sum1[child_idx] == 0) {
+                continue;
+            }
+            numerator_sums[child_idx][0](0, 0) += chunk_sum0[child_idx];
+            numerator_sums[child_idx][1](0, 0) += chunk_sum1[child_idx];
+        }
+    }
+    return numerator_sums;
+}
+
+std::vector<sf64Matrix<kFlatBSPNDecimal>> compute_leaf_target_numerator_sums_from_row_values(
+    const FlatBSPNModel& model,
+    const std::vector<const FlatBSPNNodeRecord*>& leaf_children,
+    const std::vector<std::size_t>& leaf_product_indices,
+    const std::vector<sbMatrix>& final_ids_by_product,
+    const FlatBSPNSecureContext& context,
+    std::uint64_t* phase3_batch_counter = nullptr) {
+    if (leaf_children.size() != leaf_product_indices.size()) {
+        throw std::runtime_error("Leaf child and product index counts do not match for row-value numerator.");
+    }
+    std::vector<sf64Matrix<kFlatBSPNDecimal>> numerator_sums;
+    numerator_sums.reserve(leaf_children.size());
+    for (std::size_t child_idx = 0; child_idx < leaf_children.size(); ++child_idx) {
+        (void)child_idx;
+        numerator_sums.push_back(share_fixed_scalar<kFlatBSPNDecimal>(0.0, 0, context));
+    }
+    if (leaf_children.empty()) {
+        return numerator_sums;
+    }
+    const auto& payload = model.secret_shared_payload();
+    if (!payload.leaf_row_values_loaded || payload.leaf_row_values.rows() == 0) {
+        throw std::runtime_error("row-value numerator requested without loaded leaf row values.");
+    }
+    const u64 total_rows = static_cast<u64>(model.manifest().total_rows);
+    if (total_rows == 0) {
+        return numerator_sums;
+    }
+    const auto& shape_mask = final_ids_by_product[leaf_product_indices.front()];
+    const u64 bit_count = shape_mask.bitCount();
+    const u64 share_cols = shape_mask.mShares[0].cols();
+    const u64 leaf_count = static_cast<u64>(leaf_children.size());
+    const u64 stacked_rows = leaf_count * total_rows;
+    sbMatrix stacked_final_ids(stacked_rows, bit_count);
+    sf64Matrix<kFlatBSPNDecimal> stacked_values(stacked_rows, 1);
+
+    for (std::size_t child_idx = 0; child_idx < leaf_children.size(); ++child_idx) {
+        const auto product_idx = leaf_product_indices[child_idx];
+        if (product_idx >= final_ids_by_product.size()) {
+            throw std::runtime_error("Leaf product index out of bounds in row-value numerator.");
+        }
+        const auto& final_ids = final_ids_by_product[product_idx];
+        if (final_ids.rows() != total_rows || final_ids.bitCount() != bit_count) {
+            throw std::runtime_error("final_ids shape mismatch in row-value numerator.");
+        }
+        const auto node_id = leaf_children[child_idx]->node_id;
+        if (node_id >= payload.leaf_row_value_offset_by_node.size() ||
+            payload.leaf_row_value_offset_by_node[node_id] < 0) {
+            throw std::runtime_error("Missing row-value payload for leaf node.");
+        }
+    }
+
+    #pragma omp parallel for schedule(static)
+    for (std::int64_t child_idx_signed = 0; child_idx_signed < static_cast<std::int64_t>(leaf_children.size()); ++child_idx_signed) {
+        const auto child_idx = static_cast<std::size_t>(child_idx_signed);
+        const auto product_idx = leaf_product_indices[child_idx];
+        const auto& final_ids = final_ids_by_product[product_idx];
+        const auto node_id = leaf_children[child_idx]->node_id;
+        const u64 value_offset = static_cast<u64>(payload.leaf_row_value_offset_by_node[node_id]);
+        const u64 row_begin = static_cast<u64>(child_idx) * total_rows;
+        for (u64 row = 0; row < total_rows; ++row) {
+            for (u64 col = 0; col < share_cols; ++col) {
+                stacked_final_ids.mShares[0](row_begin + row, col) = final_ids.mShares[0](row, col);
+                stacked_final_ids.mShares[1](row_begin + row, col) = final_ids.mShares[1](row, col);
+            }
+            stacked_values[0](row_begin + row, 0) = payload.leaf_row_values[0](value_offset + row, 0);
+            stacked_values[1](row_begin + row, 0) = payload.leaf_row_values[1](value_offset + row, 0);
+        }
+    }
+
+    auto contributions = fixed_mul_bool_same_shape(stacked_values, stacked_final_ids, context);
+    if (phase3_batch_counter != nullptr) {
+        ++(*phase3_batch_counter);
+    }
+
+    #pragma omp parallel for schedule(static)
+    for (std::int64_t child_idx_signed = 0; child_idx_signed < static_cast<std::int64_t>(leaf_children.size()); ++child_idx_signed) {
+        const auto child_idx = static_cast<std::size_t>(child_idx_signed);
+        const u64 row_begin = static_cast<u64>(child_idx) * total_rows;
+        numerator_sums[child_idx][0](0, 0) =
+            contributions[0].block(row_begin, 0, total_rows, 1).sum();
+        numerator_sums[child_idx][1](0, 0) =
+            contributions[1].block(row_begin, 0, total_rows, 1).sum();
     }
     return numerator_sums;
 }
@@ -1949,7 +2250,7 @@ std::vector<sbMatrix> compute_leaf_local_ids_batched(
         local_ids.push_back(std::move(child_local_ids));
     }
 
-    constexpr u64 kMaxStackedBitmapRows = 1 << 20;
+    const u64 kMaxStackedBitmapRows = bspn_max_stacked_bitmap_rows();
     const std::size_t buckets_per_chunk = static_cast<std::size_t>(
         std::max<u64>(1, kMaxStackedBitmapRows / std::max<u64>(1, block_len)));
 
@@ -1964,10 +2265,21 @@ std::vector<sbMatrix> compute_leaf_local_ids_batched(
             const auto& bucket_ref = bucket_refs[chunk_begin + ref_idx];
             const auto& bucket_bitmap = model.secret_shared_payload().dense_bucket_bitmaps[bucket_ref.bucket_index];
             const auto& match_mask = match_masks[bucket_ref.child_idx];
-            const bool expand_one_bit_mask = match_mask.bitCount() == 1;
             if (bucket_bitmap.rows() != block_len || bucket_bitmap.bitCount() != bit_count) {
                 throw std::runtime_error("Bucket bitmap shape mismatch in batched local id computation.");
             }
+            if (match_mask.bitCount() != 1 && match_mask.bitCount() != bit_count) {
+                throw std::runtime_error("Match mask bit width mismatch in batched local id computation.");
+            }
+        }
+
+        #pragma omp parallel for schedule(static)
+        for (std::int64_t ref_idx_signed = 0; ref_idx_signed < static_cast<std::int64_t>(chunk_bucket_count); ++ref_idx_signed) {
+            const auto ref_idx = static_cast<std::size_t>(ref_idx_signed);
+            const auto& bucket_ref = bucket_refs[chunk_begin + ref_idx];
+            const auto& bucket_bitmap = model.secret_shared_payload().dense_bucket_bitmaps[bucket_ref.bucket_index];
+            const auto& match_mask = match_masks[bucket_ref.child_idx];
+            const bool expand_one_bit_mask = match_mask.bitCount() == 1;
             const u64 row_begin = static_cast<u64>(ref_idx) * block_len;
             i64 match_share0 = 0;
             i64 match_share1 = 0;
@@ -2350,6 +2662,11 @@ std::vector<sbMatrix> compute_leaf_match_masks_for_evidence(
         if (node_id >= static_cast<std::uint32_t>(node_scopes.rows())) {
             throw std::runtime_error("secure leaf scope row is out of bounds");
         }
+    }
+    #pragma omp parallel for schedule(static)
+    for (std::int64_t row_signed = 0; row_signed < static_cast<std::int64_t>(leaf_rows); ++row_signed) {
+        const auto row = static_cast<u64>(row_signed);
+        const auto node_id = leaf_children[static_cast<std::size_t>(row)]->node_id;
         const u64 copy_cols = std::min<u64>(evidence_cols, static_cast<u64>(node_scopes.cols()));
         for (u64 col = 0; col < copy_cols; ++col) {
             leaf_scope_matrix.mShares[0](row, col) = node_scopes.mShares[0](node_id, col);
@@ -2361,6 +2678,7 @@ std::vector<sbMatrix> compute_leaf_match_masks_for_evidence(
         si64Matrix repeated(leaf_rows, evidence_cols);
         repeated.mShares[0].setZero();
         repeated.mShares[1].setZero();
+        #pragma omp parallel for schedule(static)
         for (u64 col = 0; col < evidence_cols; ++col) {
             const std::size_t evidence_row =
                 static_cast<std::size_t>(secret_factor_row) * max_columns + static_cast<std::size_t>(col);
@@ -2379,6 +2697,7 @@ std::vector<sbMatrix> compute_leaf_match_masks_for_evidence(
         sf64Matrix<kFlatBSPNDecimal> repeated(leaf_rows, evidence_cols);
         repeated[0].setZero();
         repeated[1].setZero();
+        #pragma omp parallel for schedule(static)
         for (u64 col = 0; col < evidence_cols; ++col) {
             const std::size_t evidence_row =
                 static_cast<std::size_t>(secret_factor_row) * max_columns + static_cast<std::size_t>(col);
@@ -2398,7 +2717,9 @@ std::vector<sbMatrix> compute_leaf_match_masks_for_evidence(
         si64Matrix products(leaf_rows, evidence_cols);
         cipher_mul(context.role, leaf_scope_matrix, repeated, products, *(context.eval), *(context.enc), *(context.runtime));
         si64Matrix row_totals(leaf_rows, 1);
-        for (u64 row = 0; row < leaf_rows; ++row) {
+        #pragma omp parallel for schedule(static)
+        for (std::int64_t row_signed = 0; row_signed < static_cast<std::int64_t>(leaf_rows); ++row_signed) {
+            const auto row = static_cast<u64>(row_signed);
             row_totals.mShares[0](row, 0) = products.mShares[0].block(row, 0, 1, evidence_cols).sum();
             row_totals.mShares[1](row, 0) = products.mShares[1].block(row, 0, 1, evidence_cols).sum();
         }
@@ -2419,7 +2740,9 @@ std::vector<sbMatrix> compute_leaf_match_masks_for_evidence(
         sf64Matrix<kFlatBSPNDecimal> products(leaf_rows, evidence_cols);
         cipher_mul(context.role, repeated_copy, leaf_scope_fixed_copy, products, *(context.eval), *(context.enc), *(context.runtime));
         sf64Matrix<kFlatBSPNDecimal> row_totals(leaf_rows, 1);
-        for (u64 row = 0; row < leaf_rows; ++row) {
+        #pragma omp parallel for schedule(static)
+        for (std::int64_t row_signed = 0; row_signed < static_cast<std::int64_t>(leaf_rows); ++row_signed) {
+            const auto row = static_cast<u64>(row_signed);
             row_totals[0](row, 0) = products[0].block(row, 0, 1, evidence_cols).sum();
             row_totals[1](row, 0) = products[1].block(row, 0, 1, evidence_cols).sum();
         }
@@ -2436,10 +2759,16 @@ std::vector<sbMatrix> compute_leaf_match_masks_for_evidence(
             return total + static_cast<u64>(child->bucket_count);
         });
     if (stacked_bucket_rows != 0 && max_interval_count != 0) {
+        std::vector<u64> leaf_bucket_offsets(leaf_children.size() + 1, 0);
+        for (std::size_t child_idx = 0; child_idx < leaf_children.size(); ++child_idx) {
+            leaf_bucket_offsets[child_idx + 1] =
+                leaf_bucket_offsets[child_idx] + static_cast<u64>(leaf_children[child_idx]->bucket_count);
+        }
         sf64Matrix<kFlatBSPNDecimal> stacked_bucket_lowers(stacked_bucket_rows, 1);
         sf64Matrix<kFlatBSPNDecimal> stacked_bucket_uppers(stacked_bucket_rows, 1);
-        u64 row_cursor = 0;
-        for (std::size_t child_idx = 0; child_idx < leaf_children.size(); ++child_idx) {
+        #pragma omp parallel for schedule(static)
+        for (std::int64_t child_idx_signed = 0; child_idx_signed < static_cast<std::int64_t>(leaf_children.size()); ++child_idx_signed) {
+            const auto child_idx = static_cast<std::size_t>(child_idx_signed);
             const auto& child = *leaf_children[child_idx];
             const auto lowers = fixed_row_slice(
                 model.secret_shared_payload().bucket_lowers,
@@ -2449,11 +2778,11 @@ std::vector<sbMatrix> compute_leaf_match_masks_for_evidence(
                 model.secret_shared_payload().bucket_uppers,
                 child.bucket_begin,
                 child.bucket_count);
+            const u64 row_cursor = leaf_bucket_offsets[child_idx];
             stacked_bucket_lowers[0].block(row_cursor, 0, child.bucket_count, 1) = lowers[0];
             stacked_bucket_lowers[1].block(row_cursor, 0, child.bucket_count, 1) = lowers[1];
             stacked_bucket_uppers[0].block(row_cursor, 0, child.bucket_count, 1) = uppers[0];
             stacked_bucket_uppers[1].block(row_cursor, 0, child.bucket_count, 1) = uppers[1];
-            row_cursor += child.bucket_count;
         }
 
         sbMatrix stacked_match(stacked_bucket_rows, 1);
@@ -2488,9 +2817,11 @@ std::vector<sbMatrix> compute_leaf_match_masks_for_evidence(
             sbMatrix stacked_open_lower(stacked_bucket_rows, 1);
             sbMatrix stacked_open_upper(stacked_bucket_rows, 1);
             sbMatrix stacked_active(stacked_bucket_rows, 1);
-            row_cursor = 0;
-            for (std::size_t child_idx = 0; child_idx < leaf_children.size(); ++child_idx) {
+            #pragma omp parallel for schedule(static)
+            for (std::int64_t child_idx_signed = 0; child_idx_signed < static_cast<std::int64_t>(leaf_children.size()); ++child_idx_signed) {
+                const auto child_idx = static_cast<std::size_t>(child_idx_signed);
                 const auto& child = *leaf_children[child_idx];
+                const u64 row_cursor = leaf_bucket_offsets[child_idx];
                 for (u64 bucket_row = 0; bucket_row < static_cast<u64>(child.bucket_count); ++bucket_row) {
                     const u64 dst_row = row_cursor + bucket_row;
                     stacked_lowers[0](dst_row, 0) = lower_values[0](static_cast<u64>(child_idx), 0);
@@ -2510,7 +2841,6 @@ std::vector<sbMatrix> compute_leaf_match_masks_for_evidence(
                         stacked_active.mShares[1](dst_row, col) = interval_active_flags.mShares[1](static_cast<u64>(child_idx), col);
                     }
                 }
-                row_cursor += child.bucket_count;
             }
 
             auto interval_match = secure_interval_match_mask_rows(
@@ -2533,16 +2863,17 @@ std::vector<sbMatrix> compute_leaf_match_masks_for_evidence(
             stacked_match = std::move(updated_stacked_match);
         }
 
-        row_cursor = 0;
-        for (std::size_t child_idx = 0; child_idx < leaf_children.size(); ++child_idx) {
+        #pragma omp parallel for schedule(static)
+        for (std::int64_t child_idx_signed = 0; child_idx_signed < static_cast<std::int64_t>(leaf_children.size()); ++child_idx_signed) {
+            const auto child_idx = static_cast<std::size_t>(child_idx_signed);
             const auto& child = *leaf_children[child_idx];
+            const u64 row_cursor = leaf_bucket_offsets[child_idx];
             for (u64 row = 0; row < static_cast<u64>(child.bucket_count); ++row) {
                 for (u64 col = 0; col < static_cast<u64>(stacked_match.mShares[0].cols()); ++col) {
                     match_masks[child_idx].mShares[0](row, col) = stacked_match.mShares[0](row_cursor + row, col);
                     match_masks[child_idx].mShares[1](row, col) = stacked_match.mShares[1](row_cursor + row, col);
                 }
             }
-            row_cursor += child.bucket_count;
         }
     }
 
@@ -2671,13 +3002,29 @@ std::vector<SecureRationalShare> evaluate_leaf_product_batch_values(
     std::vector<sf64Matrix<kFlatBSPNDecimal>> target_numerator_sums;
     if (needs_target_numerator) {
         const auto phase_start = SteadyClock::now();
-        target_numerator_sums = compute_leaf_target_numerator_sums_group_batched(
-            model,
-            leaf_children,
-            leaf_product_indices,
-            final_ids_by_product,
-            context,
-            eval_stats != nullptr ? &eval_stats->phase3_batch_b2a_calls : nullptr);
+        const bool use_row_values =
+            bspn_use_row_value_eval() &&
+            model.secret_shared_payload().leaf_row_values_loaded;
+        if (use_row_values) {
+            target_numerator_sums = compute_leaf_target_numerator_sums_from_row_values(
+                model,
+                leaf_children,
+                leaf_product_indices,
+                final_ids_by_product,
+                context,
+                eval_stats != nullptr ? &eval_stats->phase3_batch_b2a_calls : nullptr);
+            if (eval_stats != nullptr) {
+                ++eval_stats->row_value_eval_used;
+            }
+        } else {
+            target_numerator_sums = compute_leaf_target_numerator_sums_group_batched(
+                model,
+                leaf_children,
+                leaf_product_indices,
+                final_ids_by_product,
+                context,
+                eval_stats != nullptr ? &eval_stats->phase3_batch_b2a_calls : nullptr);
+        }
         if (eval_stats != nullptr) {
             eval_stats->phase3_numerator_ms += elapsed_ms_since(phase_start);
         }
@@ -2686,69 +3033,80 @@ std::vector<SecureRationalShare> evaluate_leaf_product_batch_values(
     std::vector<SecureRationalShare> out;
     out.reserve(product_items.size());
     const auto phase_start = SteadyClock::now();
+    if (product_items.empty()) {
+        if (eval_stats != nullptr) {
+            eval_stats->final_combine_ms += elapsed_ms_since(phase_start);
+        }
+        return out;
+    }
     auto zero_fixed = share_fixed_scalar<kFlatBSPNDecimal>(0.0, 0, context);
     auto one_fixed = share_fixed_scalar<kFlatBSPNDecimal>(1.0, 0, context);
     auto total_rows_int = share_int_scalar(
         static_cast<i64>(factor.factor.total_rows != 0 ? factor.factor.total_rows : model.manifest().total_rows),
         0,
         context);
-    std::vector<sf64Matrix<kFlatBSPNDecimal>> effective_cnts;
-    std::vector<sf64Matrix<kFlatBSPNDecimal>> inv_cardinalities;
-    std::vector<sf64Matrix<kFlatBSPNDecimal>> selectivity_nums;
-    std::vector<sbMatrix> is_empty_nodes;
-    std::vector<sf64Matrix<kFlatBSPNDecimal>> denom_safes;
-    effective_cnts.reserve(product_items.size());
-    inv_cardinalities.reserve(product_items.size());
-    selectivity_nums.reserve(product_items.size());
-    is_empty_nodes.reserve(product_items.size());
-    denom_safes.reserve(product_items.size());
-
+    const u64 product_count = static_cast<u64>(product_items.size());
+    std::vector<std::uint32_t> product_node_rows(product_items.size());
     for (std::size_t product_idx = 0; product_idx < product_items.size(); ++product_idx) {
-        const auto& item = product_items[product_idx];
-        const auto node_cardinality = fixed_row_slice(
-            model.secret_shared_payload().node_cardinalities,
-            static_cast<std::uint32_t>(item.node_idx),
-            1);
-        sf64Matrix<kFlatBSPNDecimal> effective_cnt = node_cardinality;
-        if (needs_evidence_filter) {
-            const auto final_cnt_int = int_row_slice(final_cnt_int_rows, static_cast<std::uint32_t>(product_idx), 1);
-            const auto final_cnt = si64_to_sf64(final_cnt_int);
-            sbMatrix is_full;
-            auto final_cnt_int_copy = final_cnt_int;
-            cipher_eq(context.role, final_cnt_int_copy, total_rows_int, is_full, *(context.eval), *(context.runtime));
-            effective_cnt = select_fixed_by_bool(node_cardinality, final_cnt, is_full, context);
-        }
-        const auto inv_cardinality = fixed_row_slice(
-            model.secret_shared_payload().node_inv_cardinalities,
-            static_cast<std::uint32_t>(item.node_idx),
-            1);
-        const auto selectivity_num = secure_mul_fixed(effective_cnt, inv_cardinality, context);
-        effective_cnts.push_back(effective_cnt);
-        inv_cardinalities.push_back(inv_cardinality);
-        selectivity_nums.push_back(selectivity_num);
-
-        if (public_factor_feature_count > 1) {
-            auto node_cardinality_for_eq = node_cardinality;
-            auto zero_for_eq = zero_fixed;
-            sbMatrix is_empty_node;
-            cipher_eq(context.role, node_cardinality_for_eq, zero_for_eq, is_empty_node, *(context.eval), *(context.runtime));
-            auto effective_cnt_for_eq = effective_cnt;
-            zero_for_eq = zero_fixed;
-            sbMatrix is_zero_effective_cnt;
-            cipher_eq(context.role, effective_cnt_for_eq, zero_for_eq, is_zero_effective_cnt, *(context.eval), *(context.runtime));
-            const auto zero_cnt_fixed = bool_scalar_to_fixed(is_zero_effective_cnt, context);
-            is_empty_nodes.push_back(std::move(is_empty_node));
-            denom_safes.push_back(effective_cnt + zero_cnt_fixed);
-        }
+        product_node_rows[product_idx] = static_cast<std::uint32_t>(product_items[product_idx].node_idx);
     }
 
-    sf64Matrix<kFlatBSPNDecimal> inv_cnt_rows(product_items.size(), 1);
+    const auto node_cardinality_rows = gather_fixed_rows(
+        model.secret_shared_payload().node_cardinalities,
+        product_node_rows);
+    const auto inv_cardinality_rows = gather_fixed_rows(
+        model.secret_shared_payload().node_inv_cardinalities,
+        product_node_rows);
+    sf64Matrix<kFlatBSPNDecimal> effective_cnt_rows = node_cardinality_rows;
+    if (needs_evidence_filter) {
+        auto final_cnt_int_rows_copy = final_cnt_int_rows;
+        auto total_rows_matrix = repeat_int_scalar_matrix(total_rows_int, product_count, 1);
+        sbMatrix is_full_rows;
+        cipher_eq(
+            context.role,
+            final_cnt_int_rows_copy,
+            total_rows_matrix,
+            is_full_rows,
+            *(context.eval),
+            *(context.runtime));
+        const auto final_cnt_fixed_rows = si64_to_sf64(final_cnt_int_rows);
+        effective_cnt_rows = select_fixed_by_bool_same_shape(
+            node_cardinality_rows,
+            final_cnt_fixed_rows,
+            is_full_rows,
+            context);
+    }
+    const auto selectivity_num_rows = secure_mul_fixed_same_shape(
+        effective_cnt_rows,
+        inv_cardinality_rows,
+        context);
+
+    sbMatrix is_empty_rows;
+    sf64Matrix<kFlatBSPNDecimal> inv_cnt_rows(product_count, 1);
     if (public_factor_feature_count > 1) {
-        sf64Matrix<kFlatBSPNDecimal> denom_safe_rows(product_items.size(), 1);
-        for (std::size_t product_idx = 0; product_idx < product_items.size(); ++product_idx) {
-            denom_safe_rows[0](static_cast<u64>(product_idx), 0) = denom_safes[product_idx][0](0, 0);
-            denom_safe_rows[1](static_cast<u64>(product_idx), 0) = denom_safes[product_idx][1](0, 0);
-        }
+        auto node_cardinality_for_eq = node_cardinality_rows;
+        const auto zero_product_rows = repeat_fixed_scalar_matrix(zero_fixed, product_count, 1);
+        auto zero_for_eq = zero_product_rows;
+        cipher_eq(
+            context.role,
+            node_cardinality_for_eq,
+            zero_for_eq,
+            is_empty_rows,
+            *(context.eval),
+            *(context.runtime));
+
+        auto effective_cnt_for_eq = effective_cnt_rows;
+        zero_for_eq = zero_product_rows;
+        sbMatrix is_zero_effective_rows;
+        cipher_eq(
+            context.role,
+            effective_cnt_for_eq,
+            zero_for_eq,
+            is_zero_effective_rows,
+            *(context.eval),
+            *(context.runtime));
+        const auto zero_cnt_rows = bool_matrix_to_fixed_same_shape(is_zero_effective_rows, context);
+        const auto denom_safe_rows = effective_cnt_rows + zero_cnt_rows;
         inv_cnt_rows = secure_count_reciprocal_newton_scaled_matrix(
             denom_safe_rows,
             factor.factor.total_rows != 0 ? factor.factor.total_rows : model.manifest().total_rows,
@@ -2758,73 +3116,124 @@ std::vector<SecureRationalShare> evaluate_leaf_product_batch_values(
         }
     }
 
-    for (std::size_t product_idx = 0; product_idx < product_items.size(); ++product_idx) {
-        const auto& item = product_items[product_idx];
-        if (public_factor_feature_count == 0 && public_factor_evidence_count != 0) {
+    auto push_fixed_rows_as_rationals = [&](const sf64Matrix<kFlatBSPNDecimal>& rows) {
+        for (u64 product_idx = 0; product_idx < product_count; ++product_idx) {
             out.push_back({
-                selectivity_nums[product_idx],
+                fixed_row_slice(rows, static_cast<std::uint32_t>(product_idx), 1),
                 one_fixed,
                 1.0,
                 1.0,
                 true,
             });
-            continue;
         }
+    };
 
-        if (public_single_target_factor) {
-            auto scalar_target_sum = share_fixed_scalar<kFlatBSPNDecimal>(0.0, 0, context);
+    if (public_factor_feature_count == 0 && public_factor_evidence_count != 0) {
+        push_fixed_rows_as_rationals(selectivity_num_rows);
+    } else if (public_single_target_factor) {
+        const auto target_sum_rows = stack_fixed_scalars(target_numerator_sums);
+        std::vector<std::uint32_t> leaf_to_product_rows(leaf_product_indices.size());
+        for (std::size_t leaf_idx = 0; leaf_idx < leaf_product_indices.size(); ++leaf_idx) {
+            leaf_to_product_rows[leaf_idx] = static_cast<std::uint32_t>(leaf_product_indices[leaf_idx]);
+        }
+        const auto inv_cardinality_by_leaf_rows = gather_fixed_rows(
+            inv_cardinality_rows,
+            leaf_to_product_rows);
+        const auto scaled_num_rows = secure_mul_fixed_same_shape(
+            target_sum_rows,
+            inv_cardinality_by_leaf_rows,
+            context);
+        const auto target_flags_rows = stack_bool_scalars(target_flags);
+        const auto zero_leaf_rows = repeat_fixed_scalar_matrix(
+            zero_fixed,
+            static_cast<u64>(leaf_children.size()),
+            1);
+        const auto selected_scaled_rows = select_fixed_by_bool_same_shape(
+            scaled_num_rows,
+            zero_leaf_rows,
+            target_flags_rows,
+            context);
+        sf64Matrix<kFlatBSPNDecimal> scalar_target_sum_rows(product_count, 1);
+        scalar_target_sum_rows[0].setZero();
+        scalar_target_sum_rows[1].setZero();
+        for (std::size_t product_idx = 0; product_idx < product_items.size(); ++product_idx) {
+            const auto& item = product_items[product_idx];
             for (std::size_t offset = 0; offset < item.leaf_count; ++offset) {
-                const auto leaf_idx = item.leaf_begin + offset;
-                const auto scaled_num =
-                    secure_mul_fixed(target_numerator_sums[leaf_idx], inv_cardinalities[product_idx], context);
-                scalar_target_sum += select_fixed_by_bool(
-                    scaled_num,
-                    zero_fixed,
-                    target_flags[leaf_idx],
-                    context);
+                const u64 leaf_idx = static_cast<u64>(item.leaf_begin + offset);
+                scalar_target_sum_rows[0](static_cast<u64>(product_idx), 0) += selected_scaled_rows[0](leaf_idx, 0);
+                scalar_target_sum_rows[1](static_cast<u64>(product_idx), 0) += selected_scaled_rows[1](leaf_idx, 0);
             }
-            out.push_back({
-                select_fixed_by_bool(
-                    scalar_target_sum,
-                    selectivity_nums[product_idx],
-                    has_target_by_product[product_idx],
-                    context),
-                one_fixed,
-                1.0,
-                1.0,
-                true,
-            });
-            continue;
         }
-
-        const auto inv_cnt_shared =
-            fixed_row_slice(inv_cnt_rows, static_cast<std::uint32_t>(product_idx), 1);
-        auto scalar_product = share_fixed_scalar<kFlatBSPNDecimal>(1.0, 0, context);
-        for (std::size_t offset = 0; offset < item.leaf_count; ++offset) {
-            const auto leaf_idx = item.leaf_begin + offset;
-            const auto exp_component = secure_mul_fixed(
-                target_numerator_sums[leaf_idx],
-                inv_cnt_shared,
-                context);
-            const auto selected_component = select_fixed_by_bool(
-                exp_component,
-                one_fixed,
-                target_flags[leaf_idx],
-                context);
-            const auto safe_component = select_fixed_by_bool(
-                one_fixed,
-                selected_component,
-                is_empty_nodes[product_idx],
-                context);
-            scalar_product = secure_mul_fixed(scalar_product, safe_component, context);
+        const auto has_target_rows = stack_bool_scalars(has_target_by_product);
+        const auto final_rows = select_fixed_by_bool_same_shape(
+            scalar_target_sum_rows,
+            selectivity_num_rows,
+            has_target_rows,
+            context);
+        push_fixed_rows_as_rationals(final_rows);
+    } else {
+        const auto target_sum_rows = stack_fixed_scalars(target_numerator_sums);
+        std::vector<std::uint32_t> leaf_to_product_rows(leaf_product_indices.size());
+        for (std::size_t leaf_idx = 0; leaf_idx < leaf_product_indices.size(); ++leaf_idx) {
+            leaf_to_product_rows[leaf_idx] = static_cast<std::uint32_t>(leaf_product_indices[leaf_idx]);
         }
-        out.push_back({
-            secure_mul_fixed(selectivity_nums[product_idx], scalar_product, context),
+        const auto inv_cnt_by_leaf_rows = gather_fixed_rows(inv_cnt_rows, leaf_to_product_rows);
+        const auto exp_component_rows = secure_mul_fixed_same_shape(
+            target_sum_rows,
+            inv_cnt_by_leaf_rows,
+            context);
+        const auto target_flags_rows = stack_bool_scalars(target_flags);
+        const auto one_leaf_rows = repeat_fixed_scalar_matrix(
             one_fixed,
-            1.0,
-            1.0,
-            true,
-        });
+            static_cast<u64>(leaf_children.size()),
+            1);
+        const auto selected_component_rows = select_fixed_by_bool_same_shape(
+            exp_component_rows,
+            one_leaf_rows,
+            target_flags_rows,
+            context);
+        sbMatrix is_empty_by_leaf_rows(static_cast<u64>(leaf_children.size()), is_empty_rows.bitCount());
+        const u64 is_empty_cols = static_cast<u64>(is_empty_rows.mShares[0].cols());
+        #pragma omp parallel for schedule(static)
+        for (std::int64_t leaf_idx_signed = 0; leaf_idx_signed < static_cast<std::int64_t>(leaf_product_indices.size()); ++leaf_idx_signed) {
+            const auto leaf_idx = static_cast<std::size_t>(leaf_idx_signed);
+            const auto product_idx = static_cast<u64>(leaf_product_indices[leaf_idx]);
+            for (u64 col = 0; col < is_empty_cols; ++col) {
+                is_empty_by_leaf_rows.mShares[0](static_cast<u64>(leaf_idx), col) =
+                    is_empty_rows.mShares[0](product_idx, col);
+                is_empty_by_leaf_rows.mShares[1](static_cast<u64>(leaf_idx), col) =
+                    is_empty_rows.mShares[1](product_idx, col);
+            }
+        }
+        const auto safe_component_rows = select_fixed_by_bool_same_shape(
+            one_leaf_rows,
+            selected_component_rows,
+            is_empty_by_leaf_rows,
+            context);
+
+        sf64Matrix<kFlatBSPNDecimal> scalar_product_rows =
+            repeat_fixed_scalar_matrix(one_fixed, product_count, 1);
+        std::size_t max_leaf_count = 0;
+        for (const auto& item : product_items) {
+            max_leaf_count = std::max<std::size_t>(max_leaf_count, item.leaf_count);
+        }
+        for (std::size_t offset = 0; offset < max_leaf_count; ++offset) {
+            auto component_rows = repeat_fixed_scalar_matrix(one_fixed, product_count, 1);
+            #pragma omp parallel for schedule(static)
+            for (std::int64_t product_idx_signed = 0; product_idx_signed < static_cast<std::int64_t>(product_items.size()); ++product_idx_signed) {
+                const auto product_idx = static_cast<std::size_t>(product_idx_signed);
+                const auto& item = product_items[product_idx];
+                if (offset >= item.leaf_count) {
+                    continue;
+                }
+                const auto leaf_idx = static_cast<u64>(item.leaf_begin + offset);
+                component_rows[0](static_cast<u64>(product_idx), 0) = safe_component_rows[0](leaf_idx, 0);
+                component_rows[1](static_cast<u64>(product_idx), 0) = safe_component_rows[1](leaf_idx, 0);
+            }
+            scalar_product_rows = secure_mul_fixed_same_shape(scalar_product_rows, component_rows, context);
+        }
+        const auto final_rows = secure_mul_fixed_same_shape(selectivity_num_rows, scalar_product_rows, context);
+        push_fixed_rows_as_rationals(final_rows);
     }
 
     if (eval_stats != nullptr) {
@@ -3110,7 +3519,14 @@ SecureBundleExecutionResult evaluate_secure_bundle_impl_secure(
         }
     }
 
-    auto eval_factor_product_secure = [&](const json& factors_doc, json* factor_debug) {
+    json factor_timing_profile = json::array();
+    std::map<std::string, SecureRationalShare> factor_value_cache;
+    std::uint64_t factor_cache_hits = 0;
+    std::uint64_t factor_cache_misses = 0;
+    auto eval_factor_product_secure = [&](
+        const json& factors_doc,
+        json* factor_debug,
+        const std::string& profile_section) {
         SecureRationalShare product = make_secure_rational(1.0, 1.0, context);
         for (const auto& factor_doc : factors_doc) {
             auto bound = bind_secure_factor_from_secure_bundle(
@@ -3121,6 +3537,56 @@ SecureBundleExecutionResult evaluate_secure_bundle_impl_secure(
                 model_cache);
             SecureRationalShare factor_value = make_secure_rational(1.0, 1.0, context);
             SecureIndicatorEvalStats indicator_stats;
+            const std::string factor_cache_key =
+                bound.manifest_path + "|" +
+                std::to_string(bound.secret_factor_binding_index) + "|" +
+                factor_doc.dump();
+            const auto cache_it = factor_value_cache.find(factor_cache_key);
+            if (cache_it != factor_value_cache.end()) {
+                factor_value = cache_it->second;
+                ++factor_cache_hits;
+                json factor_timing_doc = secure_indicator_stats_json(indicator_stats);
+                factor_timing_doc["profile_section"] = profile_section;
+                factor_timing_doc["factor_index"] = bound.factor.factor_index;
+                factor_timing_doc["factor_kind"] = bound.factor.factor_kind;
+                factor_timing_doc["inverse"] = bound.factor.inverse;
+                factor_timing_doc["model_id"] = bound.model_id;
+                factor_timing_doc["public_feature_count"] = bound.factor.public_feature_count;
+                factor_timing_doc["public_evidence_count"] = bound.factor.public_evidence_count;
+                factor_timing_doc["cache_hit"] = true;
+                if (!bound.manifest_path.empty()) {
+                    const auto timing_model_it = model_cache.find(bound.manifest_path);
+                    if (timing_model_it != model_cache.end()) {
+                        const auto& manifest = timing_model_it->second.manifest();
+                        factor_timing_doc["bucket_count"] = manifest.bucket_count;
+                        if (manifest.has_real_bucket_count) {
+                            factor_timing_doc["real_bucket_count"] = manifest.real_bucket_count;
+                        }
+                        factor_timing_doc["padding_bucket_count"] = manifest.padding_bucket_count;
+                        factor_timing_doc["bucket_padding_scope"] = manifest.bucket_padding_scope;
+                        factor_timing_doc["sample_total_rows"] = manifest.sample_total_rows;
+                    }
+                }
+                factor_timing_profile.push_back(std::move(factor_timing_doc));
+                if (factor_debug != nullptr && context.debug_internal_reveal) {
+                    const double numerator = reveal_scaled_numerator(factor_value, context);
+                    const double denominator = reveal_scaled_denominator(factor_value, context);
+                    json factor_debug_doc = {
+                        {"factor_index", bound.factor.factor_index},
+                        {"factor_kind", bound.factor.factor_kind},
+                        {"inverse", bound.factor.inverse},
+                        {"model_id", bound.model_id},
+                        {"cache_hit", true},
+                        {"numerator", numerator},
+                        {"denominator", denominator},
+                        {"value", std::abs(denominator) <= 1e-12 ? 0.0 : numerator / denominator},
+                    };
+                    factor_debug->push_back(factor_debug_doc);
+                }
+                product = multiply_secure_rational(product, factor_value, context);
+                continue;
+            }
+            ++factor_cache_misses;
             if (bound.factor.factor_kind == "CONSTANT") {
                 if (std::abs(bound.factor.public_constant_value) > 1000000.0) {
                     factor_value = make_secure_public_scaled_constant(bound.factor.public_constant_value, context);
@@ -3177,6 +3643,30 @@ SecureBundleExecutionResult evaluate_secure_bundle_impl_secure(
                 constexpr double kSecureD16IndicatorCalibration = 1.0054;
                 factor_value.numerator_scale *= kSecureD16IndicatorCalibration;
             }
+            factor_value_cache[factor_cache_key] = factor_value;
+            json factor_timing_doc = secure_indicator_stats_json(indicator_stats);
+            factor_timing_doc["profile_section"] = profile_section;
+            factor_timing_doc["factor_index"] = bound.factor.factor_index;
+            factor_timing_doc["factor_kind"] = bound.factor.factor_kind;
+            factor_timing_doc["inverse"] = bound.factor.inverse;
+            factor_timing_doc["model_id"] = bound.model_id;
+            factor_timing_doc["public_feature_count"] = bound.factor.public_feature_count;
+            factor_timing_doc["public_evidence_count"] = bound.factor.public_evidence_count;
+            factor_timing_doc["cache_hit"] = false;
+            if (!bound.manifest_path.empty()) {
+                const auto timing_model_it = model_cache.find(bound.manifest_path);
+                if (timing_model_it != model_cache.end()) {
+                    const auto& manifest = timing_model_it->second.manifest();
+                    factor_timing_doc["bucket_count"] = manifest.bucket_count;
+                    if (manifest.has_real_bucket_count) {
+                        factor_timing_doc["real_bucket_count"] = manifest.real_bucket_count;
+                    }
+                    factor_timing_doc["padding_bucket_count"] = manifest.padding_bucket_count;
+                    factor_timing_doc["bucket_padding_scope"] = manifest.bucket_padding_scope;
+                    factor_timing_doc["sample_total_rows"] = manifest.sample_total_rows;
+                }
+            }
+            factor_timing_profile.push_back(std::move(factor_timing_doc));
             if (factor_debug != nullptr && context.debug_internal_reveal) {
                 const double numerator = reveal_scaled_numerator(factor_value, context);
                 const double denominator = reveal_scaled_denominator(factor_value, context);
@@ -3237,7 +3727,8 @@ SecureBundleExecutionResult evaluate_secure_bundle_impl_secure(
     if (public_plan_doc.contains("cardinality_plan") && public_plan_doc["cardinality_plan"].is_object()) {
         cardinality_rational = eval_factor_product_secure(
             public_plan_doc["cardinality_plan"].value("factors", json::array()),
-            &cardinality_factor_debug);
+            &cardinality_factor_debug,
+            "cardinality");
         has_cardinality = true;
     }
 
@@ -3260,7 +3751,8 @@ SecureBundleExecutionResult evaluate_secure_bundle_impl_secure(
         if (evaluation_mode == "single_spn") {
             current_value = eval_factor_product_secure(
                 term_doc.at("expectation_plan").value("factors", json::array()),
-                &expectation_factor_debug);
+                &expectation_factor_debug,
+                "expectation");
             if (aggregation_type == "SUM") {
                 if (!has_cardinality) {
                     throw std::runtime_error("Secure SUM single_spn requires cardinality.");
@@ -3272,11 +3764,13 @@ SecureBundleExecutionResult evaluate_secure_bundle_impl_secure(
         } else {
                 auto numerator_rational = eval_factor_product_secure(
                     term_doc.at("numerator_plan").value("factors", json::array()),
-                    &numerator_factor_debug);
+                    &numerator_factor_debug,
+                    "numerator");
                 if (aggregation_type == "AVG") {
                     auto denominator_rational = eval_factor_product_secure(
                     term_doc.at("denominator_plan").value("factors", json::array()),
-                    &denominator_factor_debug);
+                    &denominator_factor_debug,
+                    "denominator");
                 current_value = multiply_secure_rational(
                     numerator_rational,
                     invert_secure_rational(denominator_rational),
@@ -3348,6 +3842,13 @@ SecureBundleExecutionResult evaluate_secure_bundle_impl_secure(
         {"query_kind", query_kind},
         {"cardinality_factors", cardinality_factor_debug},
         {"aggregate_terms", term_debug},
+    };
+    out.timing_profile = {
+        {"query_skeleton_id", public_plan_doc.value("query_skeleton_id", std::string())},
+        {"query_kind", query_kind},
+        {"cache_hits", factor_cache_hits},
+        {"cache_misses", factor_cache_misses},
+        {"factors", factor_timing_profile},
     };
     return out;
 }
@@ -3474,6 +3975,7 @@ void FlatBSPNModel::load_public_manifest(const std::string& manifest_path) {
         "max_leaf_bucket_width",
         manifest_.leaf_bucket_width);
     manifest_.leaf_node_count = manifest_doc.value("leaf_node_count", std::uint64_t(0));
+    manifest_.has_real_bucket_count = manifest_doc.contains("real_bucket_count");
     manifest_.real_bucket_count = manifest_doc.value("real_bucket_count", manifest_.bucket_count);
     manifest_.padding_bucket_count = manifest_doc.value("padding_bucket_count", std::uint64_t(0));
     manifest_.node_cardinality_count = manifest_doc.value("node_cardinality_count", std::uint64_t(0));
@@ -3499,6 +4001,42 @@ void FlatBSPNModel::load_public_manifest(const std::string& manifest_path) {
         for (const auto& idx_doc : manifest_doc["secure_multiplier_bucket_indices"]) {
             manifest_.secure_multiplier_bucket_indices.push_back(idx_doc.get<std::uint32_t>());
         }
+    }
+    manifest_.has_leaf_row_values = manifest_doc.value("has_leaf_row_values", false);
+    manifest_.leaf_row_value_total_rows = manifest_doc.value("leaf_row_value_total_rows", std::uint64_t(0));
+    manifest_.leaf_row_value_node_ids.clear();
+    manifest_.leaf_row_value_offsets.clear();
+    if (manifest_doc.contains("leaf_row_value_node_ids") &&
+        manifest_doc["leaf_row_value_node_ids"].is_array()) {
+        for (const auto& item : manifest_doc["leaf_row_value_node_ids"]) {
+            manifest_.leaf_row_value_node_ids.push_back(item.get<std::uint32_t>());
+        }
+    }
+    if (manifest_doc.contains("leaf_row_value_offsets") &&
+        manifest_doc["leaf_row_value_offsets"].is_array()) {
+        for (const auto& item : manifest_doc["leaf_row_value_offsets"]) {
+            manifest_.leaf_row_value_offsets.push_back(item.get<std::uint64_t>());
+        }
+    }
+    manifest_.secure_multiplier_leaf_row_value_total_rows =
+        manifest_doc.value("secure_multiplier_leaf_row_value_total_rows", std::uint64_t(0));
+    manifest_.secure_multiplier_leaf_row_value_node_ids.clear();
+    manifest_.secure_multiplier_leaf_row_value_offsets.clear();
+    if (manifest_doc.contains("secure_multiplier_leaf_row_value_node_ids") &&
+        manifest_doc["secure_multiplier_leaf_row_value_node_ids"].is_array()) {
+        for (const auto& item : manifest_doc["secure_multiplier_leaf_row_value_node_ids"]) {
+            manifest_.secure_multiplier_leaf_row_value_node_ids.push_back(item.get<std::uint32_t>());
+        }
+    }
+    if (manifest_doc.contains("secure_multiplier_leaf_row_value_offsets") &&
+        manifest_doc["secure_multiplier_leaf_row_value_offsets"].is_array()) {
+        for (const auto& item : manifest_doc["secure_multiplier_leaf_row_value_offsets"]) {
+            manifest_.secure_multiplier_leaf_row_value_offsets.push_back(item.get<std::uint64_t>());
+        }
+    }
+    if (manifest_.has_leaf_row_values &&
+        manifest_.leaf_row_value_node_ids.size() != manifest_.leaf_row_value_offsets.size()) {
+        throw std::runtime_error("leaf_row_value_node_ids/offsets length mismatch in manifest.");
     }
 
     if (manifest_.payload_layout_version < 4) {
@@ -3595,6 +4133,7 @@ void FlatBSPNModel::load_public_manifest(const std::string& manifest_path) {
         throw std::runtime_error("Padded bucket count mismatch with manifest leaf dimensions.");
     }
     if (manifest_.payload_layout_version >= 5 &&
+        manifest_.has_real_bucket_count &&
         manifest_.padding_bucket_count != 0 &&
         manifest_.real_bucket_count + manifest_.padding_bucket_count != manifest_.bucket_count) {
         throw std::runtime_error("Padded bucket count mismatch with manifest bucket padding metadata.");
@@ -3631,6 +4170,20 @@ void FlatBSPNModel::load_secret_payload() {
     leaf_bitmaps_ = read_binary_bytes(join_path(secret_dir, "leaf_bitmaps.bin"));
     node_cardinalities_ = read_binary_doubles(join_path(secret_dir, "node_cardinalities.bin"));
     node_inv_cardinalities_ = read_binary_doubles(join_path(secret_dir, "node_inv_cardinalities.bin"));
+    std::vector<double> leaf_row_values;
+    if (manifest_.has_leaf_row_values) {
+        const std::string leaf_row_values_path = join_path(secret_dir, "leaf_row_values.bin");
+        if (!path_exists(leaf_row_values_path)) {
+            throw std::runtime_error("manifest declares leaf row values but secret/leaf_row_values.bin is missing.");
+        }
+        leaf_row_values = read_binary_doubles(leaf_row_values_path);
+        const std::uint64_t expected_rows =
+            static_cast<std::uint64_t>(manifest_.leaf_row_value_node_ids.size()) *
+            std::max<std::uint64_t>(1, manifest_.leaf_row_value_total_rows);
+        if (expected_rows != 0 && leaf_row_values.size() < expected_rows) {
+            throw std::runtime_error("leaf_row_values.bin count mismatch with manifest.");
+        }
+    }
     const std::string node_scopes_path = join_path(secret_dir, "node_scopes.bin");
     if (path_exists(node_scopes_path)) {
         node_scopes_ = read_binary_bytes(node_scopes_path);
@@ -3686,6 +4239,7 @@ void FlatBSPNModel::load_secret_payload() {
     secret_host_payload_.bucket_values = doubles_to_fixed_column<kFlatBSPNDecimal>(bucket_representatives);
     secret_host_payload_.bucket_lowers = doubles_to_fixed_column<kFlatBSPNDecimal>(bucket_lowers);
     secret_host_payload_.bucket_uppers = doubles_to_fixed_column<kFlatBSPNDecimal>(bucket_uppers);
+    secret_host_payload_.leaf_row_values = doubles_to_fixed_column<kFlatBSPNDecimal>(leaf_row_values);
     secret_host_payload_.leaf_bitmaps = i64Matrix(0, 0);
 
     secret_shared_payload_ = FlatBSPNSecretSharedPayload{};
@@ -3709,6 +4263,12 @@ void FlatBSPNModel::load_secret_payload(const FlatBSPNSecureContext& context) {
         secret_host_payload_.bucket_values = f64Matrix<kFlatBSPNDecimal>(manifest_.bucket_count, 1);
         secret_host_payload_.bucket_lowers = f64Matrix<kFlatBSPNDecimal>(manifest_.bucket_count, 1);
         secret_host_payload_.bucket_uppers = f64Matrix<kFlatBSPNDecimal>(manifest_.bucket_count, 1);
+        const u64 leaf_row_value_rows =
+            manifest_.has_leaf_row_values
+                ? static_cast<u64>(manifest_.leaf_row_value_node_ids.size()) *
+                    std::max<u64>(1, static_cast<u64>(manifest_.leaf_row_value_total_rows))
+                : 0;
+        secret_host_payload_.leaf_row_values = f64Matrix<kFlatBSPNDecimal>(leaf_row_value_rows, 1);
         secret_host_payload_.leaf_bitmaps = i64Matrix(0, 0);
         for (u64 idx = 0; idx < static_cast<u64>(secret_host_payload_.node_cardinalities.size()); ++idx) secret_host_payload_.node_cardinalities(idx) = 0;
         for (u64 idx = 0; idx < static_cast<u64>(secret_host_payload_.node_inv_cardinalities.size()); ++idx) secret_host_payload_.node_inv_cardinalities(idx) = 0;
@@ -3717,6 +4277,7 @@ void FlatBSPNModel::load_secret_payload(const FlatBSPNSecureContext& context) {
         for (u64 idx = 0; idx < static_cast<u64>(secret_host_payload_.bucket_values.size()); ++idx) secret_host_payload_.bucket_values(idx) = 0;
         for (u64 idx = 0; idx < static_cast<u64>(secret_host_payload_.bucket_lowers.size()); ++idx) secret_host_payload_.bucket_lowers(idx) = 0;
         for (u64 idx = 0; idx < static_cast<u64>(secret_host_payload_.bucket_uppers.size()); ++idx) secret_host_payload_.bucket_uppers(idx) = 0;
+        for (u64 idx = 0; idx < static_cast<u64>(secret_host_payload_.leaf_row_values.size()); ++idx) secret_host_payload_.leaf_row_values(idx) = 0;
     }
 
     share_fixed_matrix(secret_host_payload_.node_cardinalities, secret_shared_payload_.node_cardinalities, context.model_owner_party, context);
@@ -3726,11 +4287,29 @@ void FlatBSPNModel::load_secret_payload(const FlatBSPNSecureContext& context) {
     share_fixed_matrix(secret_host_payload_.bucket_values, secret_shared_payload_.bucket_values, context.model_owner_party, context);
     share_fixed_matrix(secret_host_payload_.bucket_lowers, secret_shared_payload_.bucket_lowers, context.model_owner_party, context);
     share_fixed_matrix(secret_host_payload_.bucket_uppers, secret_shared_payload_.bucket_uppers, context.model_owner_party, context);
+    if (manifest_.has_leaf_row_values) {
+        share_fixed_matrix(secret_host_payload_.leaf_row_values, secret_shared_payload_.leaf_row_values, context.model_owner_party, context);
+        secret_shared_payload_.leaf_row_value_offset_by_node.assign(
+            static_cast<std::size_t>(manifest_.node_count),
+            -1);
+        for (std::size_t idx = 0; idx < manifest_.leaf_row_value_node_ids.size(); ++idx) {
+            const auto node_id = manifest_.leaf_row_value_node_ids[idx];
+            if (node_id < secret_shared_payload_.leaf_row_value_offset_by_node.size()) {
+                secret_shared_payload_.leaf_row_value_offset_by_node[node_id] =
+                    static_cast<std::int64_t>(manifest_.leaf_row_value_offsets[idx]);
+            }
+        }
+        secret_shared_payload_.leaf_row_values_loaded = true;
+    } else {
+        secret_shared_payload_.leaf_row_values = sf64Matrix<kFlatBSPNDecimal>(0, 1);
+        secret_shared_payload_.leaf_row_value_offset_by_node.clear();
+        secret_shared_payload_.leaf_row_values_loaded = false;
+    }
     secret_shared_payload_.leaf_bitmaps = si64Matrix(0, 0);
 
     secret_shared_payload_.dense_bucket_bitmaps.clear();
     secret_shared_payload_.dense_bucket_bitmaps.reserve(buckets_.size());
-    constexpr u64 kMaxBitmapShareRowsPerChunk = 1 << 20;
+    const u64 kMaxBitmapShareRowsPerChunk = bspn_bitmap_share_rows_per_chunk();
     const u64 total_rows = static_cast<u64>(manifest_.total_rows);
     const u64 buckets_per_chunk =
         total_rows == 0
@@ -3749,6 +4328,11 @@ void FlatBSPNModel::load_secret_payload(const FlatBSPNSecureContext& context) {
                 if (bucket.bitmap_begin + bucket.bitmap_len > leaf_bitmaps_.size()) {
                     throw std::runtime_error("Leaf bitmap slice is out of bounds.");
                 }
+            }
+            #pragma omp parallel for schedule(static)
+            for (std::int64_t local_bucket_idx_signed = 0; local_bucket_idx_signed < static_cast<std::int64_t>(chunk_bucket_count); ++local_bucket_idx_signed) {
+                const auto local_bucket_idx = static_cast<std::size_t>(local_bucket_idx_signed);
+                const auto& bucket = buckets_[bucket_begin + local_bucket_idx];
                 const std::vector<std::uint8_t> bitmap_bytes(
                     leaf_bitmaps_.begin() + static_cast<std::ptrdiff_t>(bucket.bitmap_begin),
                     leaf_bitmaps_.begin() + static_cast<std::ptrdiff_t>(bucket.bitmap_begin + bucket.bitmap_len));
@@ -3762,8 +4346,15 @@ void FlatBSPNModel::load_secret_payload(const FlatBSPNSecureContext& context) {
 
         sbMatrix shared_chunk;
         share_bool_matrix(dense_rows, shared_chunk, context.model_owner_party, context);
+        std::vector<sbMatrix> chunk_bitmaps;
+        chunk_bitmaps.reserve(chunk_bucket_count);
         for (std::size_t local_bucket_idx = 0; local_bucket_idx < chunk_bucket_count; ++local_bucket_idx) {
-            sbMatrix shared_bitmap(total_rows, shared_chunk.bitCount());
+            chunk_bitmaps.emplace_back(total_rows, shared_chunk.bitCount());
+        }
+        #pragma omp parallel for schedule(static)
+        for (std::int64_t local_bucket_idx_signed = 0; local_bucket_idx_signed < static_cast<std::int64_t>(chunk_bucket_count); ++local_bucket_idx_signed) {
+            const auto local_bucket_idx = static_cast<std::size_t>(local_bucket_idx_signed);
+            auto& shared_bitmap = chunk_bitmaps[local_bucket_idx];
             const u64 row_begin = static_cast<u64>(local_bucket_idx) * total_rows;
             for (u64 row = 0; row < total_rows; ++row) {
                 for (u64 col = 0; col < static_cast<u64>(shared_chunk.mShares[0].cols()); ++col) {
@@ -3771,6 +4362,8 @@ void FlatBSPNModel::load_secret_payload(const FlatBSPNSecureContext& context) {
                     shared_bitmap.mShares[1](row, col) = shared_chunk.mShares[1](row_begin + row, col);
                 }
             }
+        }
+        for (auto& shared_bitmap : chunk_bitmaps) {
             secret_shared_payload_.dense_bucket_bitmaps.push_back(std::move(shared_bitmap));
         }
     }
@@ -3824,6 +4417,41 @@ void FlatBSPNModel::load_secret_payload(const FlatBSPNSecureContext& context) {
                 }
             }
             secret_shared_payload_.dense_bucket_bitmaps[bucket_index] = std::move(bitmap);
+        }
+        if (secret_shared_payload_.leaf_row_values_loaded &&
+            !manifest_.secure_multiplier_leaf_row_value_node_ids.empty()) {
+            if (manifest_.secure_multiplier_leaf_row_value_node_ids.size() !=
+                manifest_.secure_multiplier_leaf_row_value_offsets.size()) {
+                throw std::runtime_error("Secure multiplier row-value node/offset manifest mismatch.");
+            }
+            const u64 row_value_rows = static_cast<u64>(
+                manifest_.secure_multiplier_leaf_row_value_node_ids.size()) *
+                static_cast<u64>(manifest_.secure_multiplier_leaf_row_value_total_rows);
+            const std::string row_value_path = join_path(role_dir, "leaf_row_values.shares.bin");
+            if (!path_exists(row_value_path)) {
+                throw std::runtime_error("Secure multiplier leaf row value shares are missing: " + row_value_path);
+            }
+            const auto shared_row_values = read_fixed_share_pair_column<kFlatBSPNDecimal>(
+                row_value_path,
+                row_value_rows);
+            for (std::size_t local_idx = 0;
+                 local_idx < manifest_.secure_multiplier_leaf_row_value_node_ids.size();
+                 ++local_idx) {
+                const auto node_id = manifest_.secure_multiplier_leaf_row_value_node_ids[local_idx];
+                if (node_id >= secret_shared_payload_.leaf_row_value_offset_by_node.size() ||
+                    secret_shared_payload_.leaf_row_value_offset_by_node[node_id] < 0) {
+                    throw std::runtime_error("Secure multiplier row-value node is missing in leaf row value payload.");
+                }
+                const u64 dst_begin =
+                    static_cast<u64>(secret_shared_payload_.leaf_row_value_offset_by_node[node_id]);
+                const u64 src_begin = manifest_.secure_multiplier_leaf_row_value_offsets[local_idx];
+                for (u64 row = 0; row < static_cast<u64>(manifest_.secure_multiplier_leaf_row_value_total_rows); ++row) {
+                    secret_shared_payload_.leaf_row_values[0](dst_begin + row, 0) =
+                        shared_row_values[0](src_begin + row, 0);
+                    secret_shared_payload_.leaf_row_values[1](dst_begin + row, 0) =
+                        shared_row_values[1](src_begin + row, 0);
+                }
+            }
         }
         secure_share_payload_loaded_ = true;
     }
@@ -4098,6 +4726,12 @@ void BSPN_secure_bundle_eval(const oc::CLP& cmd) {
     if (secure_context.debug_internal_reveal) {
         out["debug"] = secure_eval.debug_output;
     }
+    out["timing_profile"] = secure_eval.timing_profile;
+    out["runtime_params"] = {
+        {"BSPN_MAX_STACKED_BITMAP_ROWS", bspn_max_stacked_bitmap_rows()},
+        {"BSPN_BITMAP_SHARE_ROWS_PER_CHUNK", bspn_bitmap_share_rows_per_chunk()},
+        {"BSPN_USE_ROW_VALUE_EVAL", bspn_use_row_value_eval()},
+    };
     std::cout << out.dump(2) << std::endl;
 }
 

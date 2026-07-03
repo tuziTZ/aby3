@@ -1,5 +1,6 @@
 #include "Sort.h"
 #include <numeric>
+#include <stdexcept>
 
 static const size_t MAX_SENDING_SIZE = 1 << 25;
 
@@ -957,12 +958,79 @@ int quick_sort(aby3::si64Matrix& data, int pIdx, aby3::Sh3Encryptor& enc, aby3::
 }
 
 int quick_sort_with_other_elements(aby3::si64Matrix& key, std::vector<aby3::si64Matrix>& value, int pIdx, aby3::Sh3Encryptor& enc, aby3::Sh3Evaluator& eval, aby3::Sh3Runtime& runtime, size_t min_size){
-    // TODO - the lacking shuffle may pose security problems.
-    // aby3::sbMatrix bool_data(key.rows(), 64); // fixed data bit size.
-    // arith2bool(pIdx, key, bool_data, enc, eval, runtime);
-    // efficient_shuffle(bool_data, pIdx, bool_data, enc, eval, runtime);
-    // bool2arith(pIdx, bool_data, key, enc, eval, runtime);
+    if (key.rows() == 0) {
+        return 0;
+    }
+    if (value.size() != static_cast<size_t>(key.rows())) {
+        throw std::runtime_error("quick_sort_with_other_elements key/value row count mismatch.");
+    }
+
+    const size_t payload_rows = value.empty() ? 0 : static_cast<size_t>(value[0].rows());
+    for (size_t row = 0; row < value.size(); ++row) {
+        if (static_cast<size_t>(value[row].rows()) != payload_rows || value[row].cols() != 1) {
+            throw std::runtime_error("quick_sort_with_other_elements payload shape mismatch.");
+        }
+    }
+
+    const u64 rows = key.rows();
+    const size_t field_count = payload_rows + 1;
+    std::vector<aby3::si64Matrix> fields(field_count);
+    fields[0] = key;
+    for (size_t payload_row = 0; payload_row < payload_rows; ++payload_row) {
+        fields[payload_row + 1].resize(rows, 1);
+        for (u64 row = 0; row < rows; ++row) {
+            fields[payload_row + 1].mShares[0](row, 0) =
+                value[static_cast<size_t>(row)].mShares[0](static_cast<u64>(payload_row), 0);
+            fields[payload_row + 1].mShares[1](row, 0) =
+                value[static_cast<size_t>(row)].mShares[1](static_cast<u64>(payload_row), 0);
+        }
+    }
+
+    for (size_t field_idx = 0; field_idx < field_count; ++field_idx) {
+        aby3::sbMatrix bool_field(rows, 64);
+        arith2bool(pIdx, fields[field_idx], bool_field, enc, eval, runtime);
+        aby3::sbMatrix shuffled_field(rows, 64);
+        efficient_shuffle(bool_field, pIdx, shuffled_field, enc, eval, runtime);
+        bool2arith(pIdx, shuffled_field, fields[field_idx], enc, eval, runtime);
+    }
+
+    key = fields[0];
+    for (size_t payload_row = 0; payload_row < payload_rows; ++payload_row) {
+        const auto& field = fields[payload_row + 1];
+        for (u64 row = 0; row < rows; ++row) {
+            value[static_cast<size_t>(row)].mShares[0](static_cast<u64>(payload_row), 0) =
+                field.mShares[0](row, 0);
+            value[static_cast<size_t>(row)].mShares[1](static_cast<u64>(payload_row), 0) =
+                field.mShares[1](row, 0);
+        }
+    }
+
     quick_sort_different(key, value, pIdx, enc, eval, runtime, min_size);
+    return 0;
+}
+
+int quick_sort_with_payload_matrix(aby3::si64Matrix& key, aby3::si64Matrix& payload, int pIdx, aby3::Sh3Encryptor& enc, aby3::Sh3Evaluator& eval, aby3::Sh3Runtime& runtime, size_t min_size){
+    if (key.rows() == 0) {
+        return 0;
+    }
+    if (payload.rows() != key.rows()) {
+        throw std::runtime_error("quick_sort_with_payload_matrix key/payload row count mismatch.");
+    }
+    std::vector<aby3::si64Matrix> row_payloads(static_cast<size_t>(key.rows()));
+    for (u64 row = 0; row < key.rows(); ++row) {
+        row_payloads[static_cast<size_t>(row)].resize(payload.cols(), 1);
+        for (u64 col = 0; col < payload.cols(); ++col) {
+            row_payloads[static_cast<size_t>(row)].mShares[0](col, 0) = payload.mShares[0](row, col);
+            row_payloads[static_cast<size_t>(row)].mShares[1](col, 0) = payload.mShares[1](row, col);
+        }
+    }
+    quick_sort_with_other_elements(key, row_payloads, pIdx, enc, eval, runtime, min_size);
+    for (u64 row = 0; row < key.rows(); ++row) {
+        for (u64 col = 0; col < payload.cols(); ++col) {
+            payload.mShares[0](row, col) = row_payloads[static_cast<size_t>(row)].mShares[0](col, 0);
+            payload.mShares[1](row, col) = row_payloads[static_cast<size_t>(row)].mShares[1](col, 0);
+        }
+    }
     return 0;
 }
 

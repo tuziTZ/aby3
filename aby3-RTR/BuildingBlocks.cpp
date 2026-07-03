@@ -386,7 +386,8 @@ int pi_cb_mul(int pIdx, const i64Matrix &plainA, const sbMatrix &sharedB, si64Ma
       std::vector<std::array<i64, 2>> s0(plainA.size());
       for(u64 i=0; i<s0.size(); i++){
 
-        auto bb = sharedB.mShares[0](i) ^ sharedB.mShares[1](i);
+        const u64 bb = (static_cast<u64>(sharedB.mShares[0](i)) ^
+                        static_cast<u64>(sharedB.mShares[1](i))) & 1ULL;
         auto zeroShare = enc.mShareGen.getShare();
 
         s0[i][bb] = zeroShare;
@@ -405,7 +406,7 @@ int pi_cb_mul(int pIdx, const i64Matrix &plainA, const sbMatrix &sharedB, si64Ma
       BitVector c0(sharedB.rows());
       for(u64 i=0; i<sharedB.rows(); i++){
         res.mShares[1](i) = enc.mShareGen.getShare();
-        c0[i] = static_cast<u8>(sharedB.mShares[0](i));
+        c0[i] = static_cast<u8>(static_cast<u64>(sharedB.mShares[0](i)) & 1ULL);
       }
       // cout << "p1 next no: " << runtime.mComm.mNext << endl;
       eval.mOtNextRecver.help(runtime.mComm.mNext, c0);
@@ -420,7 +421,7 @@ int pi_cb_mul(int pIdx, const i64Matrix &plainA, const sbMatrix &sharedB, si64Ma
       BitVector c0(sharedB.rows());
       for(u64 i = 0; i < sharedB.rows(); i++){
         res.mShares[0](i) = enc.mShareGen.getShare();
-        c0[i] = static_cast<u8>(sharedB.mShares[1](i));
+        c0[i] = static_cast<u8>(static_cast<u64>(sharedB.mShares[1](i)) & 1ULL);
       }
 
       // cout << "p2 prev no: " << runtime.mComm.mPrev << endl;
