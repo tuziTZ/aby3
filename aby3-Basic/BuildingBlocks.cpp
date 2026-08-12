@@ -66,6 +66,10 @@ static std::string endpoint(const std::string& host, int port) {
   return host + ":" + std::to_string(port);
 }
 
+static std::string server_endpoint(int port) {
+  return endpoint("0.0.0.0", port);
+}
+
 double synchronized_time(int pIdx, double& time_slot, Sh3Runtime &runtime){
   // double sync_time = time_slot;
   if(pIdx == 0){
@@ -165,13 +169,13 @@ void multi_processor_setup(u64 partyIdx, int rank, IOService &ios, Sh3Encryptor 
   const int basePort = net.multiBasePort + 3 * rank;
   switch (partyIdx) {
     case 0:
-      comm.mNext = Session(ios, endpoint(net.hosts[0], basePort), SessionMode::Server, "01")
+      comm.mNext = Session(ios, server_endpoint(basePort), SessionMode::Server, "01")
                        .addChannel();
-      comm.mPrev = Session(ios, endpoint(net.hosts[0], basePort + 1), SessionMode::Server, "02")
+      comm.mPrev = Session(ios, server_endpoint(basePort + 1), SessionMode::Server, "02")
                        .addChannel();
       break;
     case 1:
-      comm.mNext = Session(ios, endpoint(net.hosts[1], basePort + 2), SessionMode::Server, "12")
+      comm.mNext = Session(ios, server_endpoint(basePort + 2), SessionMode::Server, "12")
                        .addChannel();
       comm.mPrev = Session(ios, endpoint(net.hosts[0], basePort), SessionMode::Client, "01")
                        .addChannel();
@@ -200,13 +204,13 @@ void basic_setup(u64 partyIdx, IOService &ios, Sh3Encryptor &enc, Sh3Evaluator &
   const int basePort = net.basicBasePort;
   switch (partyIdx) {
     case 0:
-      comm.mNext = Session(ios, endpoint(net.hosts[0], basePort), SessionMode::Server, "01")
+      comm.mNext = Session(ios, server_endpoint(basePort), SessionMode::Server, "01")
                        .addChannel();
-      comm.mPrev = Session(ios, endpoint(net.hosts[0], basePort + 1), SessionMode::Server, "02")
+      comm.mPrev = Session(ios, server_endpoint(basePort + 1), SessionMode::Server, "02")
                        .addChannel();
       break;
     case 1:
-      comm.mNext = Session(ios, endpoint(net.hosts[1], basePort + 2), SessionMode::Server, "12")
+      comm.mNext = Session(ios, server_endpoint(basePort + 2), SessionMode::Server, "12")
                        .addChannel();
       comm.mPrev = Session(ios, endpoint(net.hosts[0], basePort), SessionMode::Client, "01")
                        .addChannel();

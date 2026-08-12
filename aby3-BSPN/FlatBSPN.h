@@ -46,6 +46,13 @@ struct FlatBSPNBucketRecord {
     std::uint32_t upper_bound_index = 0;
 };
 
+struct FlatSecureBucketMapping {
+    std::uint64_t secure_local_idx = 0;
+    std::uint32_t global_bucket_id = 0;
+    std::uint32_t leaf_node_id = 0;
+    std::uint64_t leaf_local_bucket_idx = 0;
+};
+
 struct FlatBSPNManifest {
     std::string model_id;
     std::string table_name;
@@ -76,7 +83,10 @@ struct FlatBSPNManifest {
     std::string secret_payload_encoding;
     bool secure_multiplier_materialized = false;
     std::string secure_share_payload_dir = "secret_shares";
+    std::string secure_share_payload_layout = "consolidated_v1";
+    std::string secure_share_bool_encoding = "bitpacked_pair_lsb_v1";
     std::vector<std::uint32_t> secure_multiplier_bucket_indices;
+    std::vector<FlatSecureBucketMapping> secure_multiplier_bucket_mapping;
     bool has_leaf_row_values = false;
     std::vector<std::uint32_t> leaf_row_value_node_ids;
     std::vector<std::uint64_t> leaf_row_value_offsets;
