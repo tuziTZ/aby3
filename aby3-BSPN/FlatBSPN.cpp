@@ -18,10 +18,14 @@
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
 #include <nlohmann/json.hpp>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace aby3 {
 
@@ -634,6 +638,14 @@ using SteadyTimePoint = SteadyClock::time_point;
 
 double elapsed_ms_since(const SteadyTimePoint& start) {
     return std::chrono::duration<double, std::milli>(SteadyClock::now() - start).count();
+}
+
+int bspn_openmp_max_threads() {
+#ifdef _OPENMP
+    return omp_get_max_threads();
+#else
+    return 1;
+#endif
 }
 
 sf64Matrix<kFlatBSPNDecimal> si64_to_sf64(
@@ -5364,26 +5376,40 @@ json evaluate_secure_bundle_paths(
         throw std::runtime_error("secret_payload_json not set");
     }
 
+    const auto path_total_start = std::chrono::steady_clock::now();
+    json stage_timing_ms = json::object();
+
+    auto phase_start = std::chrono::steady_clock::now();
     std::ifstream public_in(public_plan_path);
     if (!public_in.is_open()) {
         throw std::runtime_error("Could not open public plan json: " + public_plan_path);
     }
     json public_doc;
     public_in >> public_doc;
+    stage_timing_ms["public_plan_read"] = elapsed_ms_since(phase_start);
 
     json secret_doc = json::object();
     FlatSecureQueryPayload secure_payload = empty_secure_query_payload_from_public_doc(public_doc);
     if (secure_context.role == secure_context.query_owner_party) {
+        phase_start = std::chrono::steady_clock::now();
         std::ifstream secret_in(secret_payload_path);
         if (!secret_in.is_open()) {
             throw std::runtime_error("Could not open secret payload json: " + secret_payload_path);
         }
         secret_in >> secret_doc;
         secure_payload = parse_secure_query_payload_doc(secret_doc);
+        stage_timing_ms["secret_payload_read"] = elapsed_ms_since(phase_start);
+    } else {
+        stage_timing_ms["secret_payload_read"] = 0.0;
     }
 
+    phase_start = std::chrono::steady_clock::now();
     auto shared_query_payload = share_secure_query_tensor_payload(secure_payload, secure_context);
+    stage_timing_ms["query_payload_share"] = elapsed_ms_since(phase_start);
 
+    phase_start = std::chrono::steady_clock::now();
+    std::uint64_t model_cache_hits = 0;
+    std::uint64_t model_cache_misses = 0;
     for (const auto& model_id : collect_secure_bundle_model_ids(public_doc)) {
         const auto manifest_it = manifest_map.find(model_id);
         const std::string manifest_path =
@@ -5391,15 +5417,20 @@ json evaluate_secure_bundle_paths(
                 ? manifest_it->second
                 : default_manifest_path_for_model(model_root, model_id);
         if (preloaded_model_cache.find(manifest_path) != preloaded_model_cache.end()) {
+            ++model_cache_hits;
             continue;
         }
+        ++model_cache_misses;
         FlatBSPNModel model;
         model.load_public_manifest(manifest_path);
         model.load_secret_payload(secure_context);
         preloaded_model_cache.emplace(manifest_path, std::move(model));
     }
+    stage_timing_ms["model_load"] = elapsed_ms_since(phase_start);
 
+    phase_start = std::chrono::steady_clock::now();
     synchronize_secure_parties(secure_context);
+    stage_timing_ms["pre_eval_synchronize"] = elapsed_ms_since(phase_start);
     const auto secure_total_start = std::chrono::steady_clock::now();
     const auto secure_core_start = std::chrono::steady_clock::now();
     auto secure_eval = evaluate_secure_bundle_impl_secure(
@@ -5412,11 +5443,15 @@ json evaluate_secure_bundle_paths(
         preloaded_model_cache);
     SecureFixedScalarShare secure_result_scalar;
     if (secure_eval.has_result) {
+        phase_start = std::chrono::steady_clock::now();
         secure_result_scalar = secure_divide_rational_to_fixed_scalar(
             secure_eval.result_rational,
             secure_context,
             secure_eval.root_division_payload_scale,
             secure_eval.root_division_scale_denominator_payload);
+        stage_timing_ms["root_division"] = elapsed_ms_since(phase_start);
+    } else {
+        stage_timing_ms["root_division"] = 0.0;
     }
     const auto secure_core_end = std::chrono::steady_clock::now();
     bool result_revealed = false;
@@ -5430,7 +5465,9 @@ json evaluate_secure_bundle_paths(
         final_reveal_wall_time_ms =
             std::chrono::duration<double, std::milli>(reveal_end - reveal_start).count();
     }
+    phase_start = std::chrono::steady_clock::now();
     synchronize_secure_parties(secure_context);
+    stage_timing_ms["post_eval_synchronize"] = elapsed_ms_since(phase_start);
     const auto secure_total_end = std::chrono::steady_clock::now();
     const double secure_core_wall_time_ms =
         std::chrono::duration<double, std::milli>(secure_core_end - secure_core_start).count();
@@ -5455,11 +5492,20 @@ json evaluate_secure_bundle_paths(
     if (secure_context.debug_internal_reveal) {
         out["debug"] = secure_eval.debug_output;
     }
+    stage_timing_ms["secure_core"] = secure_core_wall_time_ms;
+    stage_timing_ms["final_reveal"] = final_reveal_wall_time_ms;
+    stage_timing_ms["secure_total_synchronized"] = secure_total_wall_time_ms;
+    stage_timing_ms["path_total"] = elapsed_ms_since(path_total_start);
+    secure_eval.timing_profile["stage_timing_ms"] = stage_timing_ms;
+    secure_eval.timing_profile["model_cache_hits"] = model_cache_hits;
+    secure_eval.timing_profile["model_cache_misses"] = model_cache_misses;
     out["timing_profile"] = secure_eval.timing_profile;
     out["runtime_params"] = {
         {"BSPN_MAX_STACKED_BITMAP_ROWS", bspn_max_stacked_bitmap_rows()},
         {"BSPN_BITMAP_SHARE_ROWS_PER_CHUNK", bspn_bitmap_share_rows_per_chunk()},
         {"BSPN_USE_ROW_VALUE_EVAL", bspn_use_row_value_eval()},
+        {"OMP_MAX_THREADS", bspn_openmp_max_threads()},
+        {"IO_SERVICE_THREAD_DEFAULT", std::thread::hardware_concurrency()},
     };
     out["model_cache_size"] = preloaded_model_cache.size();
     return out;
@@ -5519,12 +5565,15 @@ void BSPN_secure_bundle_eval(const oc::CLP& cmd) {
 
     const std::string batch_bundle_path = cmd.getOr<std::string>("batch_bundle_json", "");
     if (!batch_bundle_path.empty()) {
+        const auto batch_total_start = std::chrono::steady_clock::now();
+        const auto batch_read_start = std::chrono::steady_clock::now();
         std::ifstream batch_in(batch_bundle_path);
         if (!batch_in.is_open()) {
             throw std::runtime_error("Could not open batch bundle json: " + batch_bundle_path);
         }
         json batch_doc;
         batch_in >> batch_doc;
+        const double batch_read_ms = elapsed_ms_since(batch_read_start);
         const json entries = batch_doc.is_array() ? batch_doc : batch_doc.value("queries", json::array());
         if (!entries.is_array()) {
             throw std::runtime_error("batch_bundle_json must be an array or an object with a queries array.");
@@ -5552,6 +5601,12 @@ void BSPN_secure_bundle_eval(const oc::CLP& cmd) {
             {"batch_query_count", batch_results.size()},
             {"persistent_frontend_eval", true},
             {"model_cache_size", preloaded_model_cache.size()},
+            {"batch_bundle_read_ms", batch_read_ms},
+            {"batch_total_wall_time_ms", elapsed_ms_since(batch_total_start)},
+            {"runtime_params", {
+                {"OMP_MAX_THREADS", bspn_openmp_max_threads()},
+                {"IO_SERVICE_THREAD_DEFAULT", std::thread::hardware_concurrency()},
+            }},
         };
         std::cout << out.dump(2) << std::endl;
         return;
