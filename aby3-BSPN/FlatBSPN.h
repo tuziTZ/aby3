@@ -91,6 +91,12 @@ struct FlatBSPNManifest {
     std::vector<std::uint32_t> leaf_row_value_node_ids;
     std::vector<std::uint64_t> leaf_row_value_offsets;
     std::uint64_t leaf_row_value_total_rows = 0;
+    bool has_row_weights = false;
+    std::uint64_t row_weight_count = 0;
+    std::string row_weight_encoding;
+    bool has_leaf_bucket_weight_sums = false;
+    std::uint64_t leaf_bucket_weight_sum_count = 0;
+    std::string leaf_bucket_weight_sum_encoding;
     std::vector<std::uint32_t> secure_multiplier_leaf_row_value_node_ids;
     std::vector<std::uint64_t> secure_multiplier_leaf_row_value_offsets;
     std::uint64_t secure_multiplier_leaf_row_value_total_rows = 0;
@@ -117,6 +123,7 @@ struct FlatFactorSpec {
     std::uint64_t public_feature_count = 0;
     std::uint64_t public_evidence_count = 0;
     std::uint64_t total_rows = 0;
+    bool weighted_count_direct = false;
 };
 
 inline constexpr Decimal kFlatBSPNDecimal = D16;
@@ -144,6 +151,8 @@ struct FlatBSPNSecretHostPayload {
     f64Matrix<kFlatBSPNDecimal> bucket_lowers;
     f64Matrix<kFlatBSPNDecimal> bucket_uppers;
     f64Matrix<kFlatBSPNDecimal> leaf_row_values;
+    f64Matrix<kFlatBSPNDecimal> row_weights;
+    f64Matrix<kFlatBSPNDecimal> leaf_bucket_weight_sums;
     i64Matrix leaf_bitmaps;
 };
 
@@ -156,6 +165,10 @@ struct FlatBSPNSecretSharedPayload {
     sf64Matrix<kFlatBSPNDecimal> bucket_lowers;
     sf64Matrix<kFlatBSPNDecimal> bucket_uppers;
     sf64Matrix<kFlatBSPNDecimal> leaf_row_values;
+    sf64Matrix<kFlatBSPNDecimal> row_weights;
+    bool row_weights_loaded = false;
+    sf64Matrix<kFlatBSPNDecimal> leaf_bucket_weight_sums;
+    bool leaf_bucket_weight_sums_loaded = false;
     std::vector<std::int64_t> leaf_row_value_offset_by_node;
     bool leaf_row_values_loaded = false;
     si64Matrix leaf_bitmaps;
@@ -255,6 +268,8 @@ private:
     std::vector<double> node_inv_cardinalities_;
     std::vector<std::uint8_t> node_scopes_;
     std::vector<std::uint8_t> leaf_bitmaps_;
+    std::vector<double> row_weights_;
+    std::vector<double> leaf_bucket_weight_sums_;
     std::vector<int> secure_bucket_offsets_;
     std::vector<sbMatrix> secure_multiplier_bucket_bitmaps_;
     bool secure_share_payload_loaded_ = false;
