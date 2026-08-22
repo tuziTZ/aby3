@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -105,6 +106,28 @@ std::uint64_t bspn_max_stacked_bitmap_rows() {
 
 std::uint64_t bspn_bitmap_share_rows_per_chunk() {
     return parse_bspn_u64_env("BSPN_BITMAP_SHARE_ROWS_PER_CHUNK", std::uint64_t(1) << 20);
+}
+
+bool bspn_env_flag_enabled(const char* name) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || *value == '\0') {
+        return false;
+    }
+    std::string normalized(value);
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on";
+}
+
+bool remote_share_only_required() {
+    return bspn_env_flag_enabled("SECURE_USE_REMOTE_ABY3") ||
+        bspn_env_flag_enabled("SECURE_REMOTE_ABY3");
+}
+
+i64 add_i64_mod(i64 left, i64 right) {
+    return static_cast<i64>(
+        static_cast<std::uint64_t>(left) + static_cast<std::uint64_t>(right));
 }
 
 bool bspn_use_row_value_eval() {
@@ -370,17 +393,47 @@ void share_bool_matrix(
 }
 
 template <Decimal D>
+sf64Matrix<D> read_fixed_share_pair_matrix(
+    const std::string& path,
+    std::size_t expected_rows,
+    std::size_t expected_cols) {
+    const auto raw = read_i64_share_pair_records(path);
+    if (raw.size() != expected_rows * expected_cols * 2) {
+        throw std::runtime_error("Fixed share file shape mismatch: " + path);
+    }
+    sf64Matrix<D> out(expected_rows, expected_cols);
+    for (std::size_t row = 0; row < expected_rows; ++row) {
+        for (std::size_t col = 0; col < expected_cols; ++col) {
+            const std::size_t idx = (row * expected_cols + col) * 2;
+            out[0](static_cast<u64>(row), static_cast<u64>(col)) = raw[idx];
+            out[1](static_cast<u64>(row), static_cast<u64>(col)) = raw[idx + 1];
+        }
+    }
+    return out;
+}
+
+template <Decimal D>
 sf64Matrix<D> read_fixed_share_pair_column(
     const std::string& path,
     std::size_t expected_rows) {
+    return read_fixed_share_pair_matrix<D>(path, expected_rows, 1);
+}
+
+si64Matrix read_int_share_pair_matrix(
+    const std::string& path,
+    std::size_t expected_rows,
+    std::size_t expected_cols) {
     const auto raw = read_i64_share_pair_records(path);
-    if (raw.size() != expected_rows * 2) {
-        throw std::runtime_error("Fixed share file row count mismatch: " + path);
+    if (raw.size() != expected_rows * expected_cols * 2) {
+        throw std::runtime_error("Int share file shape mismatch: " + path);
     }
-    sf64Matrix<D> out(expected_rows, 1);
+    si64Matrix out(expected_rows, expected_cols);
     for (std::size_t row = 0; row < expected_rows; ++row) {
-        out[0](static_cast<u64>(row), 0) = raw[row * 2];
-        out[1](static_cast<u64>(row), 0) = raw[row * 2 + 1];
+        for (std::size_t col = 0; col < expected_cols; ++col) {
+            const std::size_t idx = (row * expected_cols + col) * 2;
+            out[0](static_cast<u64>(row), static_cast<u64>(col)) = raw[idx];
+            out[1](static_cast<u64>(row), static_cast<u64>(col)) = raw[idx + 1];
+        }
     }
     return out;
 }
@@ -584,6 +637,7 @@ struct SecureBundleExecutionResult {
     double root_division_payload_scale = 1.0;
     bool root_division_scale_denominator_payload = false;
     json debug_output;
+    json factor_trace_shares = json::array();
     json timing_profile;
 };
 
@@ -1019,13 +1073,13 @@ SecureRationalShare select_rational_by_bool(
         target_numerator_scale,
         target_denominator_scale,
         context);
-    auto out = normalize_secure_rational_scales({
+    SecureRationalShare out{
         select_fixed_by_bool(aligned_true.numerator, aligned_false.numerator, flag, context),
         select_fixed_by_bool(aligned_true.denominator, aligned_false.denominator, flag, context),
         target_numerator_scale,
         target_denominator_scale,
         true_value.denominator_is_one && false_value.denominator_is_one,
-    });
+    };
     if (!out.denominator_is_one) {
         const auto true_non_unit = rational_non_unit_denominator_flag(aligned_true, context);
         const auto false_non_unit = rational_non_unit_denominator_flag(aligned_false, context);
@@ -1295,6 +1349,59 @@ json secure_rational_debug_json(
     };
 }
 
+json fixed_scalar_share_json(
+    const sf64Matrix<kFlatBSPNDecimal>& value) {
+    auto cell = const_cast<sf64Matrix<kFlatBSPNDecimal>&>(value)(0, 0);
+    return {
+        {"share0", static_cast<long long>(cell[0])},
+        {"share1", static_cast<long long>(cell[1])},
+        {"rows", static_cast<std::uint64_t>(value.rows())},
+        {"cols", static_cast<std::uint64_t>(value.cols())},
+    };
+}
+
+json bool_scalar_share_json(
+    const sbMatrix& value) {
+    return {
+        {"share0", static_cast<int>(value.mShares[0](0, 0))},
+        {"share1", static_cast<int>(value.mShares[1](0, 0))},
+        {"rows", static_cast<std::uint64_t>(value.rows())},
+        {"cols", static_cast<std::uint64_t>(value.mShares[0].cols())},
+    };
+}
+
+json secure_rational_share_json(
+    const SecureRationalShare& value) {
+    json out = {
+        {"numerator_share", fixed_scalar_share_json(value.numerator)},
+        {"denominator_share", fixed_scalar_share_json(value.denominator)},
+        {"numerator_scale", value.numerator_scale},
+        {"denominator_scale", value.denominator_scale},
+        {"denominator_is_one", value.denominator_is_one},
+        {"has_secret_non_unit_denominator", value.has_secret_non_unit_denominator},
+        {"has_secret_zero_numerator", value.has_secret_zero_numerator},
+        {"fixed_decimal_bits", static_cast<int>(kFlatBSPNDecimal)},
+    };
+    if (value.has_secret_non_unit_denominator) {
+        out["secret_non_unit_denominator_share"] =
+            bool_scalar_share_json(value.secret_non_unit_denominator);
+    }
+    if (value.has_secret_zero_numerator) {
+        out["secret_zero_numerator_share"] =
+            bool_scalar_share_json(value.secret_zero_numerator);
+    }
+    return out;
+}
+
+json secure_fixed_scalar_share_json(
+    const SecureFixedScalarShare& value) {
+    return {
+        {"value_share", fixed_scalar_share_json(value.value)},
+        {"scale", value.scale},
+        {"fixed_decimal_bits", static_cast<int>(kFlatBSPNDecimal)},
+    };
+}
+
 SecureRationalShare normalize_secure_rational_scales(SecureRationalShare value) {
     const double common_scale = std::max(
         std::max(std::abs(value.numerator_scale), std::abs(value.denominator_scale)),
@@ -1539,7 +1646,7 @@ SecureFixedScalarShare secure_divide_rational_to_fixed_scalar(
             context);
         scaled_value.numerator_scale = value.numerator_scale / numerator_payload_scale;
         if (scale_denominator_payload) {
-            const double denominator_payload_scale = std::max(payload_scale, 1.0 / 32.0);
+            const double denominator_payload_scale = std::max(payload_scale, 1.0 / 4096.0);
             scaled_value.denominator = secure_mul_public_fixed(
                 value.denominator,
                 denominator_payload_scale,
@@ -2327,12 +2434,20 @@ sf64Matrix<kFlatBSPNDecimal> sum_single_leaf_match_bucket_weights_batched(
         std::vector<i64> chunk_sum1(product_items.size(), 0);
         for (std::size_t local_idx = 0; local_idx < chunk_bucket_count; ++local_idx) {
             const auto product_idx = bucket_refs[chunk_begin + local_idx].product_idx;
-            chunk_sum0[product_idx] += selected_weight_sums[0](static_cast<u64>(local_idx), 0);
-            chunk_sum1[product_idx] += selected_weight_sums[1](static_cast<u64>(local_idx), 0);
+            chunk_sum0[product_idx] = add_i64_mod(
+                chunk_sum0[product_idx],
+                selected_weight_sums[0](static_cast<u64>(local_idx), 0));
+            chunk_sum1[product_idx] = add_i64_mod(
+                chunk_sum1[product_idx],
+                selected_weight_sums[1](static_cast<u64>(local_idx), 0));
         }
         for (std::size_t product_idx = 0; product_idx < product_items.size(); ++product_idx) {
-            counts[0](static_cast<u64>(product_idx), 0) += chunk_sum0[product_idx];
-            counts[1](static_cast<u64>(product_idx), 0) += chunk_sum1[product_idx];
+            counts[0](static_cast<u64>(product_idx), 0) = add_i64_mod(
+                counts[0](static_cast<u64>(product_idx), 0),
+                chunk_sum0[product_idx]);
+            counts[1](static_cast<u64>(product_idx), 0) = add_i64_mod(
+                counts[1](static_cast<u64>(product_idx), 0),
+                chunk_sum1[product_idx]);
         }
     }
 
@@ -2505,15 +2620,23 @@ std::vector<sf64Matrix<kFlatBSPNDecimal>> compute_leaf_target_numerator_sums_gro
         std::vector<i64> chunk_sum1(leaf_children.size(), 0);
         for (std::size_t local_bucket_idx = 0; local_bucket_idx < chunk_bucket_count; ++local_bucket_idx) {
             const auto child_idx = bucket_refs[chunk_begin + local_bucket_idx].child_idx;
-            chunk_sum0[child_idx] += bucket_contributions[0](static_cast<u64>(local_bucket_idx), 0);
-            chunk_sum1[child_idx] += bucket_contributions[1](static_cast<u64>(local_bucket_idx), 0);
+            chunk_sum0[child_idx] = add_i64_mod(
+                chunk_sum0[child_idx],
+                bucket_contributions[0](static_cast<u64>(local_bucket_idx), 0));
+            chunk_sum1[child_idx] = add_i64_mod(
+                chunk_sum1[child_idx],
+                bucket_contributions[1](static_cast<u64>(local_bucket_idx), 0));
         }
         for (std::size_t child_idx = 0; child_idx < leaf_children.size(); ++child_idx) {
             if (chunk_sum0[child_idx] == 0 && chunk_sum1[child_idx] == 0) {
                 continue;
             }
-            numerator_sums[child_idx][0](0, 0) += chunk_sum0[child_idx];
-            numerator_sums[child_idx][1](0, 0) += chunk_sum1[child_idx];
+            numerator_sums[child_idx][0](0, 0) = add_i64_mod(
+                numerator_sums[child_idx][0](0, 0),
+                chunk_sum0[child_idx]);
+            numerator_sums[child_idx][1](0, 0) = add_i64_mod(
+                numerator_sums[child_idx][1](0, 0),
+                chunk_sum1[child_idx]);
         }
     }
     return numerator_sums;
@@ -2777,6 +2900,13 @@ SecureBoundFactor bind_secure_factor_from_secure_bundle(
     bound.factor.weighted_count_direct = factor_doc.value("weighted_count_direct", false);
 
     if (bound.factor.factor_kind == "CONSTANT") {
+        return bound;
+    }
+    if ((bound.factor.factor_kind == "INDICATOR_EXPECTATION" ||
+         bound.factor.factor_kind == "EXPECTATION") &&
+        bound.factor.public_feature_count == 0 &&
+        bound.factor.public_evidence_count == 0) {
+        bound.model_id = factor_doc.value("spn_model_id", std::string());
         return bound;
     }
 
@@ -3235,6 +3365,54 @@ std::vector<sbMatrix> compute_leaf_match_masks_for_evidence(
 
     const auto selected_interval_counts = scoped_int_values(shared_query_payload.interval_counts_shared, 0);
     const auto selected_has_evidence_flags = scoped_int_flags(shared_query_payload.has_evidence_shared, 0);
+    const bool debug_leaf_evidence_flags =
+        context.debug_internal_reveal && std::getenv("BSPN_DEBUG_LEAF_EVIDENCE_FLAGS") != nullptr;
+    if (debug_leaf_evidence_flags) {
+        i64Matrix interval_counts_plain(
+            selected_interval_counts.rows(),
+            selected_interval_counts.cols());
+        context.enc->revealAll(
+            context.runtime->noDependencies(),
+            selected_interval_counts,
+            interval_counts_plain).get();
+        auto has_evidence_flags_copy = selected_has_evidence_flags;
+        si64Matrix has_evidence_int(selected_has_evidence_flags.rows(), 1);
+        bool2arith(
+            context.role,
+            has_evidence_flags_copy,
+            has_evidence_int,
+            *(context.enc),
+            *(context.eval),
+            *(context.runtime));
+        i64Matrix has_evidence_plain(
+            has_evidence_int.rows(),
+            has_evidence_int.cols());
+        context.enc->revealAll(
+            context.runtime->noDependencies(),
+            has_evidence_int,
+            has_evidence_plain).get();
+        if (context.role == 0) {
+            std::cerr << "bspn_debug_leaf_evidence_flags:"
+                      << " factor_row=" << secret_factor_row
+                      << " leaf_rows=" << leaf_rows
+                      << " evidence_cols=" << evidence_cols
+                      << " interval_counts=[";
+            for (u64 row = 0; row < static_cast<u64>(interval_counts_plain.rows()); ++row) {
+                if (row != 0) {
+                    std::cerr << ",";
+                }
+                std::cerr << interval_counts_plain(row, 0);
+            }
+            std::cerr << "] has_evidence=[";
+            for (u64 row = 0; row < static_cast<u64>(has_evidence_plain.rows()); ++row) {
+                if (row != 0) {
+                    std::cerr << ",";
+                }
+                std::cerr << has_evidence_plain(row, 0);
+            }
+            std::cerr << "]\n";
+        }
+    }
     const u64 stacked_bucket_rows = std::accumulate(
         leaf_children.begin(),
         leaf_children.end(),
@@ -3408,6 +3586,30 @@ std::vector<sbMatrix> compute_leaf_match_masks_for_evidence(
         sbMatrix updated_match_mask(child.bucket_count, match_masks[child_idx].bitCount());
         bool_cipher_or(context.role, match_masks[child_idx], no_evidence_rows, updated_match_mask, *(context.enc), *(context.eval), *(context.runtime));
         match_masks[child_idx] = std::move(updated_match_mask);
+    }
+    if (debug_leaf_evidence_flags) {
+        std::vector<sbMatrix> match_masks_copy = match_masks;
+        const auto match_counts = sum_boolean_masks_to_int_batched(
+            match_masks_copy,
+            context,
+            nullptr);
+        i64Matrix match_counts_plain(match_counts.rows(), match_counts.cols());
+        context.enc->revealAll(
+            context.runtime->noDependencies(),
+            match_counts,
+            match_counts_plain).get();
+        if (context.role == 0) {
+            std::cerr << "bspn_debug_leaf_match_counts:"
+                      << " factor_row=" << secret_factor_row
+                      << " counts=[";
+            for (u64 row = 0; row < static_cast<u64>(match_counts_plain.rows()); ++row) {
+                if (row != 0) {
+                    std::cerr << ",";
+                }
+                std::cerr << match_counts_plain(row, 0);
+            }
+            std::cerr << "]\n";
+        }
     }
 
     return match_masks;
@@ -3798,42 +4000,14 @@ std::vector<SecureRationalShare> evaluate_leaf_product_batch_values(
         }
     };
     auto push_count_selectivity_rows_as_rationals = [&]() {
-        if (use_row_weights_for_rows) {
-            if (factor.factor.weighted_count_direct) {
-                for (u64 product_idx = 0; product_idx < product_count; ++product_idx) {
-                    SecureRationalShare value{
-                        fixed_row_slice(effective_cnt_rows, static_cast<std::uint32_t>(product_idx), 1),
-                        one_fixed,
-                        1.0,
-                        1.0,
-                        true,
-                    };
-                    value.has_secret_zero_numerator = true;
-                    value.secret_zero_numerator = bool_row_slice(
-                        product_zero_rows,
-                        static_cast<std::uint32_t>(product_idx),
-                        1);
-                    value.numerator = fixed_mul_bool_same_shape(
-                        value.numerator,
-                        bool_not_scalar(value.secret_zero_numerator, context),
-                        context);
-                    out.push_back(std::move(value));
-                }
-                return;
-            }
-            const double public_total_rows = std::max<double>(
-                1.0,
-                static_cast<double>(
-                    factor.factor.total_rows != 0
-                        ? factor.factor.total_rows
-                        : model.manifest().total_rows));
+        if (use_row_weights_for_rows && factor.factor.weighted_count_direct) {
             for (u64 product_idx = 0; product_idx < product_count; ++product_idx) {
                 SecureRationalShare value{
                     fixed_row_slice(effective_cnt_rows, static_cast<std::uint32_t>(product_idx), 1),
                     one_fixed,
                     1.0,
-                    public_total_rows,
-                    false,
+                    1.0,
+                    true,
                 };
                 value.has_secret_zero_numerator = true;
                 value.secret_zero_numerator = bool_row_slice(
@@ -3848,14 +4022,14 @@ std::vector<SecureRationalShare> evaluate_leaf_product_batch_values(
             }
             return;
         }
+        if (product_count > 1) {
+            push_fixed_rows_as_rationals(selectivity_num_nonzero_rows);
+            return;
+        }
         const auto empty_fixed_rows = bool_matrix_to_fixed_same_shape(is_empty_rows, context);
         const auto denom_safe_rows = node_cardinality_rows + empty_fixed_rows;
-        const double denominator_public_scale = std::max<double>(
-            1.0,
-            static_cast<double>(
-                factor.factor.total_rows != 0
-                    ? factor.factor.total_rows
-                    : model.manifest().total_rows));
+        const double denominator_public_scale =
+            static_cast<double>(std::uint64_t(1) << static_cast<unsigned>(kFlatBSPNDecimal));
         const auto denom_payload_rows = secure_mul_public_fixed(
             denom_safe_rows,
             1.0 / denominator_public_scale,
@@ -3913,8 +4087,12 @@ std::vector<SecureRationalShare> evaluate_leaf_product_batch_values(
             const auto& item = product_items[product_idx];
             for (std::size_t offset = 0; offset < item.leaf_count; ++offset) {
                 const u64 leaf_idx = static_cast<u64>(item.leaf_begin + offset);
-                scalar_target_sum_rows[0](static_cast<u64>(product_idx), 0) += selected_scaled_rows[0](leaf_idx, 0);
-                scalar_target_sum_rows[1](static_cast<u64>(product_idx), 0) += selected_scaled_rows[1](leaf_idx, 0);
+                scalar_target_sum_rows[0](static_cast<u64>(product_idx), 0) = add_i64_mod(
+                    scalar_target_sum_rows[0](static_cast<u64>(product_idx), 0),
+                    selected_scaled_rows[0](leaf_idx, 0));
+                scalar_target_sum_rows[1](static_cast<u64>(product_idx), 0) = add_i64_mod(
+                    scalar_target_sum_rows[1](static_cast<u64>(product_idx), 0),
+                    selected_scaled_rows[1](leaf_idx, 0));
             }
         }
         const auto has_target_rows = stack_bool_scalars(has_target_by_product);
@@ -4408,6 +4586,7 @@ SecureBundleExecutionResult evaluate_secure_bundle_impl_secure(
     }
 
     json factor_timing_profile = json::array();
+    json factor_trace_shares = json::array();
     std::map<std::string, SecureRationalShare> factor_value_cache;
     std::uint64_t factor_cache_hits = 0;
     std::uint64_t factor_cache_misses = 0;
@@ -4471,7 +4650,32 @@ SecureBundleExecutionResult evaluate_secure_bundle_impl_secure(
                     };
                     factor_debug->push_back(factor_debug_doc);
                 }
+                if (context.factor_trace_shares) {
+                    factor_trace_shares.push_back({
+                        {"stage", "factor"},
+                        {"profile_section", profile_section},
+                        {"factor_index", bound.factor.factor_index},
+                        {"factor_kind", bound.factor.factor_kind},
+                        {"inverse", bound.factor.inverse},
+                        {"model_id", bound.model_id},
+                        {"cache_hit", true},
+                        {"public_feature_count", bound.factor.public_feature_count},
+                        {"public_evidence_count", bound.factor.public_evidence_count},
+                        {"weighted_count_direct", bound.factor.weighted_count_direct},
+                        {"rational_share", secure_rational_share_json(factor_value)},
+                    });
+                }
                 product = multiply_secure_rational(product, factor_value, context);
+                if (context.factor_trace_shares) {
+                    factor_trace_shares.push_back({
+                        {"stage", "prefix"},
+                        {"profile_section", profile_section},
+                        {"factor_index", bound.factor.factor_index},
+                        {"factor_kind", "FACTOR_PRODUCT_PREFIX"},
+                        {"model_id", bound.model_id},
+                        {"rational_share", secure_rational_share_json(product)},
+                    });
+                }
                 continue;
             }
             ++factor_cache_misses;
@@ -4536,7 +4740,9 @@ SecureBundleExecutionResult evaluate_secure_bundle_impl_secure(
             if (!exact_unit_factor &&
                 bound.factor.factor_kind == "INDICATOR_EXPECTATION" &&
                 !bound.factor.inverse &&
-                !bound.factor.weighted_count_direct) {
+                !bound.factor.weighted_count_direct &&
+                !(bound.factor.public_feature_count == 0 &&
+                  bound.factor.public_evidence_count > 0)) {
                 constexpr double kSecureD16IndicatorPayloadUpscale = 4096.0;
                 factor_value.numerator = secure_nonnegative_fixed_same_shape(
                     factor_value.numerator,
@@ -4601,6 +4807,8 @@ SecureBundleExecutionResult evaluate_secure_bundle_impl_secure(
             if (factor_debug != nullptr && context.debug_internal_reveal) {
                 const double numerator = reveal_scaled_numerator(factor_value, context);
                 const double denominator = reveal_scaled_denominator(factor_value, context);
+                const double numerator_raw = reveal_fixed_scalar(factor_value.numerator, context);
+                const double denominator_raw = reveal_fixed_scalar(factor_value.denominator, context);
                 json factor_debug_doc = {
                     {"factor_index", bound.factor.factor_index},
                     {"factor_kind", bound.factor.factor_kind},
@@ -4626,6 +4834,10 @@ SecureBundleExecutionResult evaluate_secure_bundle_impl_secure(
                     }},
 	                    {"numerator", numerator},
                     {"denominator", denominator},
+                    {"numerator_raw", numerator_raw},
+                    {"denominator_raw", denominator_raw},
+                    {"numerator_scale", factor_value.numerator_scale},
+                    {"denominator_scale", factor_value.denominator_scale},
                     {"value", std::abs(denominator) <= 1e-12 ? 0.0 : numerator / denominator},
                 };
                 if (!bound.manifest_path.empty()) {
@@ -4640,7 +4852,32 @@ SecureBundleExecutionResult evaluate_secure_bundle_impl_secure(
                 }
                 factor_debug->push_back(factor_debug_doc);
             }
+            if (context.factor_trace_shares) {
+                factor_trace_shares.push_back({
+                    {"stage", "factor"},
+                    {"profile_section", profile_section},
+                    {"factor_index", bound.factor.factor_index},
+                    {"factor_kind", bound.factor.factor_kind},
+                    {"inverse", bound.factor.inverse},
+                    {"model_id", bound.model_id},
+                    {"cache_hit", false},
+                    {"public_feature_count", bound.factor.public_feature_count},
+                    {"public_evidence_count", bound.factor.public_evidence_count},
+                    {"weighted_count_direct", bound.factor.weighted_count_direct},
+                    {"rational_share", secure_rational_share_json(factor_value)},
+                });
+            }
             product = multiply_secure_rational(product, factor_value, context);
+            if (context.factor_trace_shares) {
+                factor_trace_shares.push_back({
+                    {"stage", "prefix"},
+                    {"profile_section", profile_section},
+                    {"factor_index", bound.factor.factor_index},
+                    {"factor_kind", "FACTOR_PRODUCT_PREFIX"},
+                    {"model_id", bound.model_id},
+                    {"rational_share", secure_rational_share_json(product)},
+                });
+            }
         }
         if (factor_debug != nullptr && context.debug_internal_reveal) {
             json product_debug_doc = secure_rational_debug_json(product, context);
@@ -4780,6 +5017,7 @@ SecureBundleExecutionResult evaluate_secure_bundle_impl_secure(
         {"cardinality_factors", cardinality_factor_debug},
         {"aggregate_terms", term_debug},
     };
+    out.factor_trace_shares = factor_trace_shares;
     out.timing_profile = {
         {"query_skeleton_id", public_plan_doc.value("query_skeleton_id", std::string())},
         {"query_kind", query_kind},
@@ -4795,11 +5033,13 @@ void require_secure_bundle_cli_contract(const oc::CLP& cmd) {
         throw std::runtime_error("bspn_flat_eval secure mode requires --role in {0,1,2}.");
     }
     const bool batch_mode = cmd.isSet("batch_bundle_json");
+    const bool has_query_share_dir = cmd.isSet("query_share_payload_dir");
     if (!batch_mode && !cmd.isSet("public_plan_json")) {
         throw std::runtime_error("bspn_flat_eval secure mode requires --public_plan_json.");
     }
-    if (!batch_mode && !cmd.isSet("secret_payload_json")) {
-        throw std::runtime_error("bspn_flat_eval secure mode requires --secret_payload_json.");
+    if (!batch_mode && !has_query_share_dir && !cmd.isSet("secret_payload_json")) {
+        throw std::runtime_error(
+            "bspn_flat_eval secure mode requires --secret_payload_json or --query_share_payload_dir.");
     }
     if (!cmd.isSet("bspn_model_root")) {
         throw std::runtime_error("bspn_flat_eval secure mode requires --bspn_model_root.");
@@ -4825,6 +5065,9 @@ void init_secure_context_from_cmd(
     context.debug_reveal = cmd.isSet("debug_reveal");
     context.debug_internal_reveal =
         context.debug_reveal && !cmd.isSet("debug_reveal_final_only");
+    context.factor_trace_shares =
+        cmd.isSet("factor_trace_shares") ||
+        std::getenv("BSPN_FACTOR_TRACE_SHARES") != nullptr;
 
     bspn_basic_setup(static_cast<u64>(role), ios, enc, eval, runtime);
     context.io_service = &ios;
@@ -4839,6 +5082,10 @@ void collect_model_ids_from_factor_array(const json& factors, std::vector<std::s
     }
     for (const auto& factor_doc : factors) {
         if (!factor_doc.is_object()) {
+            continue;
+        }
+        if (factor_doc.value("public_feature_count", std::uint64_t(0)) == 0 &&
+            factor_doc.value("public_evidence_count", std::uint64_t(0)) == 0) {
             continue;
         }
         const std::string model_id = factor_doc.value("spn_model_id", std::string());
@@ -4931,6 +5178,10 @@ void FlatBSPNModel::load_public_manifest(const std::string& manifest_path) {
     }
     manifest_.secret_payload_dir = manifest_doc.value("secret_payload_dir", std::string("secret"));
     manifest_.secret_payload_encoding = manifest_doc.value("secret_payload_encoding", std::string());
+    manifest_.model_secret_share_payload_dir =
+        manifest_doc.value("model_secret_share_payload_dir", std::string("secret_shares/model"));
+    manifest_.model_secret_share_payload_layout =
+        manifest_doc.value("model_secret_share_payload_layout", std::string("pair_matrix_v1"));
     manifest_.secure_multiplier_materialized = manifest_doc.value("secure_multiplier_materialized", false);
     manifest_.secure_share_payload_dir = manifest_doc.value("secure_share_payload_dir", std::string("secret_shares"));
     manifest_.secure_share_payload_layout = manifest_doc.value("secure_share_payload_layout", std::string("consolidated_v1"));
@@ -5255,13 +5506,141 @@ void FlatBSPNModel::load_secret_payload(const FlatBSPNSecureContext& context) {
     if (!context.has_runtime()) {
         throw std::runtime_error("FlatBSPNSecureContext runtime is not initialized.");
     }
-    if (context.role == context.model_owner_party &&
-        secret_host_payload_.node_cardinalities.size() == 0 &&
-        !base_dir_.empty()) {
-        load_secret_payload();
+    const std::string model_share_root = join_path(
+        base_dir_,
+        manifest_.model_secret_share_payload_dir.empty()
+            ? std::string("secret_shares/model")
+            : manifest_.model_secret_share_payload_dir);
+    const std::string model_share_role_dir = join_path(model_share_root, "role_" + std::to_string(context.role));
+    bool loaded_from_model_share_dir = false;
+    if (manifest_.model_secret_share_payload_layout == "pair_matrix_v1" &&
+        !base_dir_.empty() &&
+        (path_exists(join_path(model_share_role_dir, "node_cardinalities.shares.bin")) ||
+         path_exists(join_path(model_share_role_dir, "manifest.json")))) {
+        const std::size_t node_count = static_cast<std::size_t>(manifest_.node_count);
+        const std::size_t column_count = manifest_.column_names.size();
+        const std::size_t bucket_count = static_cast<std::size_t>(manifest_.bucket_count);
+        const std::size_t total_rows = static_cast<std::size_t>(manifest_.total_rows);
+        const std::size_t leaf_row_value_rows =
+            manifest_.has_leaf_row_values
+                ? static_cast<std::size_t>(manifest_.leaf_row_value_node_ids.size()) *
+                    static_cast<std::size_t>(std::max<std::uint64_t>(1, manifest_.leaf_row_value_total_rows))
+                : 0;
+        auto load_fixed = [&](const std::string& name, std::size_t rows, std::size_t cols) {
+            return read_fixed_share_pair_matrix<kFlatBSPNDecimal>(join_path(model_share_role_dir, name), rows, cols);
+        };
+        auto load_int = [&](const std::string& name, std::size_t rows, std::size_t cols) {
+            return read_int_share_pair_matrix(join_path(model_share_role_dir, name), rows, cols);
+        };
+        secret_shared_payload_.node_cardinalities = load_fixed("node_cardinalities.shares.bin", node_count, 1);
+        secret_shared_payload_.node_inv_cardinalities = load_fixed("node_inv_cardinalities.shares.bin", node_count, 1);
+        secret_shared_payload_.node_scopes = load_int("node_scopes.shares.bin", node_count, column_count);
+        secret_shared_payload_.weights = load_fixed("weights.shares.bin", static_cast<std::size_t>(manifest_.weights_count), 1);
+        secret_shared_payload_.bucket_values = load_fixed("bucket_values.shares.bin", bucket_count, 1);
+        secret_shared_payload_.bucket_lowers = load_fixed("bucket_lowers.shares.bin", bucket_count, 1);
+        secret_shared_payload_.bucket_uppers = load_fixed("bucket_uppers.shares.bin", bucket_count, 1);
+        if (manifest_.has_row_weights) {
+            secret_shared_payload_.row_weights = load_fixed(
+                "row_weights.shares.bin",
+                static_cast<std::size_t>(manifest_.row_weight_count),
+                1);
+            secret_shared_payload_.row_weights_loaded = true;
+        } else {
+            secret_shared_payload_.row_weights = sf64Matrix<kFlatBSPNDecimal>(0, 1);
+            secret_shared_payload_.row_weights_loaded = false;
+        }
+        if (manifest_.has_leaf_bucket_weight_sums) {
+            secret_shared_payload_.leaf_bucket_weight_sums = load_fixed(
+                "leaf_bucket_weight_sums.shares.bin",
+                static_cast<std::size_t>(manifest_.leaf_bucket_weight_sum_count),
+                1);
+            secret_shared_payload_.leaf_bucket_weight_sums_loaded = true;
+        } else {
+            secret_shared_payload_.leaf_bucket_weight_sums = sf64Matrix<kFlatBSPNDecimal>(0, 1);
+            secret_shared_payload_.leaf_bucket_weight_sums_loaded = false;
+        }
+        if (manifest_.has_leaf_row_values) {
+            secret_shared_payload_.leaf_row_values = load_fixed("leaf_row_values.shares.bin", leaf_row_value_rows, 1);
+            secret_shared_payload_.leaf_row_value_offset_by_node.assign(node_count, -1);
+            for (std::size_t idx = 0; idx < manifest_.leaf_row_value_node_ids.size(); ++idx) {
+                const auto node_id = manifest_.leaf_row_value_node_ids[idx];
+                if (node_id < secret_shared_payload_.leaf_row_value_offset_by_node.size()) {
+                    secret_shared_payload_.leaf_row_value_offset_by_node[node_id] =
+                        static_cast<std::int64_t>(manifest_.leaf_row_value_offsets[idx]);
+                }
+            }
+            secret_shared_payload_.leaf_row_values_loaded = true;
+        } else {
+            secret_shared_payload_.leaf_row_values = sf64Matrix<kFlatBSPNDecimal>(0, 1);
+            secret_shared_payload_.leaf_row_value_offset_by_node.clear();
+            secret_shared_payload_.leaf_row_values_loaded = false;
+        }
+        secret_shared_payload_.leaf_bitmaps = si64Matrix(0, 0);
+        secret_shared_payload_.dense_bucket_bitmaps.clear();
+        secret_shared_payload_.dense_bucket_bitmaps.reserve(buckets_.size());
+        const u64 kMaxBitmapShareRowsPerChunk = bspn_bitmap_share_rows_per_chunk();
+        const u64 total_rows_u64 = static_cast<u64>(manifest_.total_rows);
+        const u64 buckets_per_chunk =
+            total_rows_u64 == 0
+                ? 1
+                : std::max<u64>(1, kMaxBitmapShareRowsPerChunk / std::max<u64>(1, total_rows_u64));
+        if (bucket_count > 0 && total_rows_u64 > 0) {
+            const std::string dense_bitmap_path = join_path(model_share_role_dir, "leaf_bitmaps.shares.bin");
+            const auto shared_flat_bitmaps = read_bool_share_pair_column_bitpacked(
+                dense_bitmap_path,
+                bucket_count * static_cast<std::size_t>(total_rows_u64));
+            for (std::size_t bucket_begin = 0; bucket_begin < buckets_.size(); bucket_begin += buckets_per_chunk) {
+                const std::size_t bucket_end = std::min<std::size_t>(
+                    buckets_.size(),
+                    bucket_begin + static_cast<std::size_t>(buckets_per_chunk));
+                const std::size_t chunk_bucket_count = bucket_end - bucket_begin;
+                sbMatrix shared_chunk(static_cast<u64>(chunk_bucket_count) * total_rows_u64, shared_flat_bitmaps.bitCount());
+                for (u64 row = 0; row < static_cast<u64>(chunk_bucket_count) * total_rows_u64; ++row) {
+                    const u64 source_row = static_cast<u64>(bucket_begin) * total_rows_u64 + row;
+                    for (u64 col = 0; col < static_cast<u64>(shared_flat_bitmaps.mShares[0].cols()); ++col) {
+                        shared_chunk.mShares[0](row, col) = shared_flat_bitmaps.mShares[0](source_row, col);
+                        shared_chunk.mShares[1](row, col) = shared_flat_bitmaps.mShares[1](source_row, col);
+                    }
+                }
+                std::vector<sbMatrix> chunk_bitmaps;
+                chunk_bitmaps.reserve(chunk_bucket_count);
+                for (std::size_t local_bucket_idx = 0; local_bucket_idx < chunk_bucket_count; ++local_bucket_idx) {
+                    chunk_bitmaps.emplace_back(total_rows_u64, shared_chunk.bitCount());
+                }
+                #pragma omp parallel for schedule(static)
+                for (std::int64_t local_bucket_idx_signed = 0; local_bucket_idx_signed < static_cast<std::int64_t>(chunk_bucket_count); ++local_bucket_idx_signed) {
+                    const auto local_bucket_idx = static_cast<std::size_t>(local_bucket_idx_signed);
+                    auto& shared_bitmap = chunk_bitmaps[local_bucket_idx];
+                    const u64 row_begin = static_cast<u64>(local_bucket_idx) * total_rows_u64;
+                    for (u64 row = 0; row < total_rows_u64; ++row) {
+                        for (u64 col = 0; col < static_cast<u64>(shared_chunk.mShares[0].cols()); ++col) {
+                            shared_bitmap.mShares[0](row, col) = shared_chunk.mShares[0](row_begin + row, col);
+                            shared_bitmap.mShares[1](row, col) = shared_chunk.mShares[1](row_begin + row, col);
+                        }
+                    }
+                }
+                for (auto& shared_bitmap : chunk_bitmaps) {
+                    secret_shared_payload_.dense_bucket_bitmaps.push_back(std::move(shared_bitmap));
+                }
+            }
+        }
+        secret_shared_payload_.dense_bucket_bitmaps_loaded = true;
+        loaded_from_model_share_dir = true;
     }
 
-    if (context.role != context.model_owner_party && secret_host_payload_.node_cardinalities.size() == 0) {
+    if (!loaded_from_model_share_dir) {
+        if (remote_share_only_required()) {
+            throw std::runtime_error(
+                "Remote ABY3 share-only mode requires model secret role shares; "
+                "plaintext model secret payload fallback is not allowed.");
+        }
+        if (context.role == context.model_owner_party &&
+            secret_host_payload_.node_cardinalities.size() == 0 &&
+            !base_dir_.empty()) {
+            load_secret_payload();
+        }
+
+        if (context.role != context.model_owner_party && secret_host_payload_.node_cardinalities.size() == 0) {
         secret_host_payload_.node_cardinalities = f64Matrix<kFlatBSPNDecimal>(manifest_.node_count, 1);
         secret_host_payload_.node_inv_cardinalities = f64Matrix<kFlatBSPNDecimal>(manifest_.node_count, 1);
         secret_host_payload_.node_scopes = i64Matrix(manifest_.node_count, manifest_.column_names.size());
@@ -5395,11 +5774,12 @@ void FlatBSPNModel::load_secret_payload(const FlatBSPNSecureContext& context) {
                 }
             }
         }
-        for (auto& shared_bitmap : chunk_bitmaps) {
-            secret_shared_payload_.dense_bucket_bitmaps.push_back(std::move(shared_bitmap));
-        }
+    for (auto& shared_bitmap : chunk_bitmaps) {
+        secret_shared_payload_.dense_bucket_bitmaps.push_back(std::move(shared_bitmap));
     }
-    secret_shared_payload_.dense_bucket_bitmaps_loaded = true;
+}
+secret_shared_payload_.dense_bucket_bitmaps_loaded = true;
+    }
 
     if (manifest_.secure_multiplier_materialized ||
         !manifest_.secure_multiplier_bucket_indices.empty()) {
@@ -5776,9 +6156,83 @@ FlatSecureQueryTensorPayload share_secure_query_tensor_payload(
     return tensors;
 }
 
+FlatSecureQueryTensorPayload load_secure_query_tensor_payload_shares(
+    const json& public_doc,
+    const std::string& query_share_payload_dir,
+    const FlatBSPNSecureContext& context) {
+    if (!context.has_runtime()) {
+        throw std::runtime_error("FlatBSPNSecureContext runtime is not initialized.");
+    }
+    if (query_share_payload_dir.empty()) {
+        throw std::runtime_error("query_share_payload_dir not set");
+    }
+
+    const FlatSecureQueryPayload shape_payload = empty_secure_query_payload_from_public_doc(public_doc);
+    FlatSecureQueryTensorPayload tensors = build_secure_query_tensor_payload(shape_payload);
+    const std::string role_dir = join_path(query_share_payload_dir, "role_" + std::to_string(context.role));
+    if (!path_exists(role_dir)) {
+        throw std::runtime_error("Could not open query share payload dir: " + role_dir);
+    }
+
+    const std::size_t factor_rows =
+        static_cast<std::size_t>(shape_payload.factor_count) *
+        static_cast<std::size_t>(shape_payload.max_factor_column_count);
+    tensors.lower_bounds_shared = read_fixed_share_pair_matrix<kFlatBSPNDecimal>(
+        join_path(role_dir, "lower_bounds.shares.bin"),
+        factor_rows,
+        static_cast<std::size_t>(shape_payload.max_interval_count));
+    tensors.upper_bounds_shared = read_fixed_share_pair_matrix<kFlatBSPNDecimal>(
+        join_path(role_dir, "upper_bounds.shares.bin"),
+        factor_rows,
+        static_cast<std::size_t>(shape_payload.max_interval_count));
+    tensors.has_lower_shared = read_int_share_pair_matrix(
+        join_path(role_dir, "has_lower.shares.bin"),
+        factor_rows,
+        static_cast<std::size_t>(shape_payload.max_interval_count));
+    tensors.has_upper_shared = read_int_share_pair_matrix(
+        join_path(role_dir, "has_upper.shares.bin"),
+        factor_rows,
+        static_cast<std::size_t>(shape_payload.max_interval_count));
+    tensors.open_lower_shared = read_int_share_pair_matrix(
+        join_path(role_dir, "open_lower.shares.bin"),
+        factor_rows,
+        static_cast<std::size_t>(shape_payload.max_interval_count));
+    tensors.open_upper_shared = read_int_share_pair_matrix(
+        join_path(role_dir, "open_upper.shares.bin"),
+        factor_rows,
+        static_cast<std::size_t>(shape_payload.max_interval_count));
+    tensors.has_evidence_shared = read_int_share_pair_matrix(
+        join_path(role_dir, "has_evidence.shares.bin"),
+        factor_rows,
+        1);
+    tensors.interval_counts_shared = read_int_share_pair_matrix(
+        join_path(role_dir, "interval_counts.shares.bin"),
+        factor_rows,
+        1);
+    tensors.feature_scope_shared = read_int_share_pair_matrix(
+        join_path(role_dir, "feature_scope.shares.bin"),
+        static_cast<std::size_t>(shape_payload.factor_count),
+        static_cast<std::size_t>(shape_payload.max_factor_column_count));
+    tensors.relevant_scope_shared = read_int_share_pair_matrix(
+        join_path(role_dir, "relevant_scope.shares.bin"),
+        static_cast<std::size_t>(shape_payload.factor_count),
+        static_cast<std::size_t>(shape_payload.max_factor_column_count));
+    tensors.feature_inverted_scope_shared = read_int_share_pair_matrix(
+        join_path(role_dir, "feature_inverted_scope.shares.bin"),
+        static_cast<std::size_t>(shape_payload.factor_count),
+        static_cast<std::size_t>(shape_payload.max_factor_column_count));
+    tensors.factor_column_counts_shared = read_int_share_pair_matrix(
+        join_path(role_dir, "factor_column_counts.shares.bin"),
+        static_cast<std::size_t>(shape_payload.factor_count),
+        1);
+    tensors.shared_loaded = true;
+    return tensors;
+}
+
 json evaluate_secure_bundle_paths(
     const std::string& public_plan_path,
     const std::string& secret_payload_path,
+    const std::string& query_share_payload_dir,
     const std::string& model_root,
     const std::map<std::string, std::string>& manifest_map,
     FlatBSPNSecureContext& secure_context,
@@ -5786,8 +6240,17 @@ json evaluate_secure_bundle_paths(
     if (public_plan_path.empty()) {
         throw std::runtime_error("public_plan_json not set");
     }
-    if (secret_payload_path.empty()) {
+    if (secret_payload_path.empty() && query_share_payload_dir.empty()) {
         throw std::runtime_error("secret_payload_json not set");
+    }
+    if (remote_share_only_required() && query_share_payload_dir.empty()) {
+        throw std::runtime_error(
+            "Remote ABY3 share-only mode requires query_share_payload_dir; "
+            "plaintext secret_payload_json is not allowed.");
+    }
+    if (remote_share_only_required() && !secret_payload_path.empty()) {
+        throw std::runtime_error(
+            "Remote ABY3 share-only mode forbids plaintext secret_payload_json.");
     }
 
     const auto path_total_start = std::chrono::steady_clock::now();
@@ -5802,24 +6265,35 @@ json evaluate_secure_bundle_paths(
     public_in >> public_doc;
     stage_timing_ms["public_plan_read"] = elapsed_ms_since(phase_start);
 
-    json secret_doc = json::object();
     FlatSecureQueryPayload secure_payload = empty_secure_query_payload_from_public_doc(public_doc);
-    if (secure_context.role == secure_context.query_owner_party) {
+    FlatSecureQueryTensorPayload shared_query_payload;
+    if (!query_share_payload_dir.empty()) {
         phase_start = std::chrono::steady_clock::now();
-        std::ifstream secret_in(secret_payload_path);
-        if (!secret_in.is_open()) {
-            throw std::runtime_error("Could not open secret payload json: " + secret_payload_path);
-        }
-        secret_in >> secret_doc;
-        secure_payload = parse_secure_query_payload_doc(secret_doc);
-        stage_timing_ms["secret_payload_read"] = elapsed_ms_since(phase_start);
-    } else {
+        shared_query_payload = load_secure_query_tensor_payload_shares(
+            public_doc,
+            query_share_payload_dir,
+            secure_context);
         stage_timing_ms["secret_payload_read"] = 0.0;
-    }
+        stage_timing_ms["query_payload_share"] = elapsed_ms_since(phase_start);
+    } else {
+        json secret_doc = json::object();
+        if (secure_context.role == secure_context.query_owner_party) {
+            phase_start = std::chrono::steady_clock::now();
+            std::ifstream secret_in(secret_payload_path);
+            if (!secret_in.is_open()) {
+                throw std::runtime_error("Could not open secret payload json: " + secret_payload_path);
+            }
+            secret_in >> secret_doc;
+            secure_payload = parse_secure_query_payload_doc(secret_doc);
+            stage_timing_ms["secret_payload_read"] = elapsed_ms_since(phase_start);
+        } else {
+            stage_timing_ms["secret_payload_read"] = 0.0;
+        }
 
-    phase_start = std::chrono::steady_clock::now();
-    auto shared_query_payload = share_secure_query_tensor_payload(secure_payload, secure_context);
-    stage_timing_ms["query_payload_share"] = elapsed_ms_since(phase_start);
+        phase_start = std::chrono::steady_clock::now();
+        shared_query_payload = share_secure_query_tensor_payload(secure_payload, secure_context);
+        stage_timing_ms["query_payload_share"] = elapsed_ms_since(phase_start);
+    }
 
     phase_start = std::chrono::steady_clock::now();
     std::uint64_t model_cache_hits = 0;
@@ -5856,6 +6330,15 @@ json evaluate_secure_bundle_paths(
         secure_context,
         preloaded_model_cache);
     SecureFixedScalarShare secure_result_scalar;
+    if (secure_context.factor_trace_shares && secure_eval.has_result) {
+        secure_eval.factor_trace_shares.push_back({
+            {"stage", "root_input"},
+            {"profile_section", "root"},
+            {"factor_index", -1},
+            {"factor_kind", "ROOT_RATIONAL"},
+            {"rational_share", secure_rational_share_json(secure_eval.result_rational)},
+        });
+    }
     if (secure_eval.has_result) {
         phase_start = std::chrono::steady_clock::now();
         secure_result_scalar = secure_divide_rational_to_fixed_scalar(
@@ -5864,6 +6347,17 @@ json evaluate_secure_bundle_paths(
             secure_eval.root_division_payload_scale,
             secure_eval.root_division_scale_denominator_payload);
         stage_timing_ms["root_division"] = elapsed_ms_since(phase_start);
+        if (secure_context.factor_trace_shares) {
+            secure_eval.factor_trace_shares.push_back({
+                {"stage", "final_scalar"},
+                {"profile_section", "root"},
+                {"factor_index", -1},
+                {"factor_kind", "FINAL_SCALAR"},
+                {"scalar_share", secure_fixed_scalar_share_json(secure_result_scalar)},
+                {"root_division_payload_scale", secure_eval.root_division_payload_scale},
+                {"root_division_scale_denominator_payload", secure_eval.root_division_scale_denominator_payload},
+            });
+        }
     } else {
         stage_timing_ms["root_division"] = 0.0;
     }
@@ -5905,6 +6399,9 @@ json evaluate_secure_bundle_paths(
     }
     if (secure_context.debug_internal_reveal) {
         out["debug"] = secure_eval.debug_output;
+    }
+    if (secure_context.factor_trace_shares) {
+        out["factor_trace_shares"] = secure_eval.factor_trace_shares;
     }
     stage_timing_ms["secure_core"] = secure_core_wall_time_ms;
     stage_timing_ms["final_reveal"] = final_reveal_wall_time_ms;
@@ -5951,11 +6448,13 @@ std::string resolve_bundle_path(const std::string& base_dir, const json& doc, co
 void BSPN_flat_eval(const oc::CLP& cmd) {
     const std::string public_plan_path = cmd.getOr<std::string>("public_plan_json", "");
     const std::string secret_payload_path = cmd.getOr<std::string>("secret_payload_json", "");
+    const std::string query_share_payload_dir = cmd.getOr<std::string>("query_share_payload_dir", "");
     const std::string batch_bundle_path = cmd.getOr<std::string>("batch_bundle_json", "");
-    if (batch_bundle_path.empty() && (public_plan_path.empty() || secret_payload_path.empty())) {
+    if (batch_bundle_path.empty() &&
+        (public_plan_path.empty() || (secret_payload_path.empty() && query_share_payload_dir.empty()))) {
         throw std::runtime_error(
             "bspn_flat_eval now supports the secure bundle contract: "
-            "--role, --public_plan_json, --secret_payload_json, and --bspn_model_root; "
+            "--role, --public_plan_json, --query_share_payload_dir or --secret_payload_json, and --bspn_model_root; "
             "or --role, --batch_bundle_json, and --bspn_model_root.");
     }
     BSPN_secure_bundle_eval(cmd);
@@ -5996,11 +6495,26 @@ void BSPN_secure_bundle_eval(const oc::CLP& cmd) {
         json batch_results = json::array();
         std::size_t batch_index = 0;
         for (const auto& entry : entries) {
+            if (remote_share_only_required() && entry.contains("secret_payload_json")) {
+                throw std::runtime_error(
+                    "Remote ABY3 share-only mode forbids batch secret_payload_json entries.");
+            }
             const std::string entry_public_plan = resolve_bundle_path(batch_base_dir, entry, "public_plan_json");
-            const std::string entry_secret_payload = resolve_bundle_path(batch_base_dir, entry, "secret_payload_json");
+            const std::string entry_secret_payload = entry.contains("secret_payload_json")
+                ? resolve_bundle_path(batch_base_dir, entry, "secret_payload_json")
+                : std::string();
+            const std::string entry_query_share_payload_dir = entry.value("query_share_payload_dir", std::string());
+            if (remote_share_only_required() && entry_query_share_payload_dir.empty()) {
+                throw std::runtime_error(
+                    "Remote ABY3 share-only mode requires batch query_share_payload_dir entries.");
+            }
+            const std::string entry_query_share_payload_dir_resolved = entry_query_share_payload_dir.empty()
+                ? std::string()
+                : join_path(batch_base_dir, entry_query_share_payload_dir);
             auto result = evaluate_secure_bundle_paths(
                 entry_public_plan,
                 entry_secret_payload,
+                entry_query_share_payload_dir_resolved,
                 model_root,
                 manifest_map,
                 secure_context,
@@ -6028,9 +6542,11 @@ void BSPN_secure_bundle_eval(const oc::CLP& cmd) {
 
     const std::string public_plan_path = cmd.getOr<std::string>("public_plan_json", "");
     const std::string secret_payload_path = cmd.getOr<std::string>("secret_payload_json", "");
+    const std::string query_share_payload_dir = cmd.getOr<std::string>("query_share_payload_dir", "");
     auto out = evaluate_secure_bundle_paths(
         public_plan_path,
         secret_payload_path,
+        query_share_payload_dir,
         model_root,
         manifest_map,
         secure_context,

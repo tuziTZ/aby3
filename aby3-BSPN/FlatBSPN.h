@@ -81,6 +81,8 @@ struct FlatBSPNManifest {
     std::string bucket_padding_scope = "global";
     std::string secret_payload_dir = "secret";
     std::string secret_payload_encoding;
+    std::string model_secret_share_payload_dir = "secret_shares/model";
+    std::string model_secret_share_payload_layout = "pair_matrix_v1";
     bool secure_multiplier_materialized = false;
     std::string secure_share_payload_dir = "secret_shares";
     std::string secure_share_payload_layout = "consolidated_v1";
@@ -134,6 +136,7 @@ struct FlatBSPNSecureContext {
     int query_owner_party = 0;
     bool debug_reveal = false;
     bool debug_internal_reveal = false;
+    bool factor_trace_shares = false;
     oc::IOService* io_service = nullptr;
     Sh3Encryptor* enc = nullptr;
     Sh3Evaluator* eval = nullptr;
