@@ -126,6 +126,7 @@ struct FlatFactorSpec {
     std::uint64_t public_evidence_count = 0;
     std::uint64_t total_rows = 0;
     bool weighted_count_direct = false;
+    bool requires_model_eval = false;
 };
 
 inline constexpr Decimal kFlatBSPNDecimal = D16;

@@ -2898,6 +2898,7 @@ SecureBoundFactor bind_secure_factor_from_secure_bundle(
     bound.factor.public_feature_count = factor_doc.value("public_feature_count", std::uint64_t(0));
     bound.factor.public_evidence_count = factor_doc.value("public_evidence_count", std::uint64_t(0));
     bound.factor.weighted_count_direct = factor_doc.value("weighted_count_direct", false);
+    bound.factor.requires_model_eval = factor_doc.value("requires_model_eval", false);
 
     if (bound.factor.factor_kind == "CONSTANT") {
         return bound;
@@ -2905,7 +2906,8 @@ SecureBoundFactor bind_secure_factor_from_secure_bundle(
     if ((bound.factor.factor_kind == "INDICATOR_EXPECTATION" ||
          bound.factor.factor_kind == "EXPECTATION") &&
         bound.factor.public_feature_count == 0 &&
-        bound.factor.public_evidence_count == 0) {
+        bound.factor.public_evidence_count == 0 &&
+        !bound.factor.requires_model_eval) {
         bound.model_id = factor_doc.value("spn_model_id", std::string());
         return bound;
     }
@@ -3635,6 +3637,9 @@ std::vector<SecureRationalShare> evaluate_leaf_product_batch_values(
         static_cast<std::size_t>(factor.factor.public_evidence_count);
     const bool needs_evidence_filter = public_factor_evidence_count != 0;
     const bool needs_target_numerator = public_factor_feature_count != 0;
+    const bool needs_leaf_domain_filter =
+        needs_evidence_filter ||
+        (factor.factor.requires_model_eval && !needs_target_numerator);
     const bool public_single_target_factor = public_factor_feature_count <= 1;
     const std::size_t max_columns = static_cast<std::size_t>(secret_feature_scope.cols());
 
@@ -3668,24 +3673,34 @@ std::vector<SecureRationalShare> evaluate_leaf_product_batch_values(
     weighted_final_cnt_rows[0].setZero();
     weighted_final_cnt_rows[1].setZero();
     const bool use_row_weights_for_rows = model.secret_shared_payload().row_weights_loaded;
-    if (needs_evidence_filter) {
+    if (needs_leaf_domain_filter) {
         auto phase_start = SteadyClock::now();
-        auto match_masks = compute_leaf_match_masks_for_evidence(
-            model,
-            shared_query_payload,
-            secret_factor_row,
-            max_columns,
-            leaf_children,
-            context,
-            eval_stats,
-            evidence_domain_miss_out);
-        if (eval_stats != nullptr) {
-            eval_stats->phase1_match_ms += elapsed_ms_since(phase_start);
+        std::vector<sbMatrix> match_masks;
+        if (needs_evidence_filter) {
+            match_masks = compute_leaf_match_masks_for_evidence(
+                model,
+                shared_query_payload,
+                secret_factor_row,
+                max_columns,
+                leaf_children,
+                context,
+                eval_stats,
+                evidence_domain_miss_out);
+            if (eval_stats != nullptr) {
+                eval_stats->phase1_match_ms += elapsed_ms_since(phase_start);
+            }
+        } else {
+            match_masks.reserve(leaf_children.size());
+            const auto all_buckets_match = shared_true_bool_scalar(context);
+            for (const auto* child : leaf_children) {
+                match_masks.push_back(repeat_bool_scalar_rows(all_buckets_match, child->bucket_count));
+            }
         }
 
         bool can_use_bucket_weight_sums =
             use_row_weights_for_rows &&
             !needs_target_numerator &&
+            factor.factor.weighted_count_direct &&
             model.secret_shared_payload().leaf_bucket_weight_sums_loaded;
         if (can_use_bucket_weight_sums) {
             for (const auto& item : product_items) {
@@ -3762,6 +3777,17 @@ std::vector<SecureRationalShare> evaluate_leaf_product_batch_values(
             (void)product_idx;
             final_ids_by_product.push_back(global_rows_shared);
         }
+        if (use_row_weights_for_rows) {
+            const auto phase_start = SteadyClock::now();
+            weighted_final_cnt_rows = sum_boolean_masks_weighted_to_fixed_batched(
+                final_ids_by_product,
+                model.secret_shared_payload().row_weights,
+                context,
+                eval_stats != nullptr ? &eval_stats->phase2_count_batches : nullptr);
+            if (eval_stats != nullptr) {
+                eval_stats->phase2_count_ms += elapsed_ms_since(phase_start);
+            }
+        }
     }
 
     std::vector<sf64Matrix<kFlatBSPNDecimal>> target_numerator_sums;
@@ -3835,7 +3861,7 @@ std::vector<SecureRationalShare> evaluate_leaf_product_batch_values(
         *(context.eval),
         *(context.runtime));
     sf64Matrix<kFlatBSPNDecimal> effective_cnt_rows = node_cardinality_rows;
-    if (needs_evidence_filter) {
+    if (needs_leaf_domain_filter) {
         auto final_cnt_for_full_match = final_cnt_int_rows;
         si64Matrix total_rows_int_rows(static_cast<u64>(product_items.size()), 1);
         for (u64 row = 0; row < static_cast<u64>(product_items.size()); ++row) {
@@ -3857,6 +3883,8 @@ std::vector<SecureRationalShare> evaluate_leaf_product_batch_values(
             final_cnt_fixed_rows,
             full_match_rows,
             context);
+    } else if (use_row_weights_for_rows) {
+        effective_cnt_rows = weighted_final_cnt_rows;
     }
     if (context.debug_internal_reveal && std::getenv("BSPN_DEBUG_LEAF_PRODUCT_COUNTS") != nullptr) {
         i64Matrix final_cnt_plain(final_cnt_int_rows.rows(), final_cnt_int_rows.cols());
@@ -3896,7 +3924,7 @@ std::vector<SecureRationalShare> evaluate_leaf_product_batch_values(
     sf64Matrix<kFlatBSPNDecimal> selectivity_num_nonzero_rows = selectivity_num_rows;
     sbMatrix product_zero_rows(product_count, 1);
     bool_init_false(context.role, product_zero_rows);
-    if (needs_evidence_filter) {
+    if (needs_leaf_domain_filter) {
         sbMatrix has_positive_count_rows;
         if (use_row_weights_for_rows) {
             auto final_cnt_for_positive = weighted_final_cnt_rows;
@@ -3940,7 +3968,7 @@ std::vector<SecureRationalShare> evaluate_leaf_product_batch_values(
         selectivity_num_nonzero_rows,
         has_nonempty_node_rows,
         context);
-    if (needs_evidence_filter) {
+    if (needs_leaf_domain_filter) {
         sbMatrix updated_product_zero_rows(product_zero_rows.rows(), product_zero_rows.bitCount());
         bool_cipher_or(
             context.role,
@@ -3985,7 +4013,7 @@ std::vector<SecureRationalShare> evaluate_leaf_product_batch_values(
                 1.0,
                 true,
             };
-            if (needs_evidence_filter) {
+            if (needs_leaf_domain_filter) {
                 value.has_secret_zero_numerator = true;
                 value.secret_zero_numerator = bool_row_slice(
                     product_zero_rows,
@@ -4055,7 +4083,8 @@ std::vector<SecureRationalShare> evaluate_leaf_product_batch_values(
         }
     };
 
-    if (public_factor_feature_count == 0 && public_factor_evidence_count != 0) {
+    if (public_factor_feature_count == 0 &&
+        (public_factor_evidence_count != 0 || factor.factor.requires_model_eval)) {
         push_count_selectivity_rows_as_rationals();
     } else if (public_single_target_factor) {
         const auto target_sum_rows = stack_fixed_scalars(target_numerator_sums);
@@ -4259,7 +4288,9 @@ SecureRationalShare evaluate_indicator_oblivious_secure(
     // numerator and denominator by the same public value preserves the value
     // while reducing fixed-point overflow risk when rational denominators are
     // multiplied higher in the SPN.
-    if (public_factor_feature_count == 0 && public_factor_evidence_count == 0) {
+    if (public_factor_feature_count == 0 &&
+        public_factor_evidence_count == 0 &&
+        !factor.factor.requires_model_eval) {
         return one;
     }
 
@@ -4689,7 +4720,8 @@ SecureBundleExecutionResult evaluate_secure_bundle_impl_secure(
 	            } else if (bound.factor.factor_kind == "INDICATOR_EXPECTATION" ||
 	                       bound.factor.factor_kind == "EXPECTATION") {
                 if (bound.factor.public_feature_count == 0 &&
-                    bound.factor.public_evidence_count == 0) {
+                    bound.factor.public_evidence_count == 0 &&
+                    !bound.factor.requires_model_eval) {
                     factor_value = make_secure_rational(1.0, 1.0, context);
                     exact_unit_factor = true;
                 } else {
@@ -5085,7 +5117,8 @@ void collect_model_ids_from_factor_array(const json& factors, std::vector<std::s
             continue;
         }
         if (factor_doc.value("public_feature_count", std::uint64_t(0)) == 0 &&
-            factor_doc.value("public_evidence_count", std::uint64_t(0)) == 0) {
+            factor_doc.value("public_evidence_count", std::uint64_t(0)) == 0 &&
+            !factor_doc.value("requires_model_eval", false)) {
             continue;
         }
         const std::string model_id = factor_doc.value("spn_model_id", std::string());
