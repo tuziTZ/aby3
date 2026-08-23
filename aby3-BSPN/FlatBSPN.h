@@ -96,6 +96,8 @@ struct FlatBSPNManifest {
     bool has_row_weights = false;
     std::uint64_t row_weight_count = 0;
     std::string row_weight_encoding;
+    bool has_node_row_weight_flags = false;
+    std::uint64_t node_row_weight_flag_count = 0;
     bool has_leaf_bucket_weight_sums = false;
     std::uint64_t leaf_bucket_weight_sum_count = 0;
     std::string leaf_bucket_weight_sum_encoding;
@@ -138,6 +140,7 @@ struct FlatBSPNSecureContext {
     bool debug_reveal = false;
     bool debug_internal_reveal = false;
     bool factor_trace_shares = false;
+    bool leaf_product_trace_shares = false;
     oc::IOService* io_service = nullptr;
     Sh3Encryptor* enc = nullptr;
     Sh3Evaluator* eval = nullptr;
@@ -171,6 +174,8 @@ struct FlatBSPNSecretSharedPayload {
     sf64Matrix<kFlatBSPNDecimal> leaf_row_values;
     sf64Matrix<kFlatBSPNDecimal> row_weights;
     bool row_weights_loaded = false;
+    si64Matrix node_row_weight_flags;
+    bool node_row_weight_flags_loaded = false;
     sf64Matrix<kFlatBSPNDecimal> leaf_bucket_weight_sums;
     bool leaf_bucket_weight_sums_loaded = false;
     std::vector<std::int64_t> leaf_row_value_offset_by_node;
