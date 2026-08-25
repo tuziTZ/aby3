@@ -141,6 +141,8 @@ struct FlatBSPNSecureContext {
     bool debug_internal_reveal = false;
     bool factor_trace_shares = false;
     bool leaf_product_trace_shares = false;
+    bool sum_node_trace_shares = false;
+    bool product_sum_trace_shares = false;
     oc::IOService* io_service = nullptr;
     Sh3Encryptor* enc = nullptr;
     Sh3Evaluator* eval = nullptr;

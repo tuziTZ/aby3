@@ -660,6 +660,8 @@ struct SecureIndicatorEvalStats {
     double phase3_numerator_ms = 0.0;
     double final_combine_ms = 0.0;
     json leaf_product_trace_shares = json::array();
+    json sum_node_trace_shares = json::array();
+    json product_sum_trace_shares = json::array();
 };
 
 json secure_indicator_stats_json(const SecureIndicatorEvalStats& stats) {
@@ -688,6 +690,12 @@ json secure_indicator_stats_json(const SecureIndicatorEvalStats& stats) {
     };
     if (!stats.leaf_product_trace_shares.empty()) {
         out["leaf_product_trace_shares"] = stats.leaf_product_trace_shares;
+    }
+    if (!stats.sum_node_trace_shares.empty()) {
+        out["sum_node_trace_shares"] = stats.sum_node_trace_shares;
+    }
+    if (!stats.product_sum_trace_shares.empty()) {
+        out["product_sum_trace_shares"] = stats.product_sum_trace_shares;
     }
     return out;
 }
@@ -1666,7 +1674,10 @@ SecureFixedScalarShare secure_divide_rational_to_fixed_scalar(
             context);
         scaled_value.numerator_scale = value.numerator_scale / numerator_payload_scale;
         if (scale_denominator_payload) {
-            const double denominator_payload_scale = std::max(payload_scale, 1.0 / 128.0);
+            const double denominator_payload_scale =
+                std::abs(value.denominator_scale) > 1.0
+                    ? payload_scale
+                    : std::max(payload_scale, 1.0 / 128.0);
             scaled_value.denominator = secure_mul_public_fixed(
                 value.denominator,
                 denominator_payload_scale,
@@ -3079,10 +3090,30 @@ bool aggregate_term_has_large_public_scale(const json& term_doc) {
 SecureRationalShare weighted_sum_secure_rational(
     const std::vector<SecureRationalShare>& values,
     const std::vector<sf64Matrix<kFlatBSPNDecimal>>& weights,
-    const FlatBSPNSecureContext& context) {
+    const FlatBSPNSecureContext& context,
+    json* sum_node_trace_shares = nullptr,
+    int factor_index = -1,
+    std::uint32_t node_idx = 0,
+    const std::vector<std::uint32_t>* child_node_ids = nullptr) {
     if (values.empty()) {
         return make_secure_rational(0.0, 1.0, context);
     }
+    const bool trace_sum_node =
+        sum_node_trace_shares != nullptr &&
+        (std::getenv("BSPN_SUM_NODE_TRACE_FACTOR") == nullptr ||
+         std::atoi(std::getenv("BSPN_SUM_NODE_TRACE_FACTOR")) == factor_index);
+    const std::uint64_t trace_limit =
+        trace_sum_node
+            ? parse_bspn_u64_env("BSPN_SUM_NODE_TRACE_LIMIT", std::uint64_t(1) << 20)
+            : 0;
+    const auto push_sum_trace = [&](json item) {
+        if (!trace_sum_node || sum_node_trace_shares->size() >= trace_limit) {
+            return;
+        }
+        item["factor_index"] = factor_index;
+        item["sum_node_id"] = static_cast<std::uint64_t>(node_idx);
+        sum_node_trace_shares->push_back(std::move(item));
+    };
     const bool all_unit_denominators = std::all_of(
         values.begin(),
         values.end(),
@@ -3098,12 +3129,34 @@ SecureRationalShare weighted_sum_secure_rational(
                 values[idx].numerator,
                 kWeightedSumTermUpscale,
                 context);
-            terms[idx] = secure_mul_fixed(scaled_numerator, weights[idx], context);
+            auto weighted_term = secure_mul_fixed(scaled_numerator, weights[idx], context);
+            terms[idx] = weighted_term;
             const auto value_zero = rational_zero_numerator_flag(values[idx], context);
             terms[idx] = fixed_mul_bool_same_shape(
                 terms[idx],
                 bool_not_scalar(value_zero, context),
                 context);
+            if (trace_sum_node) {
+                json item = {
+                    {"stage", "sum_child"},
+                    {"branch", "all_unit_denominator"},
+                    {"child_offset", static_cast<std::uint64_t>(idx)},
+                    {"child_node_id", child_node_ids != nullptr && idx < child_node_ids->size()
+                        ? static_cast<std::uint64_t>((*child_node_ids)[idx])
+                        : std::uint64_t(0)},
+                    {"numerator_share", fixed_scalar_share_json(values[idx].numerator)},
+                    {"numerator_scale", values[idx].numerator_scale},
+                    {"denominator_share", fixed_scalar_share_json(values[idx].denominator)},
+                    {"denominator_scale", values[idx].denominator_scale},
+                    {"weight_share", fixed_scalar_share_json(weights[idx])},
+                    {"scaled_numerator_share", fixed_scalar_share_json(scaled_numerator)},
+                    {"weighted_term_unmasked_share", fixed_scalar_share_json(weighted_term)},
+                    {"weighted_term_share", fixed_scalar_share_json(terms[idx])},
+                    {"zero_numerator_share", bool_scalar_share_json(value_zero)},
+                    {"fixed_decimal_bits", static_cast<int>(kFlatBSPNDecimal)},
+                };
+                push_sum_trace(std::move(item));
+            }
             all_zero = bool_and_scalar(all_zero, value_zero, context);
             term_scales[idx] = values[idx].numerator_scale;
             numerator_scale = std::max(numerator_scale, term_scales[idx]);
@@ -3119,6 +3172,23 @@ SecureRationalShare weighted_sum_secure_rational(
             numerator_sum,
             1.0 / kWeightedSumTermUpscale,
             context);
+        numerator_sum = fixed_mul_bool_same_shape(
+            numerator_sum,
+            bool_not_scalar(all_zero, context),
+            context);
+        if (trace_sum_node) {
+            push_sum_trace({
+                {"stage", "sum_output"},
+                {"branch", "all_unit_denominator"},
+                {"child_count", static_cast<std::uint64_t>(values.size())},
+                {"numerator_sum_share", fixed_scalar_share_json(numerator_sum)},
+                {"denominator_share", fixed_scalar_share_json(share_fixed_scalar<kFlatBSPNDecimal>(1.0, 0, context))},
+                {"numerator_scale", numerator_scale},
+                {"denominator_scale", 1.0},
+                {"all_zero_share", bool_scalar_share_json(all_zero)},
+                {"fixed_decimal_bits", static_cast<int>(kFlatBSPNDecimal)},
+            });
+        }
         auto out = normalize_secure_rational_scales({
             numerator_sum,
             share_fixed_scalar<kFlatBSPNDecimal>(1.0, 0, context),
@@ -3141,12 +3211,34 @@ SecureRationalShare weighted_sum_secure_rational(
 	            any_non_unit,
 	            rational_non_unit_denominator_flag(values[idx], context),
 	            context);
-	        scalar_terms[idx] = secure_mul_fixed(values[idx].numerator, weights[idx], context);
+	        auto scalar_term_unmasked = secure_mul_fixed(values[idx].numerator, weights[idx], context);
+	        scalar_terms[idx] = scalar_term_unmasked;
 	        const auto value_zero = rational_zero_numerator_flag(values[idx], context);
 	        scalar_terms[idx] = fixed_mul_bool_same_shape(
 	            scalar_terms[idx],
 	            bool_not_scalar(value_zero, context),
 	            context);
+	        if (trace_sum_node) {
+	            json item = {
+	                {"stage", "sum_child"},
+	                {"branch", "mixed_denominator"},
+	                {"child_offset", static_cast<std::uint64_t>(idx)},
+	                {"child_node_id", child_node_ids != nullptr && idx < child_node_ids->size()
+	                    ? static_cast<std::uint64_t>((*child_node_ids)[idx])
+	                    : std::uint64_t(0)},
+	                {"numerator_share", fixed_scalar_share_json(values[idx].numerator)},
+	                {"numerator_scale", values[idx].numerator_scale},
+	                {"denominator_share", fixed_scalar_share_json(values[idx].denominator)},
+	                {"denominator_scale", values[idx].denominator_scale},
+	                {"weight_share", fixed_scalar_share_json(weights[idx])},
+	                {"scalar_term_unmasked_share", fixed_scalar_share_json(scalar_term_unmasked)},
+	                {"scalar_term_share", fixed_scalar_share_json(scalar_terms[idx])},
+	                {"zero_numerator_share", bool_scalar_share_json(value_zero)},
+	                {"non_unit_denominator_share", bool_scalar_share_json(rational_non_unit_denominator_flag(values[idx], context))},
+	                {"fixed_decimal_bits", static_cast<int>(kFlatBSPNDecimal)},
+	            };
+	            push_sum_trace(std::move(item));
+	        }
 	        all_zero = bool_and_scalar(all_zero, value_zero, context);
 	        scalar_term_scales[idx] = values[idx].numerator_scale;
 	        scalar_numerator_scale = std::max(scalar_numerator_scale, scalar_term_scales[idx]);
@@ -3158,6 +3250,10 @@ SecureRationalShare weighted_sum_secure_rational(
 	            scalar_term_scales[idx] / scalar_numerator_scale,
 	            context);
 	    }
+	    scalar_numerator_sum = fixed_mul_bool_same_shape(
+	        scalar_numerator_sum,
+	        bool_not_scalar(all_zero, context),
+	        context);
 	    const SecureRationalShare scalar_total{
 	        scalar_numerator_sum,
 	        share_fixed_scalar<kFlatBSPNDecimal>(1.0, 0, context),
@@ -3165,6 +3261,18 @@ SecureRationalShare weighted_sum_secure_rational(
 	        1.0,
 	        true,
 	    };
+	    if (trace_sum_node) {
+	        push_sum_trace({
+	            {"stage", "sum_output"},
+	            {"branch", "mixed_denominator"},
+	            {"child_count", static_cast<std::uint64_t>(values.size())},
+	            {"scalar_numerator_sum_share", fixed_scalar_share_json(scalar_numerator_sum)},
+	            {"scalar_numerator_scale", scalar_numerator_scale},
+	            {"all_zero_share", bool_scalar_share_json(all_zero)},
+	            {"any_non_unit_share", bool_scalar_share_json(any_non_unit)},
+	            {"fixed_decimal_bits", static_cast<int>(kFlatBSPNDecimal)},
+	        });
+	    }
 	    auto total = make_secure_rational(0.0, 1.0, context);
 	    for (std::size_t idx = 0; idx < values.size(); ++idx) {
 	        SecureRationalShare term{
@@ -4230,12 +4338,34 @@ std::vector<SecureRationalShare> evaluate_leaf_product_batch_values(
         selectivity_num_nonzero_rows,
         has_nonempty_node_rows,
         context);
+    auto selectivity_num_for_zero_cmp = selectivity_num_nonzero_rows;
+    auto zero_for_selectivity_cmp = zero_product_rows;
+    sbMatrix selectivity_num_zero_rows;
+    cipher_eq(
+        context.role,
+        selectivity_num_for_zero_cmp,
+        zero_for_selectivity_cmp,
+        selectivity_num_zero_rows,
+        *(context.eval),
+        *(context.runtime));
     if (needs_leaf_domain_filter) {
         sbMatrix updated_product_zero_rows(product_zero_rows.rows(), product_zero_rows.bitCount());
         bool_cipher_or(
             context.role,
             product_zero_rows,
             is_empty_rows,
+            updated_product_zero_rows,
+            *(context.enc),
+            *(context.eval),
+            *(context.runtime));
+        product_zero_rows = std::move(updated_product_zero_rows);
+    }
+    {
+        sbMatrix updated_product_zero_rows(product_zero_rows.rows(), product_zero_rows.bitCount());
+        bool_cipher_or(
+            context.role,
+            product_zero_rows,
+            selectivity_num_zero_rows,
             updated_product_zero_rows,
             *(context.enc),
             *(context.eval),
@@ -4464,7 +4594,19 @@ std::vector<SecureRationalShare> evaluate_leaf_product_batch_values(
             }
             scalar_product_rows = secure_mul_fixed_same_shape(scalar_product_rows, component_rows, context);
         }
-        const auto final_rows = secure_mul_fixed_same_shape(selectivity_num_nonzero_rows, scalar_product_rows, context);
+        auto final_rows = secure_mul_fixed_same_shape(selectivity_num_nonzero_rows, scalar_product_rows, context);
+        sbMatrix selectivity_num_nonzero_mask(
+            selectivity_num_zero_rows.rows(),
+            selectivity_num_zero_rows.bitCount());
+        auto selectivity_num_zero_rows_copy = selectivity_num_zero_rows;
+        bool_cipher_not(
+            context.role,
+            selectivity_num_zero_rows_copy,
+            selectivity_num_nonzero_mask);
+        final_rows = fixed_mul_bool_same_shape(
+            final_rows,
+            selectivity_num_nonzero_mask,
+            context);
         if (trace_leaf_products) {
             const std::uint64_t trace_product_limit =
                 parse_bspn_u64_env("BSPN_LEAF_PRODUCT_TRACE_PRODUCT_LIMIT", std::uint64_t(1) << 20);
@@ -4754,7 +4896,25 @@ SecureRationalShare evaluate_indicator_oblivious_secure(
                 child_values.push_back(node_values[child_id]);
                 child_weights.push_back(fixed_row_slice(model.secret_shared_payload().weights, node.weight_begin + offset, 1));
             }
-            node_values[node_idx] = weighted_sum_secure_rational(child_values, child_weights, context);
+            std::vector<std::uint32_t> sum_child_node_ids;
+            if (context.sum_node_trace_shares && eval_stats != nullptr) {
+                sum_child_node_ids.reserve(node.child_count);
+                for (std::uint32_t offset = 0; offset < node.child_count; ++offset) {
+                    sum_child_node_ids.push_back(child_ids[node.child_begin + offset]);
+                }
+            }
+            node_values[node_idx] = weighted_sum_secure_rational(
+                child_values,
+                child_weights,
+                context,
+                context.sum_node_trace_shares && eval_stats != nullptr
+                    ? &eval_stats->sum_node_trace_shares
+                    : nullptr,
+                factor.factor.factor_index,
+                static_cast<std::uint32_t>(node_idx),
+                context.sum_node_trace_shares && eval_stats != nullptr
+                    ? &sum_child_node_ids
+                    : nullptr);
             if (eval_stats != nullptr) {
                 eval_stats->sum_node_ms += elapsed_ms_since(phase_start);
             }
@@ -4786,6 +4946,35 @@ SecureRationalShare evaluate_indicator_oblivious_secure(
             for (std::uint32_t offset = 0; offset < node.child_count; ++offset) {
                 product_child_node_ids.push_back(child_ids[node.child_begin + offset]);
             }
+            const bool trace_product_sum =
+                context.product_sum_trace_shares &&
+                eval_stats != nullptr &&
+                (std::getenv("BSPN_PRODUCT_SUM_TRACE_FACTOR") == nullptr ||
+                 std::atoi(std::getenv("BSPN_PRODUCT_SUM_TRACE_FACTOR")) == factor.factor.factor_index);
+            const auto trace_product_sum_node_ids =
+                trace_product_sum
+                    ? parse_bspn_u32_list_env("BSPN_PRODUCT_SUM_TRACE_NODE_IDS")
+                    : std::vector<std::uint32_t>();
+            const bool trace_this_product_sum =
+                trace_product_sum &&
+                (trace_product_sum_node_ids.empty() ||
+                 std::find(
+                     trace_product_sum_node_ids.begin(),
+                     trace_product_sum_node_ids.end(),
+                     static_cast<std::uint32_t>(node_idx)) != trace_product_sum_node_ids.end());
+            const std::uint64_t trace_product_sum_limit =
+                trace_this_product_sum
+                    ? parse_bspn_u64_env("BSPN_PRODUCT_SUM_TRACE_LIMIT", std::uint64_t(1) << 20)
+                    : 0;
+            const auto push_product_sum_trace = [&](json item) {
+                if (!trace_this_product_sum ||
+                    eval_stats->product_sum_trace_shares.size() >= trace_product_sum_limit) {
+                    return;
+                }
+                item["factor_index"] = factor.factor.factor_index;
+                item["product_sum_node_id"] = static_cast<std::uint64_t>(node_idx);
+                eval_stats->product_sum_trace_shares.push_back(std::move(item));
+            };
             const auto relevant_flags = secure_scope_intersects_shared_rows(
                 model,
                 product_child_node_ids,
@@ -4797,6 +4986,7 @@ SecureRationalShare evaluate_indicator_oblivious_secure(
                 const auto child_id = child_ids[node.child_begin + offset];
                 const auto& child_value = node_values[child_id];
                 const auto& relevant_flag = relevant_flags[static_cast<std::size_t>(offset)];
+                const auto product_before = product;
                 const auto multiplied = multiply_secure_rational(product, child_value, context);
                 const auto first_relevant_child = bool_and_scalar(
                     relevant_flag,
@@ -4812,6 +5002,21 @@ SecureRationalShare evaluate_indicator_oblivious_secure(
                     product,
                     relevant_flag,
                     context);
+                if (trace_this_product_sum) {
+                    push_product_sum_trace({
+                        {"stage", "product_sum_child"},
+                        {"child_offset", static_cast<std::uint64_t>(offset)},
+                        {"child_node_id", static_cast<std::uint64_t>(child_id)},
+                        {"product_before_share", secure_rational_share_json(product_before)},
+                        {"child_value_share", secure_rational_share_json(child_value)},
+                        {"multiplied_share", secure_rational_share_json(multiplied)},
+                        {"product_after_share", secure_rational_share_json(product)},
+                        {"relevant_flag_share", bool_scalar_share_json(relevant_flag)},
+                        {"first_relevant_child_share", bool_scalar_share_json(first_relevant_child)},
+                        {"has_relevant_child_before_share", bool_scalar_share_json(has_relevant_child)},
+                        {"fixed_decimal_bits", static_cast<int>(kFlatBSPNDecimal)},
+                    });
+                }
                 has_relevant_child = bool_or_scalar(has_relevant_child, relevant_flag, context);
             }
             node_values[node_idx] =
@@ -5483,6 +5688,10 @@ void init_secure_context_from_cmd(
     context.leaf_product_trace_shares =
         cmd.isSet("leaf_product_trace_shares") ||
         bspn_env_flag_enabled("BSPN_LEAF_PRODUCT_TRACE_SHARES");
+    context.sum_node_trace_shares =
+        bspn_env_flag_enabled("BSPN_SUM_NODE_TRACE_SHARES");
+    context.product_sum_trace_shares =
+        bspn_env_flag_enabled("BSPN_PRODUCT_SUM_TRACE_SHARES");
 
     bspn_basic_setup(static_cast<u64>(role), ios, enc, eval, runtime);
     context.io_service = &ios;
