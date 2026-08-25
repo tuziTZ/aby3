@@ -1666,7 +1666,7 @@ SecureFixedScalarShare secure_divide_rational_to_fixed_scalar(
             context);
         scaled_value.numerator_scale = value.numerator_scale / numerator_payload_scale;
         if (scale_denominator_payload) {
-            const double denominator_payload_scale = std::max(payload_scale, 1.0 / 4096.0);
+            const double denominator_payload_scale = std::max(payload_scale, 1.0 / 128.0);
             scaled_value.denominator = secure_mul_public_fixed(
                 value.denominator,
                 denominator_payload_scale,
@@ -4060,15 +4060,6 @@ std::vector<SecureRationalShare> evaluate_leaf_product_batch_values(
             final_cnt_fixed_rows,
             full_match_rows,
             context);
-    } else if (use_row_weights_for_rows) {
-        const auto final_cnt_int_fixed_rows = si64_to_sf64(final_cnt_int_rows);
-        effective_cnt_rows = has_node_row_weight_flags
-            ? select_fixed_by_bool_same_shape(
-                final_cnt_int_fixed_rows,
-                weighted_final_cnt_rows,
-                product_use_row_weights_rows,
-                context)
-            : weighted_final_cnt_rows;
     }
     if (context.debug_internal_reveal && std::getenv("BSPN_DEBUG_LEAF_PRODUCT_COUNTS") != nullptr) {
         i64Matrix final_cnt_plain(final_cnt_int_rows.rows(), final_cnt_int_rows.cols());
@@ -4132,6 +4123,9 @@ std::vector<SecureRationalShare> evaluate_leaf_product_batch_values(
         }
     } else if (needs_leaf_domain_filter) {
         denominator_is_cardinality_rows = full_match_rows;
+    } else {
+        const auto true_flag = shared_true_bool_scalar(context);
+        denominator_is_cardinality_rows = repeat_bool_scalar_rows(true_flag, static_cast<std::uint32_t>(product_count));
     }
     const auto selectivity_num_raw_rows = secure_mul_fixed_same_shape(
         denominator_cnt_rows,
