@@ -4127,6 +4127,46 @@ std::vector<SecureRationalShare> evaluate_leaf_product_batch_values(
         const auto true_flag = shared_true_bool_scalar(context);
         denominator_is_cardinality_rows = repeat_bool_scalar_rows(true_flag, static_cast<std::uint32_t>(product_count));
     }
+    {
+        const auto denominator_cardinality_delta_rows =
+            secure_abs_fixed_same_shape(denominator_cnt_rows - node_cardinality_rows, context);
+        const auto one_raw_fixed = share_fixed_scalar<kFlatBSPNDecimal>(
+            1.0 / static_cast<double>(std::uint64_t(1) << kFlatBSPNDecimal),
+            0,
+            context);
+        auto one_raw_rows = repeat_fixed_scalar_matrix(
+            one_raw_fixed,
+            static_cast<std::uint32_t>(product_count),
+            1);
+        sbMatrix denominator_delta_gt_one_raw_rows(product_count, 1);
+        auto denominator_cardinality_delta_for_cmp = denominator_cardinality_delta_rows;
+        cipher_gt(
+            context.role,
+            denominator_cardinality_delta_for_cmp,
+            one_raw_rows,
+            denominator_delta_gt_one_raw_rows,
+            *(context.eval),
+            *(context.runtime));
+        sbMatrix denominator_near_cardinality_rows(
+            denominator_delta_gt_one_raw_rows.rows(),
+            denominator_delta_gt_one_raw_rows.bitCount());
+        bool_cipher_not(
+            context.role,
+            denominator_delta_gt_one_raw_rows,
+            denominator_near_cardinality_rows);
+        sbMatrix updated_denominator_is_cardinality(
+            denominator_is_cardinality_rows.rows(),
+            denominator_is_cardinality_rows.bitCount());
+        bool_cipher_or(
+            context.role,
+            denominator_is_cardinality_rows,
+            denominator_near_cardinality_rows,
+            updated_denominator_is_cardinality,
+            *(context.enc),
+            *(context.eval),
+            *(context.runtime));
+        denominator_is_cardinality_rows = std::move(updated_denominator_is_cardinality);
+    }
     const auto selectivity_num_raw_rows = secure_mul_fixed_same_shape(
         denominator_cnt_rows,
         inv_cardinality_rows,
