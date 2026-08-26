@@ -2936,8 +2936,8 @@ std::vector<sbMatrix> compute_leaf_local_ids_batched(
             i64 match_share0 = 0;
             i64 match_share1 = 0;
             if (expand_one_bit_mask) {
-                match_share0 = (match_mask.mShares[0](bucket_ref.bucket_offset, 0) & 1) ? -1 : 0;
-                match_share1 = (match_mask.mShares[1](bucket_ref.bucket_offset, 0) & 1) ? -1 : 0;
+                match_share0 = match_mask.mShares[0](bucket_ref.bucket_offset, 0) & 1;
+                match_share1 = match_mask.mShares[1](bucket_ref.bucket_offset, 0) & 1;
             }
             for (u64 row = 0; row < block_len; ++row) {
                 for (u64 col = 0; col < share_cols; ++col) {
@@ -2973,12 +2973,23 @@ std::vector<sbMatrix> compute_leaf_local_ids_batched(
             const auto& bucket_ref = bucket_refs[chunk_begin + ref_idx];
             auto& child_local_ids = local_ids[bucket_ref.child_idx];
             const u64 row_begin = static_cast<u64>(ref_idx) * block_len;
+            sbMatrix selected_bucket_rows(block_len, bit_count);
             for (u64 row = 0; row < block_len; ++row) {
                 for (u64 col = 0; col < share_cols; ++col) {
-                    child_local_ids.mShares[0](row, col) ^= stacked_products.mShares[0](row_begin + row, col);
-                    child_local_ids.mShares[1](row, col) ^= stacked_products.mShares[1](row_begin + row, col);
+                    selected_bucket_rows.mShares[0](row, col) = stacked_products.mShares[0](row_begin + row, col);
+                    selected_bucket_rows.mShares[1](row, col) = stacked_products.mShares[1](row_begin + row, col);
                 }
             }
+            sbMatrix updated_child_local_ids(block_len, bit_count);
+            bool_cipher_or(
+                context.role,
+                child_local_ids,
+                selected_bucket_rows,
+                updated_child_local_ids,
+                *(context.enc),
+                *(context.eval),
+                *(context.runtime));
+            child_local_ids = std::move(updated_child_local_ids);
         }
     }
 
@@ -3796,16 +3807,17 @@ std::vector<sbMatrix> compute_leaf_match_masks_for_evidence(
         match_masks[child_idx] = std::move(updated_match_mask);
     }
     if (debug_leaf_evidence_flags) {
-        std::vector<sbMatrix> match_masks_copy = match_masks;
-        const auto match_counts = sum_boolean_masks_to_int_batched(
-            match_masks_copy,
-            context,
-            nullptr);
-        i64Matrix match_counts_plain(match_counts.rows(), match_counts.cols());
-        context.enc->revealAll(
-            context.runtime->noDependencies(),
-            match_counts,
-            match_counts_plain).get();
+        i64Matrix match_counts_plain(static_cast<u64>(match_masks.size()), 1);
+        for (std::size_t mask_idx = 0; mask_idx < match_masks.size(); ++mask_idx) {
+            auto match_mask_copy = match_masks[mask_idx];
+            const auto match_count = sum_boolean_mask_to_int(match_mask_copy, context);
+            i64Matrix one_count_plain(match_count.rows(), match_count.cols());
+            context.enc->revealAll(
+                context.runtime->noDependencies(),
+                match_count,
+                one_count_plain).get();
+            match_counts_plain(static_cast<u64>(mask_idx), 0) = one_count_plain(0, 0);
+        }
         if (context.role == 0) {
             std::cerr << "bspn_debug_leaf_match_counts:"
                       << " factor_row=" << secret_factor_row
@@ -3950,6 +3962,31 @@ std::vector<SecureRationalShare> evaluate_leaf_product_batch_values(
                 match_masks,
                 context,
                 eval_stats != nullptr ? &eval_stats->phase1_batch_dot_calls : nullptr);
+            if (context.debug_internal_reveal && std::getenv("BSPN_DEBUG_LEAF_EVIDENCE_FLAGS") != nullptr) {
+                if (context.role == 0) {
+                    std::cerr << "bspn_debug_leaf_local_id_counts:"
+                              << " factor_index=" << factor.factor.factor_index
+                              << " counts=[";
+                }
+                for (std::size_t leaf_idx = 0; leaf_idx < local_ids.size(); ++leaf_idx) {
+                    auto local_id_copy = local_ids[leaf_idx];
+                    const auto local_count = sum_boolean_mask_to_int(local_id_copy, context);
+                    i64Matrix local_count_plain(local_count.rows(), local_count.cols());
+                    context.enc->revealAll(
+                        context.runtime->noDependencies(),
+                        local_count,
+                        local_count_plain).get();
+                    if (context.role == 0) {
+                        if (leaf_idx != 0) {
+                            std::cerr << ",";
+                        }
+                        std::cerr << local_count_plain(0, 0);
+                    }
+                }
+                if (context.role == 0) {
+                    std::cerr << "]\n";
+                }
+            }
             if (eval_stats != nullptr) {
                 eval_stats->phase1_local_ids_ms += elapsed_ms_since(phase_start);
             }
@@ -4447,37 +4484,7 @@ std::vector<SecureRationalShare> evaluate_leaf_product_batch_values(
             }
             return;
         }
-        if (product_count > 1) {
-            push_fixed_rows_as_rationals(selectivity_num_nonzero_rows);
-            return;
-        }
-        const auto empty_fixed_rows = bool_matrix_to_fixed_same_shape(is_empty_rows, context);
-        const auto denom_safe_rows = node_cardinality_rows + empty_fixed_rows;
-        const double denominator_public_scale =
-            static_cast<double>(std::uint64_t(1) << static_cast<unsigned>(kFlatBSPNDecimal));
-        const auto denom_payload_rows = secure_mul_public_fixed(
-            denom_safe_rows,
-            1.0 / denominator_public_scale,
-            context);
-        for (u64 product_idx = 0; product_idx < product_count; ++product_idx) {
-            SecureRationalShare value{
-                fixed_row_slice(effective_cnt_rows, static_cast<std::uint32_t>(product_idx), 1),
-                fixed_row_slice(denom_payload_rows, static_cast<std::uint32_t>(product_idx), 1),
-                1.0,
-                denominator_public_scale,
-                false,
-            };
-            value.has_secret_zero_numerator = true;
-            value.secret_zero_numerator = bool_row_slice(
-                product_zero_rows,
-                static_cast<std::uint32_t>(product_idx),
-                1);
-            value.numerator = fixed_mul_bool_same_shape(
-                value.numerator,
-                bool_not_scalar(value.secret_zero_numerator, context),
-                context);
-            out.push_back(std::move(value));
-        }
+        push_fixed_rows_as_rationals(selectivity_num_nonzero_rows);
     };
 
     if (public_factor_feature_count == 0 &&
