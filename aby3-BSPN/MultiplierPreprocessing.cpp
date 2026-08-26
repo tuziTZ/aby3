@@ -112,6 +112,11 @@ bool secure_multiplier_provider_separated_oblivious_merge_enabled()
     return env_flag_enabled("BSPN_MULTIPLIER_PROVIDER_SEPARATED_OBLIVIOUS_MERGE", false);
 }
 
+bool secure_multiplier_provider_separated_partitioned_enabled()
+{
+    return env_flag_enabled("BSPN_MULTIPLIER_PROVIDER_SEPARATED_PARTITIONED", false);
+}
+
 bool secure_leaf_sorted_group_enabled()
 {
     const char* value = std::getenv("SECURE_LEAF_MATERIALIZE_STRATEGY");
@@ -120,6 +125,75 @@ bool secure_leaf_sorted_group_enabled()
     }
     const std::string normalized(value);
     return normalized == "sorted_group" || normalized == "sort_group" || normalized == "grouped_sort";
+}
+
+std::vector<i64> parse_i64_csv_env(const char* name)
+{
+    const char* raw = std::getenv(name);
+    if (raw == nullptr || *raw == '\0') {
+        return {};
+    }
+    std::vector<i64> values;
+    std::stringstream stream(raw);
+    std::string token;
+    while (std::getline(stream, token, ',')) {
+        token.erase(std::remove_if(token.begin(), token.end(), [](unsigned char ch) {
+            return std::isspace(ch) != 0;
+        }), token.end());
+        if (token.empty()) {
+            throw std::runtime_error(std::string("Empty integer token in ") + name + ".");
+        }
+        std::size_t parsed = 0;
+        i64 value = 0;
+        try {
+            value = std::stoll(token, &parsed, 10);
+        } catch (const std::exception&) {
+            throw std::runtime_error(std::string("Invalid integer token in ") + name + ": " + token);
+        }
+        if (parsed != token.size()) {
+            throw std::runtime_error(std::string("Invalid integer token in ") + name + ": " + token);
+        }
+        values.push_back(value);
+    }
+    return values;
+}
+
+std::vector<u64> parse_u64_csv_env(const char* name)
+{
+    const auto signed_values = parse_i64_csv_env(name);
+    std::vector<u64> values;
+    values.reserve(signed_values.size());
+    for (i64 value : signed_values) {
+        if (value < 0) {
+            throw std::runtime_error(std::string("Negative capacity in ") + name + ".");
+        }
+        values.push_back(static_cast<u64>(value));
+    }
+    return values;
+}
+
+std::string join_i64_values(const std::vector<i64>& values)
+{
+    std::ostringstream out;
+    for (std::size_t idx = 0; idx < values.size(); ++idx) {
+        if (idx != 0) {
+            out << ",";
+        }
+        out << values[idx];
+    }
+    return out.str();
+}
+
+std::string join_u64_values(const std::vector<u64>& values)
+{
+    std::ostringstream out;
+    for (std::size_t idx = 0; idx < values.size(); ++idx) {
+        if (idx != 0) {
+            out << ",";
+        }
+        out << values[idx];
+    }
+    return out.str();
 }
 
 std::string secure_leaf_materialize_strategy_name()
@@ -801,15 +875,22 @@ void write_secure_shared_values_manifest(
     const bool provider_separated_sorted = provider_separated && secure_multiplier_provider_separated_sorted_enabled();
     const bool provider_separated_oblivious = provider_separated &&
         secure_multiplier_provider_separated_oblivious_merge_enabled();
+    const bool provider_separated_partitioned = provider_separated &&
+        secure_multiplier_provider_separated_partitioned_enabled();
     const std::string secure_core_status = fast_preprocess
         ? "legacy_plaintext_count_then_secret_share"
         : (provider_separated
-            ? (provider_separated_oblivious
+            ? (provider_separated_partitioned
+                ? "provider_separated_partitioned_oblivious_merge_group_count"
+                : (provider_separated_oblivious
                 ? "provider_separated_oblivious_merge_group_count"
                 : (provider_separated_sorted
                 ? "diagnostic_provider_separated_sort_group_count_reveals_sort_comparisons"
-                : "pairwise_secret_shared_key_equality_count_no_reveal"))
+                : "pairwise_secret_shared_key_equality_count_no_reveal")))
             : "centralized_plaintext_input_party_sorted_segmented_scan_count_no_reveal");
+    const auto partition_boundaries = parse_i64_csv_env("BSPN_MULTIPLIER_PARTITION_BOUNDARIES");
+    const auto partition_pk_capacities = parse_u64_csv_env("BSPN_MULTIPLIER_PARTITION_PK_CAPACITIES");
+    const auto partition_fk_capacities = parse_u64_csv_env("BSPN_MULTIPLIER_PARTITION_FK_CAPACITIES");
     const std::string manifest_path = artifact_dir + "/manifest.json";
     std::ostringstream content;
     content << "{\n";
@@ -836,11 +917,26 @@ void write_secure_shared_values_manifest(
     content << "  \"provider_separated_sorted_group_count\": " << (provider_separated_sorted ? "true" : "false") << ",\n";
     content << "  \"provider_separated_oblivious_merge_group_count\": "
             << (provider_separated_oblivious ? "true" : "false") << ",\n";
-    content << "  \"provider_local_sort\": " << (provider_separated_oblivious ? "true" : "false") << ",\n";
-    content << "  \"server_oblivious_merge\": " << (provider_separated_oblivious ? "true" : "false") << ",\n";
+    content << "  \"provider_separated_partitioned_oblivious_merge_group_count\": "
+            << (provider_separated_partitioned ? "true" : "false") << ",\n";
+    content << "  \"provider_local_partition\": " << (provider_separated_partitioned ? "true" : "false") << ",\n";
+    content << "  \"provider_local_sort\": " << ((provider_separated_oblivious || provider_separated_partitioned) ? "true" : "false") << ",\n";
+    content << "  \"server_oblivious_merge\": " << ((provider_separated_oblivious || provider_separated_partitioned) ? "true" : "false") << ",\n";
     content << "  \"sort_core_reveals_comparisons\": " << (provider_separated_sorted ? "true" : "false") << ",\n";
     content << "  \"network_schedule_version\": \""
-            << (provider_separated_oblivious ? "bitonic_compare_exchange_v1" : "not_applicable") << "\",\n";
+            << ((provider_separated_oblivious || provider_separated_partitioned) ? "bitonic_compare_exchange_v1" : "not_applicable") << "\",\n";
+    content << "  \"partition_boundaries_public\": " << (provider_separated_partitioned ? "true" : "false") << ",\n";
+    content << "  \"partition_boundaries_query_independent\": " << (provider_separated_partitioned ? "true" : "false") << ",\n";
+    content << "  \"partition_real_cardinalities_hidden\": " << (provider_separated_partitioned ? "true" : "false") << ",\n";
+    content << "  \"partition_capacities_public\": " << (provider_separated_partitioned ? "true" : "false") << ",\n";
+    content << "  \"partition_boundary_rule\": \""
+            << (provider_separated_partitioned ? "public_half_open_ranges_last_closed" : "not_applicable") << "\",\n";
+    content << "  \"partition_boundaries\": \"" << json_escape(join_i64_values(partition_boundaries)) << "\",\n";
+    content << "  \"partition_pk_capacities\": \"" << json_escape(join_u64_values(partition_pk_capacities)) << "\",\n";
+    content << "  \"partition_fk_capacities\": \"" << json_escape(join_u64_values(partition_fk_capacities)) << "\",\n";
+    content << "  \"output_alignment_mode\": \""
+            << (provider_separated_partitioned ? "provider_local_partitioned_model_order" : "original_pk_order") << "\",\n";
+    content << "  \"overflow_policy\": \"" << (provider_separated_partitioned ? "fail_closed" : "not_applicable") << "\",\n";
     content << "  \"plaintext_count_then_share\": " << (fast_preprocess ? "true" : "false") << ",\n";
     content << "  \"secure_core_status\": \"" << secure_core_status << "\",\n";
     content << "  \"role_paths\": {\n";
@@ -1532,6 +1628,77 @@ struct ProviderLocalKeyRow {
     u64 original_index = 0;
 };
 
+struct PartitionContract {
+    std::vector<i64> boundaries;
+    std::vector<u64> pk_capacities;
+    std::vector<u64> fk_capacities;
+};
+
+PartitionContract parse_partition_contract()
+{
+    PartitionContract contract;
+    contract.boundaries = parse_i64_csv_env("BSPN_MULTIPLIER_PARTITION_BOUNDARIES");
+    contract.pk_capacities = parse_u64_csv_env("BSPN_MULTIPLIER_PARTITION_PK_CAPACITIES");
+    contract.fk_capacities = parse_u64_csv_env("BSPN_MULTIPLIER_PARTITION_FK_CAPACITIES");
+    if (contract.boundaries.size() < 2) {
+        throw std::runtime_error("Partitioned multiplier requires at least two public boundaries.");
+    }
+    for (std::size_t idx = 1; idx < contract.boundaries.size(); ++idx) {
+        if (contract.boundaries[idx] <= contract.boundaries[idx - 1]) {
+            throw std::runtime_error("Partition boundaries must be strictly increasing public values.");
+        }
+    }
+    const std::size_t partition_count = contract.boundaries.size() - 1;
+    if (contract.pk_capacities.size() != partition_count ||
+        contract.fk_capacities.size() != partition_count) {
+        throw std::runtime_error("Partition capacity lists must match the public partition count.");
+    }
+    for (std::size_t idx = 0; idx < partition_count; ++idx) {
+        if (contract.pk_capacities[idx] == 0 || contract.fk_capacities[idx] == 0) {
+            throw std::runtime_error("Partition capacities must be positive public values.");
+        }
+    }
+    return contract;
+}
+
+u64 partition_count(const PartitionContract& contract)
+{
+    return static_cast<u64>(contract.boundaries.size() - 1);
+}
+
+u64 sum_u64(const std::vector<u64>& values)
+{
+    u64 total = 0;
+    for (u64 value : values) {
+        total += value;
+    }
+    return total;
+}
+
+u64 assign_public_partition(const PartitionContract& contract, const NormalizedKey& key)
+{
+    if (key.is_null) {
+        return 0;
+    }
+    const i64 domain_min = contract.boundaries.front();
+    const i64 domain_max = contract.boundaries.back();
+    if (key.value < domain_min || key.value > domain_max) {
+        throw std::runtime_error("public capacity contract not satisfied");
+    }
+    const u64 partitions = partition_count(contract);
+    for (u64 part = 0; part < partitions; ++part) {
+        const i64 lower = contract.boundaries[static_cast<std::size_t>(part)];
+        const i64 upper = contract.boundaries[static_cast<std::size_t>(part + 1)];
+        const bool in_range = (part + 1 == partitions)
+            ? (key.value >= lower && key.value <= upper)
+            : (key.value >= lower && key.value < upper);
+        if (in_range) {
+            return part;
+        }
+    }
+    throw std::runtime_error("public capacity contract not satisfied");
+}
+
 std::vector<ProviderLocalKeyRow> provider_local_sorted_rows(const std::vector<NormalizedKey>& keys)
 {
     std::vector<ProviderLocalKeyRow> rows;
@@ -1549,6 +1716,56 @@ std::vector<ProviderLocalKeyRow> provider_local_sorted_rows(const std::vector<No
         return lhs.original_index < rhs.original_index;
     });
     return rows;
+}
+
+std::vector<ProviderLocalKeyRow> provider_local_partitioned_rows(
+    const std::vector<NormalizedKey>& keys,
+    const PartitionContract& contract,
+    const std::vector<u64>& capacities,
+    bool& overflow)
+{
+    const u64 partitions = partition_count(contract);
+    std::vector<std::vector<ProviderLocalKeyRow>> per_partition(static_cast<std::size_t>(partitions));
+    overflow = false;
+    for (u64 idx = 0; idx < static_cast<u64>(keys.size()); ++idx) {
+        u64 part = 0;
+        try {
+            part = assign_public_partition(contract, keys[static_cast<std::size_t>(idx)]);
+        } catch (const std::exception&) {
+            overflow = true;
+            continue;
+        }
+        auto& rows = per_partition[static_cast<std::size_t>(part)];
+        rows.push_back({keys[static_cast<std::size_t>(idx)], idx});
+        if (rows.size() > capacities[static_cast<std::size_t>(part)]) {
+            overflow = true;
+        }
+    }
+    std::vector<ProviderLocalKeyRow> out;
+    out.reserve(sum_u64(capacities));
+    for (u64 part = 0; part < partitions; ++part) {
+        auto& rows = per_partition[static_cast<std::size_t>(part)];
+        std::sort(rows.begin(), rows.end(), [](const ProviderLocalKeyRow& lhs, const ProviderLocalKeyRow& rhs) {
+            if (lhs.key.is_null != rhs.key.is_null) {
+                return !lhs.key.is_null && rhs.key.is_null;
+            }
+            if (lhs.key.value != rhs.key.value) {
+                return lhs.key.value < rhs.key.value;
+            }
+            return lhs.original_index < rhs.original_index;
+        });
+        u64 slot = 0;
+        for (; slot < static_cast<u64>(rows.size()) &&
+               slot < capacities[static_cast<std::size_t>(part)]; ++slot) {
+            auto row = rows[static_cast<std::size_t>(slot)];
+            row.original_index = slot;
+            out.push_back(row);
+        }
+        for (; slot < capacities[static_cast<std::size_t>(part)]; ++slot) {
+            out.push_back({NormalizedKey{0, true}, slot});
+        }
+    }
+    return out;
 }
 
 si64Matrix provider_separated_oblivious_merge_counts(
@@ -1687,6 +1904,53 @@ si64Matrix provider_separated_oblivious_merge_counts(
     for (u64 row = 0; row < n_pk; ++row) {
         counts.mShares[0](row, 0) = output_columns[kOutputCountCol].mShares[0](row, 0);
         counts.mShares[1](row, 0) = output_columns[kOutputCountCol].mShares[1](row, 0);
+    }
+    return counts;
+}
+
+si64Matrix provider_separated_partitioned_oblivious_merge_counts(
+    const MultiplierPreprocessConfig& config,
+    const PartitionContract& contract,
+    const si64Matrix& pk_key_shared,
+    const si64Matrix& pk_null_shared,
+    const si64Matrix& pk_original_index_shared,
+    const si64Matrix& fk_key_shared,
+    const si64Matrix& fk_null_shared,
+    const si64Matrix& fk_original_index_shared,
+    Sh3Encryptor& enc,
+    Sh3Evaluator& eval,
+    Sh3Runtime& runtime)
+{
+    const u64 partitions = partition_count(contract);
+    const u64 total_pk_capacity = sum_u64(contract.pk_capacities);
+    si64Matrix counts(total_pk_capacity, 1);
+    counts.mShares[0].setZero();
+    counts.mShares[1].setZero();
+
+    u64 pk_offset = 0;
+    u64 fk_offset = 0;
+    for (u64 part = 0; part < partitions; ++part) {
+        const u64 pk_cap = contract.pk_capacities[static_cast<std::size_t>(part)];
+        const u64 fk_cap = contract.fk_capacities[static_cast<std::size_t>(part)];
+        auto part_counts = provider_separated_oblivious_merge_counts(
+            config,
+            int_row_slice(pk_key_shared, pk_offset, pk_cap),
+            int_row_slice(pk_null_shared, pk_offset, pk_cap),
+            int_row_slice(pk_original_index_shared, pk_offset, pk_cap),
+            int_row_slice(fk_key_shared, fk_offset, fk_cap),
+            int_row_slice(fk_null_shared, fk_offset, fk_cap),
+            int_row_slice(fk_original_index_shared, fk_offset, fk_cap),
+            pk_cap,
+            fk_cap,
+            enc,
+            eval,
+            runtime);
+        for (u64 row = 0; row < pk_cap; ++row) {
+            counts.mShares[0](pk_offset + row, 0) = part_counts.mShares[0](row, 0);
+            counts.mShares[1](pk_offset + row, 0) = part_counts.mShares[1](row, 0);
+        }
+        pk_offset += pk_cap;
+        fk_offset += fk_cap;
     }
     return counts;
 }
@@ -1852,9 +2116,10 @@ void run_secure_multiplier_shared_values_fast(const MultiplierPreprocessConfig& 
         throw std::runtime_error("FK sample rate must be positive.");
     }
     if (secure_multiplier_provider_separated_sorted_enabled() &&
-        secure_multiplier_provider_separated_oblivious_merge_enabled()) {
+        (secure_multiplier_provider_separated_oblivious_merge_enabled() ||
+         secure_multiplier_provider_separated_partitioned_enabled())) {
         throw std::runtime_error(
-            "Provider-separated diagnostic sorted path and oblivious merge path are mutually exclusive.");
+            "Provider-separated diagnostic sorted path is mutually exclusive with privacy-aligned oblivious paths.");
     }
 
     const auto pk_keys = load_key_column_csv(config.pk_csv_path, config.pk_key_column, config.pk_has_header);
@@ -1942,12 +2207,19 @@ void run_secure_multiplier_shared_values_provider_separated(const MultiplierPrep
     sync_value_from_party(config.role, config.pk_input_party, runtime, n_pk);
     sync_value_from_party(config.role, config.fk_input_party, runtime, n_fk);
 
-    i64Matrix plain_pk_key(n_pk, 1);
-    i64Matrix plain_pk_is_null(n_pk, 1);
-    i64Matrix plain_pk_original_index(n_pk, 1);
-    i64Matrix plain_fk_key(n_fk, 1);
-    i64Matrix plain_fk_is_null(n_fk, 1);
-    i64Matrix plain_fk_original_index(n_fk, 1);
+    const bool partitioned = secure_multiplier_provider_separated_partitioned_enabled();
+    const PartitionContract partition_contract = partitioned ? parse_partition_contract() : PartitionContract{};
+    const u64 pk_share_rows = partitioned ? sum_u64(partition_contract.pk_capacities) : n_pk;
+    const u64 fk_share_rows = partitioned ? sum_u64(partition_contract.fk_capacities) : n_fk;
+    u64 pk_overflow = 0;
+    u64 fk_overflow = 0;
+
+    i64Matrix plain_pk_key(pk_share_rows, 1);
+    i64Matrix plain_pk_is_null(pk_share_rows, 1);
+    i64Matrix plain_pk_original_index(pk_share_rows, 1);
+    i64Matrix plain_fk_key(fk_share_rows, 1);
+    i64Matrix plain_fk_is_null(fk_share_rows, 1);
+    i64Matrix plain_fk_original_index(fk_share_rows, 1);
     plain_pk_key.setZero();
     plain_pk_is_null.setConstant(1);
     plain_pk_original_index.setZero();
@@ -1959,11 +2231,19 @@ void run_secure_multiplier_shared_values_provider_separated(const MultiplierPrep
         if (static_cast<u64>(pk_keys.size()) != n_pk) {
             throw std::runtime_error("PK owner has inconsistent key row count.");
         }
-        const auto rows = secure_multiplier_provider_separated_oblivious_merge_enabled()
-            ? provider_local_sorted_rows(pk_keys)
-            : std::vector<ProviderLocalKeyRow>{};
-        for (u64 row = 0; row < n_pk; ++row) {
-            const auto& local_row = secure_multiplier_provider_separated_oblivious_merge_enabled()
+        bool overflow = false;
+        const auto rows = partitioned
+            ? provider_local_partitioned_rows(
+                pk_keys,
+                partition_contract,
+                partition_contract.pk_capacities,
+                overflow)
+            : (secure_multiplier_provider_separated_oblivious_merge_enabled()
+                ? provider_local_sorted_rows(pk_keys)
+                : std::vector<ProviderLocalKeyRow>{});
+        pk_overflow = overflow ? 1 : 0;
+        for (u64 row = 0; row < pk_share_rows; ++row) {
+            const auto& local_row = (partitioned || secure_multiplier_provider_separated_oblivious_merge_enabled())
                 ? rows[static_cast<std::size_t>(row)]
                 : ProviderLocalKeyRow{pk_keys[static_cast<std::size_t>(row)], row};
             plain_pk_key(row, 0) = local_row.key.value;
@@ -1975,16 +2255,32 @@ void run_secure_multiplier_shared_values_provider_separated(const MultiplierPrep
         if (static_cast<u64>(fk_keys.size()) != n_fk) {
             throw std::runtime_error("FK owner has inconsistent key row count.");
         }
-        const auto rows = secure_multiplier_provider_separated_oblivious_merge_enabled()
-            ? provider_local_sorted_rows(fk_keys)
-            : std::vector<ProviderLocalKeyRow>{};
-        for (u64 row = 0; row < n_fk; ++row) {
-            const auto& local_row = secure_multiplier_provider_separated_oblivious_merge_enabled()
+        bool overflow = false;
+        const auto rows = partitioned
+            ? provider_local_partitioned_rows(
+                fk_keys,
+                partition_contract,
+                partition_contract.fk_capacities,
+                overflow)
+            : (secure_multiplier_provider_separated_oblivious_merge_enabled()
+                ? provider_local_sorted_rows(fk_keys)
+                : std::vector<ProviderLocalKeyRow>{});
+        fk_overflow = overflow ? 1 : 0;
+        for (u64 row = 0; row < fk_share_rows; ++row) {
+            const auto& local_row = (partitioned || secure_multiplier_provider_separated_oblivious_merge_enabled())
                 ? rows[static_cast<std::size_t>(row)]
                 : ProviderLocalKeyRow{fk_keys[static_cast<std::size_t>(row)], row};
             plain_fk_key(row, 0) = local_row.key.value;
             plain_fk_is_null(row, 0) = local_row.key.is_null ? 1 : 0;
             plain_fk_original_index(row, 0) = static_cast<i64>(local_row.original_index);
+        }
+    }
+
+    if (partitioned) {
+        sync_value_from_party(config.role, config.pk_input_party, runtime, pk_overflow);
+        sync_value_from_party(config.role, config.fk_input_party, runtime, fk_overflow);
+        if (pk_overflow != 0 || fk_overflow != 0) {
+            throw std::runtime_error("public capacity contract not satisfied");
         }
     }
 
@@ -2005,7 +2301,22 @@ void run_secure_multiplier_shared_values_provider_separated(const MultiplierPrep
     counts.mShares[0].setZero();
     counts.mShares[1].setZero();
 
-    if (secure_multiplier_provider_separated_oblivious_merge_enabled()) {
+    if (partitioned) {
+        counts = provider_separated_partitioned_oblivious_merge_counts(
+            config,
+            partition_contract,
+            pk_key_shared,
+            pk_null_shared,
+            pk_original_index_shared,
+            fk_key_shared,
+            fk_null_shared,
+            fk_original_index_shared,
+            enc,
+            eval,
+            runtime);
+        n_pk = pk_share_rows;
+        n_fk = fk_share_rows;
+    } else if (secure_multiplier_provider_separated_oblivious_merge_enabled()) {
         counts = provider_separated_oblivious_merge_counts(
             config,
             pk_key_shared,
