@@ -101,6 +101,11 @@ bool secure_multiplier_provider_separated_enabled()
     return env_flag_enabled("BSPN_MULTIPLIER_PROVIDER_SEPARATED", false);
 }
 
+bool secure_multiplier_provider_separated_sorted_enabled()
+{
+    return env_flag_enabled("BSPN_MULTIPLIER_PROVIDER_SEPARATED_SORTED", false);
+}
+
 bool secure_leaf_sorted_group_enabled()
 {
     const char* value = std::getenv("SECURE_LEAF_MATERIALIZE_STRATEGY");
@@ -785,10 +790,13 @@ void write_secure_shared_values_manifest(
     const std::string join_key_input_mode = provider_separated
         ? "provider_separated_secret_shares"
         : "centralized_plaintext_input_party";
+    const bool provider_separated_sorted = provider_separated && secure_multiplier_provider_separated_sorted_enabled();
     const std::string secure_core_status = fast_preprocess
         ? "legacy_plaintext_count_then_secret_share"
         : (provider_separated
-            ? "pairwise_secret_shared_key_equality_count_no_reveal"
+            ? (provider_separated_sorted
+                ? "diagnostic_provider_separated_sort_group_count_reveals_sort_comparisons"
+                : "pairwise_secret_shared_key_equality_count_no_reveal")
             : "centralized_plaintext_input_party_sorted_segmented_scan_count_no_reveal");
     const std::string manifest_path = artifact_dir + "/manifest.json";
     std::ostringstream content;
@@ -808,9 +816,13 @@ void write_secure_shared_values_manifest(
     content << "  \"pk_input_party\": " << config.pk_input_party << ",\n";
     content << "  \"fk_input_party\": " << config.fk_input_party << ",\n";
     content << "  \"share_kind\": \"ABY3_REPLICATED_PAIR_I64\",\n";
-    content << "  \"construction_mode\": \"" << (provider_separated ? "privacy_aligned" : "legacy") << "\",\n";
+    content << "  \"construction_mode\": \"" << (
+        provider_separated_sorted ? "diagnostic_non_private" : (provider_separated ? "privacy_aligned" : "legacy")
+    ) << "\",\n";
     content << "  \"join_key_input_mode\": \"" << join_key_input_mode << "\",\n";
     content << "  \"provider_separated_key_inputs\": " << (provider_separated ? "true" : "false") << ",\n";
+    content << "  \"provider_separated_sorted_group_count\": " << (provider_separated_sorted ? "true" : "false") << ",\n";
+    content << "  \"sort_core_reveals_comparisons\": " << (provider_separated_sorted ? "true" : "false") << ",\n";
     content << "  \"plaintext_count_then_share\": " << (fast_preprocess ? "true" : "false") << ",\n";
     content << "  \"secure_core_status\": \"" << secure_core_status << "\",\n";
     content << "  \"role_paths\": {\n";
@@ -1344,6 +1356,158 @@ sbMatrix int_eq_public(
     return out;
 }
 
+si64Matrix provider_separated_sorted_counts(
+    const MultiplierPreprocessConfig& config,
+    const si64Matrix& pk_key_shared,
+    const si64Matrix& pk_null_shared,
+    const si64Matrix& fk_key_shared,
+    const si64Matrix& fk_null_shared,
+    u64 n_pk,
+    u64 n_fk,
+    Sh3Encryptor& enc,
+    Sh3Evaluator& eval,
+    Sh3Runtime& runtime)
+{
+    const u64 padded = roundUpToPowerOfTwo(n_pk + n_fk);
+    const u64 pad_rows = padded - n_pk - n_fk;
+
+    auto pk_table_id = public_i64_column(0, n_pk, config.role);
+    auto fk_table_id = public_i64_column(1, n_fk, config.role);
+    auto pad_table_id = public_i64_column(2, pad_rows, config.role);
+    auto pk_row_id = public_i64_row_ids(n_pk, config.role);
+    auto fk_row_id = public_i64_row_ids(n_fk, config.role);
+    auto pad_row_id = public_i64_row_ids(pad_rows, config.role);
+
+    auto pk_not_null_flag = int_eq_public(pk_null_shared, 0, config.role, eval, runtime);
+    auto fk_not_null_flag = int_eq_public(fk_null_shared, 0, config.role, eval, runtime);
+    auto pk_not_null = bool_to_si64(pk_not_null_flag, config.role, enc, eval, runtime);
+    auto fk_contrib = bool_to_si64(fk_not_null_flag, config.role, enc, eval, runtime);
+
+    auto pad_key = public_i64_column(0, pad_rows, config.role);
+    auto pad_not_null = public_i64_column(0, pad_rows, config.role);
+    auto pad_fk_contrib = public_i64_column(0, pad_rows, config.role);
+
+    si64Matrix group_key = concat_shared_row_blocks({pk_key_shared, fk_key_shared, pad_key});
+    auto table_id = concat_shared_row_blocks({pk_table_id, fk_table_id, pad_table_id});
+    auto row_id = concat_shared_row_blocks({pk_row_id, fk_row_id, pad_row_id});
+    auto pk_not_null_rows = concat_shared_row_blocks({
+        pk_not_null,
+        public_i64_column(0, n_fk, config.role),
+        pad_not_null,
+    });
+    auto fk_contrib_rows = concat_shared_row_blocks({
+        public_i64_column(0, n_pk, config.role),
+        fk_contrib,
+        pad_fk_contrib,
+    });
+
+    si64Matrix public_tag(padded, 1);
+    public_tag.mShares[0].setZero();
+    public_tag.mShares[1].setZero();
+    for (u64 row = 0; row < padded; ++row) {
+        if (config.role == 0) {
+            public_tag.mShares[0](row, 0) = static_cast<i64>(row);
+        } else if (config.role == 1) {
+            public_tag.mShares[1](row, 0) = static_cast<i64>(row);
+        }
+    }
+    si64Matrix sec_key = group_key;
+    for (u64 row = 0; row < padded; ++row) {
+        sec_key.mShares[0](row, 0) *= static_cast<i64>(std::max<u64>(1, padded));
+        sec_key.mShares[1](row, 0) *= static_cast<i64>(std::max<u64>(1, padded));
+    }
+    sec_key = sec_key + public_tag;
+
+    std::vector<si64Matrix> payloads(static_cast<std::size_t>(padded));
+    for (u64 row = 0; row < padded; ++row) {
+        si64Matrix payload(5, 1);
+        payload.mShares[0](0, 0) = table_id.mShares[0](row, 0);
+        payload.mShares[1](0, 0) = table_id.mShares[1](row, 0);
+        payload.mShares[0](1, 0) = row_id.mShares[0](row, 0);
+        payload.mShares[1](1, 0) = row_id.mShares[1](row, 0);
+        payload.mShares[0](2, 0) = pk_not_null_rows.mShares[0](row, 0);
+        payload.mShares[1](2, 0) = pk_not_null_rows.mShares[1](row, 0);
+        payload.mShares[0](3, 0) = fk_contrib_rows.mShares[0](row, 0);
+        payload.mShares[1](3, 0) = fk_contrib_rows.mShares[1](row, 0);
+        payload.mShares[0](4, 0) = group_key.mShares[0](row, 0);
+        payload.mShares[1](4, 0) = group_key.mShares[1](row, 0);
+        payloads[static_cast<std::size_t>(row)] = std::move(payload);
+    }
+
+    quick_sort_with_other_elements(
+        sec_key,
+        payloads,
+        config.role,
+        enc,
+        eval,
+        runtime,
+        config.secure_sort_min_size);
+
+    auto sorted_table_id = payload_column_to_matrix(payloads, 0);
+    auto sorted_row_id = payload_column_to_matrix(payloads, 1);
+    auto sorted_pk_not_null = payload_column_to_matrix(payloads, 2);
+    auto sorted_fk_contrib = payload_column_to_matrix(payloads, 3);
+    auto sorted_group_key = payload_column_to_matrix(payloads, 4);
+
+    auto same_previous = adjacent_group_equal_flags(sorted_group_key, true, config.role, eval, runtime);
+    auto same_next = adjacent_group_equal_flags(sorted_group_key, false, config.role, eval, runtime);
+    auto prefix_counts = segmented_prefix_sum(sorted_fk_contrib, same_previous, config.role, enc, eval, runtime);
+    auto suffix_counts = segmented_suffix_sum(sorted_fk_contrib, same_next, config.role, enc, eval, runtime);
+    auto sorted_group_counts = prefix_counts + suffix_counts - sorted_fk_contrib;
+
+    auto zero_sorted = public_i64_column(0, padded, config.role);
+    sbMatrix is_pk_row;
+    cipher_eq(config.role, sorted_table_id, zero_sorted, is_pk_row, eval, runtime);
+    auto sorted_pk_is_non_null = int_eq_public(sorted_pk_not_null, 1, config.role, eval, runtime);
+    auto output_pk_row = bool_and_matrix(is_pk_row, sorted_pk_is_non_null, config.role, enc, eval, runtime);
+    auto selected_counts = select_si64_by_bool(
+        sorted_group_counts,
+        zero_sorted,
+        output_pk_row,
+        config.role,
+        enc,
+        eval,
+        runtime);
+
+    si64Matrix non_pk_sort_key(padded, 1);
+    non_pk_sort_key.mShares[0].setZero();
+    non_pk_sort_key.mShares[1].setZero();
+    for (u64 row = 0; row < padded; ++row) {
+        const i64 public_key = static_cast<i64>(n_pk + row);
+        if (config.role == 0) {
+            non_pk_sort_key.mShares[0](row, 0) = public_key;
+        } else if (config.role == 1) {
+            non_pk_sort_key.mShares[1](row, 0) = public_key;
+        }
+    }
+    auto sort_back_key = select_si64_by_bool(
+        sorted_row_id,
+        non_pk_sort_key,
+        is_pk_row,
+        config.role,
+        enc,
+        eval,
+        runtime);
+    auto count_payloads = column_to_payload_vector(selected_counts);
+    quick_sort_with_other_elements(
+        sort_back_key,
+        count_payloads,
+        config.role,
+        enc,
+        eval,
+        runtime,
+        config.secure_sort_min_size);
+
+    si64Matrix counts(n_pk, 1);
+    counts.mShares[0].setZero();
+    counts.mShares[1].setZero();
+    for (u64 row = 0; row < n_pk; ++row) {
+        counts.mShares[0](row, 0) = count_payloads[static_cast<std::size_t>(row)].mShares[0](0, 0);
+        counts.mShares[1](row, 0) = count_payloads[static_cast<std::size_t>(row)].mShares[1](0, 0);
+    }
+    return counts;
+}
+
 void run_secure_multiplier_shared_values_fast(const MultiplierPreprocessConfig& config)
 {
     if (config.role < 0 || config.role > 2) {
@@ -1479,7 +1643,19 @@ void run_secure_multiplier_shared_values_provider_separated(const MultiplierPrep
     counts.mShares[0].setZero();
     counts.mShares[1].setZero();
 
-    if (n_fk > 0) {
+    if (secure_multiplier_provider_separated_sorted_enabled()) {
+        counts = provider_separated_sorted_counts(
+            config,
+            pk_key_shared,
+            pk_null_shared,
+            fk_key_shared,
+            fk_null_shared,
+            n_pk,
+            n_fk,
+            enc,
+            eval,
+            runtime);
+    } else if (n_fk > 0) {
         auto fk_not_null = int_eq_public(fk_null_shared, 0, config.role, eval, runtime);
         for (u64 pk_row = 0; pk_row < n_pk; ++pk_row) {
             auto pk_key_rows = repeat_int_scalar_rows(int_row_slice(pk_key_shared, pk_row, 1), n_fk);
