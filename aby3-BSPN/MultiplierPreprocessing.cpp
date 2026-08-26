@@ -75,6 +75,32 @@ struct MultiplierPreprocessConfig {
     u64 secure_sort_min_size = 32;
 };
 
+bool env_flag_enabled(const char* name, bool default_value)
+{
+    const char* value = std::getenv(name);
+    if (value == nullptr || *value == '\0') {
+        return default_value;
+    }
+    std::string normalized(value);
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    if (normalized == "0" || normalized == "false" || normalized == "no" || normalized == "off") {
+        return false;
+    }
+    return true;
+}
+
+bool secure_multiplier_fast_preprocess_enabled()
+{
+    return env_flag_enabled("BSPN_MULTIPLIER_FAST_PREPROCESS", true);
+}
+
+bool secure_multiplier_provider_separated_enabled()
+{
+    return env_flag_enabled("BSPN_MULTIPLIER_PROVIDER_SEPARATED", false);
+}
+
 bool secure_leaf_sorted_group_enabled()
 {
     const char* value = std::getenv("SECURE_LEAF_MATERIALIZE_STRATEGY");
@@ -159,6 +185,7 @@ void secure_share_i64_column(
 std::string json_escape(const std::string& input);
 void write_text_file(const std::string& path, const std::string& content);
 sbMatrix bool_not_matrix(sbMatrix value, int role);
+sbMatrix bool_and_matrix(sbMatrix lhs, sbMatrix rhs, int role, Sh3Encryptor& enc, Sh3Evaluator& eval, Sh3Runtime& runtime);
 
 void sync_value_from_party(int role, int owner_party, Sh3Runtime& runtime, u64& value)
 {
@@ -753,6 +780,16 @@ void write_secure_shared_values_manifest(
     size_t fk_row_count,
     const std::string& artifact_dir)
 {
+    const bool fast_preprocess = secure_multiplier_fast_preprocess_enabled();
+    const bool provider_separated = secure_multiplier_provider_separated_enabled();
+    const std::string join_key_input_mode = provider_separated
+        ? "provider_separated_secret_shares"
+        : "centralized_plaintext_input_party";
+    const std::string secure_core_status = fast_preprocess
+        ? "legacy_plaintext_count_then_secret_share"
+        : (provider_separated
+            ? "pairwise_secret_shared_key_equality_count_no_reveal"
+            : "centralized_plaintext_input_party_sorted_segmented_scan_count_no_reveal");
     const std::string manifest_path = artifact_dir + "/manifest.json";
     std::ostringstream content;
     content << "{\n";
@@ -771,7 +808,11 @@ void write_secure_shared_values_manifest(
     content << "  \"pk_input_party\": " << config.pk_input_party << ",\n";
     content << "  \"fk_input_party\": " << config.fk_input_party << ",\n";
     content << "  \"share_kind\": \"ABY3_REPLICATED_PAIR_I64\",\n";
-    content << "  \"secure_core_status\": \"sorted_segmented_scan_count_no_reveal\",\n";
+    content << "  \"construction_mode\": \"" << (provider_separated ? "privacy_aligned" : "legacy") << "\",\n";
+    content << "  \"join_key_input_mode\": \"" << join_key_input_mode << "\",\n";
+    content << "  \"provider_separated_key_inputs\": " << (provider_separated ? "true" : "false") << ",\n";
+    content << "  \"plaintext_count_then_share\": " << (fast_preprocess ? "true" : "false") << ",\n";
+    content << "  \"secure_core_status\": \"" << secure_core_status << "\",\n";
     content << "  \"role_paths\": {\n";
     for (int role = 0; role < 3; ++role) {
         content << "    \"" << role << "\": {";
@@ -1355,20 +1396,153 @@ void run_secure_multiplier_shared_values_fast(const MultiplierPreprocessConfig& 
     }
 }
 
-bool secure_multiplier_fast_preprocess_enabled()
+void run_secure_multiplier_shared_values_provider_separated(const MultiplierPreprocessConfig& config)
 {
-    const char* value = std::getenv("BSPN_MULTIPLIER_FAST_PREPROCESS");
-    if (value == nullptr || *value == '\0') {
-        return true;
+    if (config.role < 0 || config.role > 2) {
+        throw std::runtime_error("secure_shared_values mode requires --role in {0,1,2}.");
     }
-    const std::string normalized(value);
-    return normalized != "0" && normalized != "false" && normalized != "FALSE" && normalized != "off";
+    if (config.pk_input_party < 0 || config.pk_input_party > 2) {
+        throw std::runtime_error("secure_shared_values mode requires --pk_input_party in {0,1,2}.");
+    }
+    if (config.fk_input_party < 0 || config.fk_input_party > 2) {
+        throw std::runtime_error("secure_shared_values mode requires --fk_input_party in {0,1,2}.");
+    }
+    if (config.pk_input_party == config.fk_input_party) {
+        throw std::runtime_error(
+            "provider-separated secure multiplier preprocessing requires distinct PK and FK input parties.");
+    }
+    if (config.fk_sample_rate <= 0.0) {
+        throw std::runtime_error("FK sample rate must be positive.");
+    }
+
+    IOService ios;
+    Sh3Encryptor enc;
+    Sh3Evaluator eval;
+    Sh3Runtime runtime;
+    basic_setup(static_cast<u64>(config.role), ios, enc, eval, runtime);
+
+    std::vector<NormalizedKey> pk_keys;
+    std::vector<NormalizedKey> fk_keys;
+    u64 n_pk = 0;
+    u64 n_fk = 0;
+
+    if (config.role == config.pk_input_party) {
+        pk_keys = load_key_column_csv(config.pk_csv_path, config.pk_key_column, config.pk_has_header);
+        n_pk = static_cast<u64>(pk_keys.size());
+    }
+    if (config.role == config.fk_input_party) {
+        fk_keys = load_key_column_csv(config.fk_csv_path, config.fk_key_column, config.fk_has_header);
+        n_fk = static_cast<u64>(fk_keys.size());
+    }
+
+    sync_value_from_party(config.role, config.pk_input_party, runtime, n_pk);
+    sync_value_from_party(config.role, config.fk_input_party, runtime, n_fk);
+
+    i64Matrix plain_pk_key(n_pk, 1);
+    i64Matrix plain_pk_is_null(n_pk, 1);
+    i64Matrix plain_fk_key(n_fk, 1);
+    i64Matrix plain_fk_is_null(n_fk, 1);
+    plain_pk_key.setZero();
+    plain_pk_is_null.setConstant(1);
+    plain_fk_key.setZero();
+    plain_fk_is_null.setConstant(1);
+
+    if (config.role == config.pk_input_party) {
+        if (static_cast<u64>(pk_keys.size()) != n_pk) {
+            throw std::runtime_error("PK owner has inconsistent key row count.");
+        }
+        for (u64 row = 0; row < n_pk; ++row) {
+            plain_pk_key(row, 0) = pk_keys[static_cast<std::size_t>(row)].value;
+            plain_pk_is_null(row, 0) = pk_keys[static_cast<std::size_t>(row)].is_null ? 1 : 0;
+        }
+    }
+    if (config.role == config.fk_input_party) {
+        if (static_cast<u64>(fk_keys.size()) != n_fk) {
+            throw std::runtime_error("FK owner has inconsistent key row count.");
+        }
+        for (u64 row = 0; row < n_fk; ++row) {
+            plain_fk_key(row, 0) = fk_keys[static_cast<std::size_t>(row)].value;
+            plain_fk_is_null(row, 0) = fk_keys[static_cast<std::size_t>(row)].is_null ? 1 : 0;
+        }
+    }
+
+    si64Matrix pk_key_shared;
+    si64Matrix pk_null_shared;
+    si64Matrix fk_key_shared;
+    si64Matrix fk_null_shared;
+    secure_share_i64_column(config.role, config.pk_input_party, plain_pk_key, pk_key_shared, enc, runtime);
+    secure_share_i64_column(config.role, config.pk_input_party, plain_pk_is_null, pk_null_shared, enc, runtime);
+    secure_share_i64_column(config.role, config.fk_input_party, plain_fk_key, fk_key_shared, enc, runtime);
+    secure_share_i64_column(config.role, config.fk_input_party, plain_fk_is_null, fk_null_shared, enc, runtime);
+
+    si64Matrix counts(n_pk, 1);
+    counts.mShares[0].setZero();
+    counts.mShares[1].setZero();
+
+    if (n_fk > 0) {
+        auto fk_not_null = int_eq_public(fk_null_shared, 0, config.role, eval, runtime);
+        for (u64 pk_row = 0; pk_row < n_pk; ++pk_row) {
+            auto pk_key_rows = repeat_int_scalar_rows(int_row_slice(pk_key_shared, pk_row, 1), n_fk);
+            auto pk_null_rows = repeat_int_scalar_rows(int_row_slice(pk_null_shared, pk_row, 1), n_fk);
+            sbMatrix key_equal;
+            cipher_eq(config.role, pk_key_rows, fk_key_shared, key_equal, eval, runtime);
+            auto pk_not_null = int_eq_public(pk_null_rows, 0, config.role, eval, runtime);
+            auto valid = bool_and_matrix(key_equal, pk_not_null, config.role, enc, eval, runtime);
+            valid = bool_and_matrix(valid, fk_not_null, config.role, enc, eval, runtime);
+            auto valid_int = bool_to_si64(valid, config.role, enc, eval, runtime);
+            for (u64 fk_row = 0; fk_row < n_fk; ++fk_row) {
+                counts.mShares[0](pk_row, 0) += valid_int.mShares[0](fk_row, 0);
+                counts.mShares[1](pk_row, 0) += valid_int.mShares[1](fk_row, 0);
+            }
+        }
+    }
+
+    const i64 fixed_scale = static_cast<i64>(std::llround(
+        static_cast<double>(kMultiplierFixedOne) / config.fk_sample_rate));
+    si64Matrix mu_fixed(n_pk, 1);
+    mu_fixed.mShares[0].setZero();
+    mu_fixed.mShares[1].setZero();
+    for (u64 row = 0; row < n_pk; ++row) {
+        mu_fixed.mShares[0](row, 0) = counts.mShares[0](row, 0) * fixed_scale;
+        mu_fixed.mShares[1](row, 0) = counts.mShares[1](row, 0) * fixed_scale;
+    }
+
+    auto zero_counts = shared_zero_int_matrix(n_pk, 1);
+    sbMatrix is_zero_count;
+    cipher_eq(config.role, counts, zero_counts, is_zero_count, eval, runtime);
+    const auto one_scalar = share_int_scalar(kMultiplierFixedOne, 0, enc, runtime, config.role);
+    const auto one_rows = repeat_int_scalar_rows(one_scalar, n_pk);
+    si64Matrix mu_nn_fixed = select_si64_by_bool(
+        one_rows,
+        mu_fixed,
+        is_zero_count,
+        config.role,
+        enc,
+        eval,
+        runtime);
+
+    ensure_dir(config.output_prefix);
+    const std::string role_dir = config.output_prefix + "/role_" + std::to_string(config.role);
+    ensure_dir(role_dir);
+    write_share_pair_matrix(role_dir + "/mu.shares.bin", mu_fixed);
+    write_share_pair_matrix(role_dir + "/mu_nn.shares.bin", mu_nn_fixed);
+    if (config.role == 0) {
+        write_secure_shared_values_manifest(
+            config,
+            static_cast<std::size_t>(n_pk),
+            static_cast<std::size_t>(n_fk),
+            config.output_prefix);
+    }
 }
 
 void run_secure_multiplier_shared_values(const MultiplierPreprocessConfig& config)
 {
     if (secure_multiplier_fast_preprocess_enabled()) {
         run_secure_multiplier_shared_values_fast(config);
+        return;
+    }
+    if (secure_multiplier_provider_separated_enabled()) {
+        run_secure_multiplier_shared_values_provider_separated(config);
         return;
     }
 
