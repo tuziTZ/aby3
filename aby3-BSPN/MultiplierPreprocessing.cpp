@@ -117,6 +117,11 @@ bool secure_multiplier_provider_separated_partitioned_enabled()
     return env_flag_enabled("BSPN_MULTIPLIER_PROVIDER_SEPARATED_PARTITIONED", false);
 }
 
+bool secure_multiplier_forbid_server_reveal_enabled()
+{
+    return env_flag_enabled("BSPN_MULTIPLIER_FORBID_SERVER_REVEAL", false);
+}
+
 bool secure_leaf_sorted_group_enabled()
 {
     const char* value = std::getenv("SECURE_LEAF_MATERIALIZE_STRATEGY");
@@ -1967,6 +1972,9 @@ si64Matrix provider_separated_sorted_counts(
     Sh3Evaluator& eval,
     Sh3Runtime& runtime)
 {
+    if (secure_multiplier_forbid_server_reveal_enabled()) {
+        throw std::runtime_error("privacy-aligned multiplier preprocessing forbids comparison-revealing sorted core");
+    }
     const u64 padded = roundUpToPowerOfTwo(n_pk + n_fk);
     const u64 pad_rows = padded - n_pk - n_fk;
 
