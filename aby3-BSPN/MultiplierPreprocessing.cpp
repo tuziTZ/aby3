@@ -15,11 +15,13 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <cstdio>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <unistd.h>
 #include <random>
 #include <unordered_map>
 #include <utility>
@@ -130,6 +132,11 @@ bool secure_multiplier_layer_batch_enabled()
 bool secure_multiplier_public_profile_enabled()
 {
     return env_flag_enabled("BSPN_MULTIPLIER_PROFILE_PUBLIC", false);
+}
+
+bool secure_multiplier_streaming_artifact_enabled()
+{
+    return env_flag_enabled("BSPN_MULTIPLIER_STREAMING_ARTIFACT", false);
 }
 
 bool secure_multiplier_forbid_server_reveal_enabled()
@@ -628,6 +635,77 @@ void write_share_pair_matrix(const std::string& path, const si64Matrix& values)
         output.write(reinterpret_cast<const char*>(&lhs), sizeof(i64));
         output.write(reinterpret_cast<const char*>(&rhs), sizeof(i64));
     }
+}
+
+void write_share_pair_matrix_atomic(const std::string& path, const si64Matrix& values)
+{
+    const std::string tmp_path = path + ".tmp";
+    write_share_pair_matrix(tmp_path, values);
+    if (std::rename(tmp_path.c_str(), path.c_str()) != 0) {
+        throw std::runtime_error("Failed to publish share output file " + path + ": " + std::strerror(errno));
+    }
+}
+
+void append_share_pair_matrix(const std::string& path, const si64Matrix& values)
+{
+    std::ofstream output(path, std::ios::binary | std::ios::app);
+    if (!output.is_open()) {
+        throw std::runtime_error("Failed to open share append file: " + path);
+    }
+    for (u64 row = 0; row < values.rows(); ++row) {
+        const i64 lhs = values.mShares[0](row, 0);
+        const i64 rhs = values.mShares[1](row, 0);
+        output.write(reinterpret_cast<const char*>(&lhs), sizeof(i64));
+        output.write(reinterpret_cast<const char*>(&rhs), sizeof(i64));
+    }
+}
+
+std::uint64_t file_size_bytes(const std::string& path)
+{
+    struct stat st;
+    if (::stat(path.c_str(), &st) != 0) {
+        throw std::runtime_error("Failed to stat file " + path + ": " + std::strerror(errno));
+    }
+    return static_cast<std::uint64_t>(st.st_size);
+}
+
+std::string shell_quote_path(const std::string& path)
+{
+    std::string quoted = "'";
+    for (char ch : path) {
+        if (ch == '\'') {
+            quoted += "'\\''";
+        } else {
+            quoted += ch;
+        }
+    }
+    quoted += "'";
+    return quoted;
+}
+
+std::string sha256_file_external(const std::string& path)
+{
+    const std::string command = "sha256sum " + shell_quote_path(path);
+    FILE* pipe = popen(command.c_str(), "r");
+    if (pipe == nullptr) {
+        throw std::runtime_error("Failed to run sha256sum for file: " + path);
+    }
+    char buffer[256];
+    std::string output;
+    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        output += buffer;
+    }
+    const int status = pclose(pipe);
+    if (status != 0) {
+        throw std::runtime_error("sha256sum failed for file: " + path);
+    }
+    std::istringstream stream(output);
+    std::string digest;
+    stream >> digest;
+    if (digest.size() != 64) {
+        throw std::runtime_error("sha256sum returned malformed digest for file: " + path);
+    }
+    return digest;
 }
 
 std::vector<i64> read_i64_records(const std::string& path)
@@ -2171,6 +2249,130 @@ std::vector<ProviderLocalKeyRow> provider_local_partitioned_fk_group_rows(
     return out;
 }
 
+std::vector<ProviderLocalKeyRow> provider_local_partition_rows_for_part(
+    const std::vector<NormalizedKey>& keys,
+    const PartitionContract& contract,
+    u64 part,
+    u64 capacity,
+    bool& overflow)
+{
+    std::vector<ProviderLocalKeyRow> rows;
+    overflow = false;
+    for (u64 idx = 0; idx < static_cast<u64>(keys.size()); ++idx) {
+        if (keys[static_cast<std::size_t>(idx)].is_null) {
+            continue;
+        }
+        u64 key_part = 0;
+        try {
+            key_part = assign_public_partition(contract, keys[static_cast<std::size_t>(idx)]);
+        } catch (const std::exception&) {
+            overflow = true;
+            continue;
+        }
+        if (key_part != part) {
+            continue;
+        }
+        rows.push_back({keys[static_cast<std::size_t>(idx)], idx, 1});
+        if (rows.size() > capacity) {
+            overflow = true;
+        }
+    }
+    std::sort(rows.begin(), rows.end(), [](const ProviderLocalKeyRow& lhs, const ProviderLocalKeyRow& rhs) {
+        if (lhs.key.value != rhs.key.value) {
+            return lhs.key.value < rhs.key.value;
+        }
+        return lhs.original_index < rhs.original_index;
+    });
+    std::vector<ProviderLocalKeyRow> out;
+    out.reserve(static_cast<std::size_t>(capacity));
+    u64 slot = 0;
+    for (; slot < static_cast<u64>(rows.size()) && slot < capacity; ++slot) {
+        auto row = rows[static_cast<std::size_t>(slot)];
+        row.original_index = slot;
+        out.push_back(row);
+    }
+    for (; slot < capacity; ++slot) {
+        out.push_back({NormalizedKey{0, true}, slot, 0});
+    }
+    return out;
+}
+
+std::vector<ProviderLocalKeyRow> provider_local_fk_group_rows_for_part(
+    const std::vector<NormalizedKey>& keys,
+    const PartitionContract& contract,
+    u64 part,
+    u64 capacity,
+    bool& overflow)
+{
+    std::unordered_map<i64, i64> counts;
+    overflow = false;
+    for (const auto& key : keys) {
+        if (key.is_null) {
+            continue;
+        }
+        u64 key_part = 0;
+        try {
+            key_part = assign_public_partition(contract, key);
+        } catch (const std::exception&) {
+            overflow = true;
+            continue;
+        }
+        if (key_part != part) {
+            continue;
+        }
+        i64& value = counts[key.value];
+        if (value == std::numeric_limits<i64>::max()) {
+            overflow = true;
+            continue;
+        }
+        ++value;
+        if (counts.size() > capacity) {
+            overflow = true;
+        }
+    }
+    std::vector<ProviderLocalKeyRow> rows;
+    rows.reserve(counts.size());
+    for (const auto& item : counts) {
+        rows.push_back({NormalizedKey{item.first, false}, 0, item.second});
+    }
+    std::sort(rows.begin(), rows.end(), [](const ProviderLocalKeyRow& lhs, const ProviderLocalKeyRow& rhs) {
+        return lhs.key.value < rhs.key.value;
+    });
+    std::vector<ProviderLocalKeyRow> out;
+    out.reserve(static_cast<std::size_t>(capacity));
+    u64 slot = 0;
+    for (; slot < static_cast<u64>(rows.size()) && slot < capacity; ++slot) {
+        auto row = rows[static_cast<std::size_t>(slot)];
+        row.original_index = slot;
+        out.push_back(row);
+    }
+    for (; slot < capacity; ++slot) {
+        out.push_back({NormalizedKey{0, true}, slot, 0});
+    }
+    return out;
+}
+
+void populate_plain_rows(
+    const std::vector<ProviderLocalKeyRow>& rows,
+    i64Matrix& key,
+    i64Matrix& is_null,
+    i64Matrix& original_index,
+    i64Matrix* multiplicity = nullptr)
+{
+    if (static_cast<u64>(rows.size()) != static_cast<u64>(key.rows())) {
+        throw std::runtime_error("Provider-local partition row count does not match public capacity.");
+    }
+    for (u64 row = 0; row < static_cast<u64>(rows.size()); ++row) {
+        const auto& local_row = rows[static_cast<std::size_t>(row)];
+        key(row, 0) = local_row.key.value;
+        is_null(row, 0) = local_row.key.is_null ? 1 : 0;
+        original_index(row, 0) = static_cast<i64>(local_row.original_index);
+        if (multiplicity != nullptr) {
+            (*multiplicity)(row, 0) = local_row.multiplicity;
+        }
+    }
+}
+
 si64Matrix provider_separated_oblivious_merge_counts(
     const MultiplierPreprocessConfig& config,
     const si64Matrix& pk_key_shared,
@@ -2363,6 +2565,169 @@ si64Matrix provider_separated_partitioned_oblivious_merge_counts(
         fk_offset += fk_cap;
     }
     return counts;
+}
+
+struct StreamingShareFileMeta {
+    std::string path;
+    std::uint64_t bytes = 0;
+    std::string sha256;
+};
+
+struct StreamingPartitionMeta {
+    u64 partition_id = 0;
+    u64 pk_capacity = 0;
+    u64 fk_capacity = 0;
+    std::array<StreamingShareFileMeta, 3> mu;
+    std::array<StreamingShareFileMeta, 3> mu_nn;
+};
+
+void multiplier_public_barrier(int role, Sh3Runtime& runtime)
+{
+    for (int owner = 0; owner < 3; ++owner) {
+        u64 marker = static_cast<u64>(owner + 1);
+        sync_value_from_party(role, owner, runtime, marker);
+    }
+}
+
+std::string partition_dir_name(u64 part)
+{
+    std::ostringstream out;
+    out << "partition_" << std::setw(4) << std::setfill('0') << part;
+    return out.str();
+}
+
+void maybe_fail_streaming_writer(const std::string& point, u64 part = std::numeric_limits<u64>::max())
+{
+    const char* value = std::getenv("BSPN_MULTIPLIER_STREAMING_FAIL_POINT");
+    if (value == nullptr || *value == '\0') {
+        return;
+    }
+    const std::string requested(value);
+    if (requested == "0" || requested == "false" || requested == "off") {
+        return;
+    }
+    if (requested == point) {
+        throw std::runtime_error("injected public streaming writer failure: " + point);
+    }
+    if (part != std::numeric_limits<u64>::max()) {
+        const std::string after_partition = "after_partition_" + std::to_string(part);
+        if (requested == after_partition) {
+            throw std::runtime_error("injected public streaming writer failure: " + after_partition);
+        }
+    }
+}
+
+json streaming_manifest_base(
+    const MultiplierPreprocessConfig& config,
+    size_t pk_row_count,
+    size_t fk_row_count,
+    const PartitionContract& contract,
+    const std::vector<StreamingPartitionMeta>& partitions,
+    const std::string& artifact_dir)
+{
+    const auto partition_boundaries = parse_i64_csv_env("BSPN_MULTIPLIER_PARTITION_BOUNDARIES");
+    const auto partition_pk_capacities = parse_u64_csv_env("BSPN_MULTIPLIER_PARTITION_PK_CAPACITIES");
+    const auto partition_fk_capacities = parse_u64_csv_env("BSPN_MULTIPLIER_PARTITION_FK_CAPACITIES");
+    const bool grouped_capacity_is_domain_width =
+        public_domain_width_covers_capacities(partition_boundaries, partition_pk_capacities) &&
+        public_domain_width_covers_capacities(partition_boundaries, partition_fk_capacities);
+
+    json doc;
+    doc["format_name"] = "BSPN_MULTIPLIER_PAYLOAD";
+    doc["format_version"] = 3;
+    doc["mode"] = "secure_shared_values";
+    doc["relationship_id"] = config.relationship_id;
+    doc["pk_csv_path"] = config.pk_csv_path;
+    doc["fk_csv_path"] = config.fk_csv_path;
+    doc["pk_key_column"] = config.pk_key_column;
+    doc["fk_key_column"] = config.fk_key_column;
+    doc["fk_sample_rate"] = config.fk_sample_rate;
+    doc["pk_row_count"] = pk_row_count;
+    doc["fk_row_count"] = fk_row_count;
+    doc["fixed_decimal_bits"] = kMultiplierFixedDecimalBits;
+    doc["pk_input_party"] = config.pk_input_party;
+    doc["fk_input_party"] = config.fk_input_party;
+    doc["share_kind"] = "ABY3_REPLICATED_PAIR_I64";
+    doc["construction_mode"] = "privacy_aligned";
+    doc["join_key_input_mode"] = "provider_separated_secret_shares";
+    doc["provider_separated_key_inputs"] = true;
+    doc["provider_separated_sorted_group_count"] = false;
+    doc["provider_separated_oblivious_merge_group_count"] = false;
+    doc["provider_separated_partitioned_oblivious_merge_group_count"] = true;
+    doc["provider_local_fk_group_count"] = true;
+    doc["fk_group_count_exact"] = true;
+    doc["fk_group_multiplicity_secret_shared"] = true;
+    doc["provider_local_partition"] = true;
+    doc["provider_local_sort"] = true;
+    doc["server_oblivious_merge"] = true;
+    doc["sort_core_reveals_comparisons"] = false;
+    doc["network_execution_mode"] = secure_multiplier_layer_batch_enabled() ? "public_layer_batched" : "scalar_reference";
+    doc["network_schedule_version"] = "bitonic_compare_exchange_v1";
+    doc["record_schema_version"] = "streaming_multiplier_partition_v1";
+    doc["partition_boundaries_public"] = true;
+    doc["partition_boundaries_query_independent"] = true;
+    doc["partition_real_cardinalities_hidden"] = true;
+    doc["partition_capacities_public"] = true;
+    doc["partition_boundary_rule"] = "public_half_open_ranges_last_closed";
+    doc["partition_boundaries"] = join_i64_values(partition_boundaries);
+    doc["partition_pk_capacities"] = join_u64_values(partition_pk_capacities);
+    doc["partition_fk_capacities"] = join_u64_values(partition_fk_capacities);
+    doc["capacity_policy"] = grouped_capacity_is_domain_width ? "public_key_domain_width" : "explicit_public_group_capacity";
+    doc["capacity_deterministic"] = grouped_capacity_is_domain_width;
+    doc["output_alignment_mode"] = "provider_local_partitioned_model_order";
+    doc["overflow_policy"] = "fail_closed";
+    doc["plaintext_count_then_share"] = false;
+    doc["secure_core_status"] = "provider_local_distinct_fk_partitioned_oblivious_merge";
+    doc["artifact_state"] = "complete";
+    doc["streaming_partition_execution"] = true;
+    doc["fixed_partition_file_schedule"] = true;
+    doc["partial_artifact_fail_closed"] = true;
+    doc["atomic_acceptance_finalization"] = true;
+    doc["expected_role_count"] = 3;
+    doc["partition_count"] = static_cast<std::uint64_t>(partitions.size());
+    doc["role_paths"] = json::object();
+    for (int role = 0; role < 3; ++role) {
+        doc["role_paths"][std::to_string(role)] = {
+            {"mu_path", artifact_dir + "/role_" + std::to_string(role) + "/mu.shares.bin"},
+            {"mu_nn_path", artifact_dir + "/role_" + std::to_string(role) + "/mu_nn.shares.bin"},
+        };
+    }
+    doc["streaming_partitions"] = json::array();
+    for (const auto& part : partitions) {
+        json part_doc;
+        part_doc["partition_id"] = part.partition_id;
+        part_doc["pk_capacity"] = part.pk_capacity;
+        part_doc["fk_group_capacity"] = part.fk_capacity;
+        part_doc["expected_mu_bytes"] = part.pk_capacity * sizeof(i64) * 2;
+        part_doc["expected_mu_nn_bytes"] = part.pk_capacity * sizeof(i64) * 2;
+        part_doc["role_shares"] = json::object();
+        for (int role = 0; role < 3; ++role) {
+            part_doc["role_shares"][std::to_string(role)] = {
+                {"mu_path", part.mu[role].path},
+                {"mu_bytes", part.mu[role].bytes},
+                {"mu_sha256", part.mu[role].sha256},
+                {"mu_nn_path", part.mu_nn[role].path},
+                {"mu_nn_bytes", part.mu_nn[role].bytes},
+                {"mu_nn_sha256", part.mu_nn[role].sha256},
+            };
+        }
+        doc["streaming_partitions"].push_back(part_doc);
+    }
+    return doc;
+}
+
+void write_streaming_manifest_atomic(const std::string& path, const json& doc)
+{
+    const std::string tmp_path = path + ".tmp";
+    std::ofstream output(tmp_path);
+    if (!output.is_open()) {
+        throw std::runtime_error("Failed to open streaming manifest temp file: " + tmp_path);
+    }
+    output << doc.dump(2) << "\n";
+    output.close();
+    if (std::rename(tmp_path.c_str(), path.c_str()) != 0) {
+        throw std::runtime_error("Failed to publish streaming manifest " + path + ": " + std::strerror(errno));
+    }
 }
 
 si64Matrix provider_separated_sorted_counts(
@@ -2581,6 +2946,239 @@ void run_secure_multiplier_shared_values_fast(const MultiplierPreprocessConfig& 
             fk_keys.size(),
             config.output_prefix);
     }
+}
+
+void run_secure_multiplier_shared_values_provider_separated_streaming(const MultiplierPreprocessConfig& config)
+{
+    if (config.role < 0 || config.role > 2) {
+        throw std::runtime_error("secure_shared_values mode requires --role in {0,1,2}.");
+    }
+    if (config.pk_input_party < 0 || config.pk_input_party > 2 ||
+        config.fk_input_party < 0 || config.fk_input_party > 2 ||
+        config.pk_input_party == config.fk_input_party) {
+        throw std::runtime_error("streaming provider-separated preprocessing requires distinct input parties.");
+    }
+    if (!secure_multiplier_provider_separated_partitioned_enabled() ||
+        !secure_multiplier_provider_local_fk_group_count_enabled()) {
+        throw std::runtime_error(
+            "streaming multiplier artifacts require partitioned provider-local FK group/count preprocessing.");
+    }
+    if (config.fk_sample_rate <= 0.0) {
+        throw std::runtime_error("FK sample rate must be positive.");
+    }
+
+    IOService ios;
+    Sh3Encryptor enc;
+    Sh3Evaluator eval;
+    Sh3Runtime runtime;
+    basic_setup(static_cast<u64>(config.role), ios, enc, eval, runtime);
+
+    const PartitionContract partition_contract = parse_partition_contract();
+    const u64 partitions = partition_count(partition_contract);
+    const u64 total_pk_capacity = sum_u64(partition_contract.pk_capacities);
+    const u64 total_fk_capacity = sum_u64(partition_contract.fk_capacities);
+
+    std::vector<NormalizedKey> pk_keys;
+    std::vector<NormalizedKey> fk_keys;
+    u64 n_pk = 0;
+    u64 n_fk = 0;
+    if (config.role == config.pk_input_party) {
+        pk_keys = load_key_column_csv(config.pk_csv_path, config.pk_key_column, config.pk_has_header);
+        n_pk = static_cast<u64>(pk_keys.size());
+    }
+    if (config.role == config.fk_input_party) {
+        fk_keys = load_key_column_csv(config.fk_csv_path, config.fk_key_column, config.fk_has_header);
+        n_fk = static_cast<u64>(fk_keys.size());
+    }
+    sync_value_from_party(config.role, config.pk_input_party, runtime, n_pk);
+    sync_value_from_party(config.role, config.fk_input_party, runtime, n_fk);
+
+    u64 pk_constraint_failed = 0;
+    if (config.role == config.pk_input_party) {
+        pk_constraint_failed = provider_local_keys_unique_in_public_domain(pk_keys, partition_contract) ? 0 : 1;
+    }
+    sync_value_from_party(config.role, config.pk_input_party, runtime, pk_constraint_failed);
+    if (pk_constraint_failed != 0) {
+        throw std::runtime_error("public capacity contract not satisfied");
+    }
+
+    ensure_dir(config.output_prefix);
+    const std::string incomplete_path = config.output_prefix + "/INCOMPLETE";
+    if (config.role == 0) {
+        if (::access((config.output_prefix + "/manifest.json").c_str(), F_OK) == 0) {
+            throw std::runtime_error("streaming final artifact already exists");
+        }
+        write_text_file(incomplete_path, "incomplete\n");
+    }
+    multiplier_public_barrier(config.role, runtime);
+    maybe_fail_streaming_writer("before_partition_0");
+
+    const std::string role_dir = config.output_prefix + "/role_" + std::to_string(config.role);
+    ensure_dir(role_dir);
+    const std::string top_mu_tmp = role_dir + "/mu.shares.bin.tmp";
+    const std::string top_mu_nn_tmp = role_dir + "/mu_nn.shares.bin.tmp";
+    {
+        std::ofstream(top_mu_tmp, std::ios::binary | std::ios::trunc).close();
+        std::ofstream(top_mu_nn_tmp, std::ios::binary | std::ios::trunc).close();
+    }
+
+    const i64 fixed_scale = static_cast<i64>(std::llround(
+        static_cast<double>(kMultiplierFixedOne) / config.fk_sample_rate));
+
+    u64 pk_offset = 0;
+    u64 fk_offset = 0;
+    for (u64 part = 0; part < partitions; ++part) {
+        const u64 pk_cap = partition_contract.pk_capacities[static_cast<std::size_t>(part)];
+        const u64 fk_cap = partition_contract.fk_capacities[static_cast<std::size_t>(part)];
+
+        i64Matrix plain_pk_key(pk_cap, 1);
+        i64Matrix plain_pk_is_null(pk_cap, 1);
+        i64Matrix plain_pk_original_index(pk_cap, 1);
+        i64Matrix plain_fk_key(fk_cap, 1);
+        i64Matrix plain_fk_is_null(fk_cap, 1);
+        i64Matrix plain_fk_original_index(fk_cap, 1);
+        i64Matrix plain_fk_multiplicity(fk_cap, 1);
+        plain_pk_key.setZero();
+        plain_pk_is_null.setConstant(1);
+        plain_pk_original_index.setZero();
+        plain_fk_key.setZero();
+        plain_fk_is_null.setConstant(1);
+        plain_fk_original_index.setZero();
+        plain_fk_multiplicity.setZero();
+
+        u64 pk_overflow = 0;
+        u64 fk_overflow = 0;
+        if (config.role == config.pk_input_party) {
+            bool overflow = false;
+            const auto rows = provider_local_partition_rows_for_part(
+                pk_keys, partition_contract, part, pk_cap, overflow);
+            populate_plain_rows(rows, plain_pk_key, plain_pk_is_null, plain_pk_original_index);
+            pk_overflow = overflow ? 1 : 0;
+        }
+        if (config.role == config.fk_input_party) {
+            bool overflow = false;
+            const auto rows = provider_local_fk_group_rows_for_part(
+                fk_keys, partition_contract, part, fk_cap, overflow);
+            populate_plain_rows(rows, plain_fk_key, plain_fk_is_null, plain_fk_original_index, &plain_fk_multiplicity);
+            fk_overflow = overflow ? 1 : 0;
+        }
+        sync_value_from_party(config.role, config.pk_input_party, runtime, pk_overflow);
+        sync_value_from_party(config.role, config.fk_input_party, runtime, fk_overflow);
+        if (pk_overflow != 0 || fk_overflow != 0) {
+            throw std::runtime_error("public capacity contract not satisfied");
+        }
+
+        si64Matrix pk_key_shared;
+        si64Matrix pk_null_shared;
+        si64Matrix pk_original_index_shared;
+        si64Matrix fk_key_shared;
+        si64Matrix fk_null_shared;
+        si64Matrix fk_original_index_shared;
+        si64Matrix fk_multiplicity_shared;
+        secure_share_i64_column(config.role, config.pk_input_party, plain_pk_key, pk_key_shared, enc, runtime);
+        secure_share_i64_column(config.role, config.pk_input_party, plain_pk_is_null, pk_null_shared, enc, runtime);
+        secure_share_i64_column(config.role, config.pk_input_party, plain_pk_original_index, pk_original_index_shared, enc, runtime);
+        secure_share_i64_column(config.role, config.fk_input_party, plain_fk_key, fk_key_shared, enc, runtime);
+        secure_share_i64_column(config.role, config.fk_input_party, plain_fk_is_null, fk_null_shared, enc, runtime);
+        secure_share_i64_column(config.role, config.fk_input_party, plain_fk_original_index, fk_original_index_shared, enc, runtime);
+        secure_share_i64_column(config.role, config.fk_input_party, plain_fk_multiplicity, fk_multiplicity_shared, enc, runtime);
+
+        auto counts = provider_separated_oblivious_merge_counts(
+            config,
+            pk_key_shared,
+            pk_null_shared,
+            pk_original_index_shared,
+            fk_key_shared,
+            fk_null_shared,
+            fk_original_index_shared,
+            fk_multiplicity_shared,
+            pk_cap,
+            fk_cap,
+            enc,
+            eval,
+            runtime);
+
+        si64Matrix mu_fixed(pk_cap, 1);
+        mu_fixed.mShares[0].setZero();
+        mu_fixed.mShares[1].setZero();
+        for (u64 row = 0; row < pk_cap; ++row) {
+            mu_fixed.mShares[0](row, 0) = counts.mShares[0](row, 0) * fixed_scale;
+            mu_fixed.mShares[1](row, 0) = counts.mShares[1](row, 0) * fixed_scale;
+        }
+        auto zero_counts = shared_zero_int_matrix(pk_cap, 1);
+        sbMatrix is_zero_count;
+        cipher_eq(config.role, counts, zero_counts, is_zero_count, eval, runtime);
+        const auto one_scalar = share_int_scalar(kMultiplierFixedOne, 0, enc, runtime, config.role);
+        const auto one_rows = repeat_int_scalar_rows(one_scalar, pk_cap);
+        si64Matrix mu_nn_fixed = select_si64_by_bool(
+            one_rows,
+            mu_fixed,
+            is_zero_count,
+            config.role,
+            enc,
+            eval,
+            runtime);
+
+        const std::string partition_dir = config.output_prefix + "/partitions/" + partition_dir_name(part);
+        ensure_dir(config.output_prefix + "/partitions");
+        ensure_dir(partition_dir);
+        const std::string part_role_dir = partition_dir + "/role_" + std::to_string(config.role);
+        ensure_dir(part_role_dir);
+        write_share_pair_matrix_atomic(part_role_dir + "/mu.shares.bin", mu_fixed);
+        write_share_pair_matrix_atomic(part_role_dir + "/mu_nn.shares.bin", mu_nn_fixed);
+        append_share_pair_matrix(top_mu_tmp, mu_fixed);
+        append_share_pair_matrix(top_mu_nn_tmp, mu_nn_fixed);
+
+        pk_offset += pk_cap;
+        fk_offset += fk_cap;
+        maybe_fail_streaming_writer("after_partition", part);
+    }
+    (void) pk_offset;
+    (void) fk_offset;
+
+    if (std::rename(top_mu_tmp.c_str(), (role_dir + "/mu.shares.bin").c_str()) != 0) {
+        throw std::runtime_error("Failed to publish role mu shares: " + std::string(std::strerror(errno)));
+    }
+    if (std::rename(top_mu_nn_tmp.c_str(), (role_dir + "/mu_nn.shares.bin").c_str()) != 0) {
+        throw std::runtime_error("Failed to publish role mu_nn shares: " + std::string(std::strerror(errno)));
+    }
+    maybe_fail_streaming_writer("after_role_publish");
+    multiplier_public_barrier(config.role, runtime);
+
+    if (config.role == 0) {
+        std::vector<StreamingPartitionMeta> metas;
+        metas.reserve(static_cast<std::size_t>(partitions));
+        for (u64 part = 0; part < partitions; ++part) {
+            StreamingPartitionMeta meta;
+            meta.partition_id = part;
+            meta.pk_capacity = partition_contract.pk_capacities[static_cast<std::size_t>(part)];
+            meta.fk_capacity = partition_contract.fk_capacities[static_cast<std::size_t>(part)];
+            for (int role = 0; role < 3; ++role) {
+                const std::string base_rel = "partitions/" + partition_dir_name(part) + "/role_" + std::to_string(role);
+                const std::string mu_rel = base_rel + "/mu.shares.bin";
+                const std::string mu_nn_rel = base_rel + "/mu_nn.shares.bin";
+                const std::string mu_path = config.output_prefix + "/" + mu_rel;
+                const std::string mu_nn_path = config.output_prefix + "/" + mu_nn_rel;
+                meta.mu[role] = {mu_rel, file_size_bytes(mu_path), sha256_file_external(mu_path)};
+                meta.mu_nn[role] = {mu_nn_rel, file_size_bytes(mu_nn_path), sha256_file_external(mu_nn_path)};
+            }
+            metas.push_back(std::move(meta));
+        }
+        maybe_fail_streaming_writer("before_manifest_publish");
+        const auto manifest = streaming_manifest_base(
+            config,
+            static_cast<size_t>(total_pk_capacity),
+            static_cast<size_t>(total_fk_capacity),
+            partition_contract,
+            metas,
+            config.output_prefix);
+        write_streaming_manifest_atomic(config.output_prefix + "/manifest.json", manifest);
+        maybe_fail_streaming_writer("after_manifest_publish");
+        if (std::remove(incomplete_path.c_str()) != 0) {
+            throw std::runtime_error("Failed to remove INCOMPLETE marker: " + std::string(std::strerror(errno)));
+        }
+    }
+    multiplier_public_barrier(config.role, runtime);
 }
 
 void run_secure_multiplier_shared_values_provider_separated(const MultiplierPreprocessConfig& config)
@@ -2842,6 +3440,10 @@ void run_secure_multiplier_shared_values(const MultiplierPreprocessConfig& confi
         return;
     }
     if (secure_multiplier_provider_separated_enabled()) {
+        if (secure_multiplier_streaming_artifact_enabled()) {
+            run_secure_multiplier_shared_values_provider_separated_streaming(config);
+            return;
+        }
         run_secure_multiplier_shared_values_provider_separated(config);
         return;
     }
