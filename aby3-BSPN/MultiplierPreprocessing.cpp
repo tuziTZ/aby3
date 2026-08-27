@@ -122,6 +122,16 @@ bool secure_multiplier_provider_local_fk_group_count_enabled()
     return env_flag_enabled("BSPN_MULTIPLIER_PROVIDER_LOCAL_FK_GROUP_COUNT", false);
 }
 
+bool secure_multiplier_layer_batch_enabled()
+{
+    return env_flag_enabled("BSPN_MULTIPLIER_LAYER_BATCH_COMPARE_EXCHANGE", true);
+}
+
+bool secure_multiplier_public_profile_enabled()
+{
+    return env_flag_enabled("BSPN_MULTIPLIER_PROFILE_PUBLIC", false);
+}
+
 bool secure_multiplier_forbid_server_reveal_enabled()
 {
     return env_flag_enabled("BSPN_MULTIPLIER_FORBID_SERVER_REVEAL", false);
@@ -306,9 +316,26 @@ void secure_share_i64_column(
 
 std::string json_escape(const std::string& input);
 void write_text_file(const std::string& path, const std::string& content);
-sbMatrix bool_not_matrix(sbMatrix value, int role);
-sbMatrix bool_and_matrix(sbMatrix lhs, sbMatrix rhs, int role, Sh3Encryptor& enc, Sh3Evaluator& eval, Sh3Runtime& runtime);
-sbMatrix bool_or_matrix(sbMatrix lhs, sbMatrix rhs, int role, Sh3Encryptor& enc, Sh3Evaluator& eval, Sh3Runtime& runtime);
+sbMatrix local_bool_not_matrix(sbMatrix value, int role)
+{
+    sbMatrix out(value.rows(), value.bitCount());
+    bool_cipher_not(role, value, out);
+    return out;
+}
+
+sbMatrix local_bool_and_matrix(sbMatrix lhs, sbMatrix rhs, int role, Sh3Encryptor& enc, Sh3Evaluator& eval, Sh3Runtime& runtime)
+{
+    sbMatrix out(lhs.rows(), lhs.bitCount());
+    bool_cipher_and(role, lhs, rhs, out, enc, eval, runtime);
+    return out;
+}
+
+sbMatrix local_bool_or_matrix(sbMatrix lhs, sbMatrix rhs, int role, Sh3Encryptor& enc, Sh3Evaluator& eval, Sh3Runtime& runtime)
+{
+    sbMatrix out(lhs.rows(), lhs.bitCount());
+    bool_cipher_or(role, lhs, rhs, out, enc, eval, runtime);
+    return out;
+}
 sbMatrix shared_false_bool_matrix(u64 rows, u64 bit_count, int role);
 
 void sync_value_from_party(int role, int owner_party, Sh3Runtime& runtime, u64& value)
@@ -1475,6 +1502,39 @@ si64Matrix int_column_slice(const si64Matrix& src, u64 column_idx)
     return out;
 }
 
+si64Matrix int_rows_gather(const si64Matrix& src, const std::vector<u64>& rows)
+{
+    si64Matrix out(static_cast<u64>(rows.size()), src.cols());
+    for (u64 out_row = 0; out_row < static_cast<u64>(rows.size()); ++out_row) {
+        const u64 src_row = rows[static_cast<std::size_t>(out_row)];
+        if (src_row >= src.rows()) {
+            throw std::runtime_error("Integer matrix gather row index is out of bounds.");
+        }
+        for (u64 col = 0; col < src.cols(); ++col) {
+            out.mShares[0](out_row, col) = src.mShares[0](src_row, col);
+            out.mShares[1](out_row, col) = src.mShares[1](src_row, col);
+        }
+    }
+    return out;
+}
+
+void int_rows_scatter(si64Matrix& dst, const std::vector<u64>& rows, const si64Matrix& values)
+{
+    if (values.rows() != static_cast<u64>(rows.size()) || values.cols() != dst.cols()) {
+        throw std::runtime_error("Integer matrix scatter shape mismatch.");
+    }
+    for (u64 value_row = 0; value_row < static_cast<u64>(rows.size()); ++value_row) {
+        const u64 dst_row = rows[static_cast<std::size_t>(value_row)];
+        if (dst_row >= dst.rows()) {
+            throw std::runtime_error("Integer matrix scatter row index is out of bounds.");
+        }
+        for (u64 col = 0; col < dst.cols(); ++col) {
+            dst.mShares[0](dst_row, col) = values.mShares[0](value_row, col);
+            dst.mShares[1](dst_row, col) = values.mShares[1](value_row, col);
+        }
+    }
+}
+
 si64Matrix int_columns_to_matrix(const std::vector<si64Matrix>& columns)
 {
     if (columns.empty()) {
@@ -1502,7 +1562,7 @@ si64Matrix prefix_sum(
     Sh3Evaluator& eval,
     Sh3Runtime& runtime)
 {
-    auto same_previous = bool_not_matrix(shared_false_bool_matrix(values.rows(), 1, role), role);
+    auto same_previous = local_bool_not_matrix(shared_false_bool_matrix(values.rows(), 1, role), role);
     if (values.rows() > 0) {
         same_previous.mShares[0](0, 0) = 0;
         same_previous.mShares[1](0, 0) = 0;
@@ -1580,11 +1640,69 @@ sbMatrix lexicographic_less_row(
         auto rhs_field = int_row_slice(columns[static_cast<std::size_t>(field_idx)], rhs_row, 1);
         auto lt = int_lt_matrix(lhs_field, rhs_field, role, enc, eval, runtime);
         auto eq = int_eq_matrix(lhs_field, rhs_field, role, eval, runtime);
-        auto term = bool_and_matrix(equal_prefix, lt, role, enc, eval, runtime);
-        less = bool_or_matrix(less, term, role, enc, eval, runtime);
-        equal_prefix = bool_and_matrix(equal_prefix, eq, role, enc, eval, runtime);
+        auto term = local_bool_and_matrix(equal_prefix, lt, role, enc, eval, runtime);
+        less = local_bool_or_matrix(less, term, role, enc, eval, runtime);
+        equal_prefix = local_bool_and_matrix(equal_prefix, eq, role, enc, eval, runtime);
     }
     return less;
+}
+
+sbMatrix lexicographic_less_rows(
+    const std::vector<si64Matrix>& columns,
+    const std::vector<u64>& field_indices,
+    const std::vector<u64>& lhs_rows,
+    const std::vector<u64>& rhs_rows,
+    int role,
+    Sh3Encryptor& enc,
+    Sh3Evaluator& eval,
+    Sh3Runtime& runtime)
+{
+    if (lhs_rows.size() != rhs_rows.size()) {
+        throw std::runtime_error("Batched lexicographic comparator row count mismatch.");
+    }
+    const u64 rows = static_cast<u64>(lhs_rows.size());
+    auto less = shared_false_bool_matrix(rows, 1, role);
+    auto equal_prefix = shared_true_bool_matrix(rows, 1, role);
+    for (u64 field_idx : field_indices) {
+        if (field_idx >= columns.size()) {
+            throw std::runtime_error("Batched oblivious sort comparator field index is out of bounds.");
+        }
+        const auto& column = columns[static_cast<std::size_t>(field_idx)];
+        auto lhs_field = int_rows_gather(column, lhs_rows);
+        auto rhs_field = int_rows_gather(column, rhs_rows);
+        auto lt = int_lt_matrix(lhs_field, rhs_field, role, enc, eval, runtime);
+        auto eq = int_eq_matrix(lhs_field, rhs_field, role, eval, runtime);
+        auto term = local_bool_and_matrix(equal_prefix, lt, role, enc, eval, runtime);
+        less = local_bool_or_matrix(less, term, role, enc, eval, runtime);
+        equal_prefix = local_bool_and_matrix(equal_prefix, eq, role, enc, eval, runtime);
+    }
+    return less;
+}
+
+sbMatrix choose_public_bool_rows(
+    const sbMatrix& if_true,
+    const sbMatrix& if_false,
+    const std::vector<unsigned char>& choose_true,
+    int role)
+{
+    if (if_true.rows() != if_false.rows() ||
+        if_true.bitCount() != if_false.bitCount() ||
+        if_true.rows() != static_cast<u64>(choose_true.size())) {
+        throw std::runtime_error("Public bool chooser shape mismatch.");
+    }
+    sbMatrix out(if_true.rows(), if_true.bitCount());
+    for (u64 row = 0; row < if_true.rows(); ++row) {
+        for (u64 col = 0; col < static_cast<u64>(if_true.mShares[0].cols()); ++col) {
+            if (choose_true[static_cast<std::size_t>(row)] != 0) {
+                out.mShares[0](row, col) = if_true.mShares[0](row, col);
+                out.mShares[1](row, col) = if_true.mShares[1](row, col);
+            } else {
+                out.mShares[0](row, col) = if_false.mShares[0](row, col);
+                out.mShares[1](row, col) = if_false.mShares[1](row, col);
+            }
+        }
+    }
+    return out;
 }
 
 void oblivious_compare_exchange_rows(
@@ -1630,6 +1748,74 @@ void oblivious_compare_exchange_rows(
     }
 }
 
+void assert_public_layer_pairs_disjoint(
+    const std::vector<u64>& lhs_rows,
+    const std::vector<u64>& rhs_rows,
+    u64 row_count)
+{
+    std::vector<unsigned char> seen(static_cast<std::size_t>(row_count), 0);
+    for (u64 idx = 0; idx < static_cast<u64>(lhs_rows.size()); ++idx) {
+        const u64 lhs = lhs_rows[static_cast<std::size_t>(idx)];
+        const u64 rhs = rhs_rows[static_cast<std::size_t>(idx)];
+        if (lhs >= row_count || rhs >= row_count || lhs == rhs) {
+            throw std::runtime_error("Oblivious network layer has invalid public pair.");
+        }
+        if (seen[static_cast<std::size_t>(lhs)] || seen[static_cast<std::size_t>(rhs)]) {
+            throw std::runtime_error("Oblivious network layer has overlapping public pairs.");
+        }
+        seen[static_cast<std::size_t>(lhs)] = 1;
+        seen[static_cast<std::size_t>(rhs)] = 1;
+    }
+}
+
+void oblivious_compare_exchange_rows_batched(
+    std::vector<si64Matrix>& columns,
+    const std::vector<u64>& field_indices,
+    const std::vector<u64>& lhs_rows,
+    const std::vector<u64>& rhs_rows,
+    const std::vector<unsigned char>& ascending,
+    int role,
+    Sh3Encryptor& enc,
+    Sh3Evaluator& eval,
+    Sh3Runtime& runtime)
+{
+    if (lhs_rows.empty()) {
+        return;
+    }
+    if (lhs_rows.size() != rhs_rows.size() || lhs_rows.size() != ascending.size()) {
+        throw std::runtime_error("Batched oblivious compare-exchange schedule shape mismatch.");
+    }
+    assert_public_layer_pairs_disjoint(lhs_rows, rhs_rows, columns.front().rows());
+    auto right_less_left = lexicographic_less_rows(
+        columns,
+        field_indices,
+        rhs_rows,
+        lhs_rows,
+        role,
+        enc,
+        eval,
+        runtime);
+    auto left_less_right = lexicographic_less_rows(
+        columns,
+        field_indices,
+        lhs_rows,
+        rhs_rows,
+        role,
+        enc,
+        eval,
+        runtime);
+    auto swap_flags = choose_public_bool_rows(right_less_left, left_less_right, ascending, role);
+
+    for (auto& column : columns) {
+        auto lhs_values = int_rows_gather(column, lhs_rows);
+        auto rhs_values = int_rows_gather(column, rhs_rows);
+        auto new_lhs = select_si64_by_bool(rhs_values, lhs_values, swap_flags, role, enc, eval, runtime);
+        auto new_rhs = select_si64_by_bool(lhs_values, rhs_values, swap_flags, role, enc, eval, runtime);
+        int_rows_scatter(column, lhs_rows, new_lhs);
+        int_rows_scatter(column, rhs_rows, new_rhs);
+    }
+}
+
 void oblivious_bitonic_sort_rows(
     std::vector<si64Matrix>& columns,
     const std::vector<u64>& field_indices,
@@ -1654,20 +1840,53 @@ void oblivious_bitonic_sort_rows(
         }
     }
 
+    const bool layer_batch = secure_multiplier_layer_batch_enabled();
+    const bool profile = secure_multiplier_public_profile_enabled();
+    u64 layer_count = 0;
+    u64 comparator_count = 0;
+    const auto started = SteadyClock::now();
     for (u64 k = 2; k <= rows; k <<= 1) {
         for (u64 j = k >> 1; j > 0; j >>= 1) {
+            ++layer_count;
+            std::vector<u64> lhs_rows;
+            std::vector<u64> rhs_rows;
+            std::vector<unsigned char> ascending_flags;
+            if (layer_batch) {
+                lhs_rows.reserve(static_cast<std::size_t>(rows / 2));
+                rhs_rows.reserve(static_cast<std::size_t>(rows / 2));
+                ascending_flags.reserve(static_cast<std::size_t>(rows / 2));
+            }
             for (u64 i = 0; i < rows; ++i) {
                 const u64 ixj = i ^ j;
                 if (ixj <= i) {
                     continue;
                 }
                 const bool ascending = ((i & k) == 0);
-                oblivious_compare_exchange_rows(
+                ++comparator_count;
+                if (layer_batch) {
+                    lhs_rows.push_back(i);
+                    rhs_rows.push_back(ixj);
+                    ascending_flags.push_back(ascending ? 1 : 0);
+                } else {
+                    oblivious_compare_exchange_rows(
+                        columns,
+                        field_indices,
+                        i,
+                        ixj,
+                        ascending,
+                        role,
+                        enc,
+                        eval,
+                        runtime);
+                }
+            }
+            if (layer_batch) {
+                oblivious_compare_exchange_rows_batched(
                     columns,
                     field_indices,
-                    i,
-                    ixj,
-                    ascending,
+                    lhs_rows,
+                    rhs_rows,
+                    ascending_flags,
                     role,
                     enc,
                     eval,
@@ -1675,8 +1894,18 @@ void oblivious_bitonic_sort_rows(
             }
         }
     }
+    if (profile && role == 0) {
+        std::cerr << "bspn_multiplier_profile: event=bitonic_sort"
+                  << " rows=" << rows
+                  << " payload_columns=" << columns.size()
+                  << " field_count=" << field_indices.size()
+                  << " layer_batch=" << (layer_batch ? 1 : 0)
+                  << " layers=" << layer_count
+                  << " comparators=" << comparator_count
+                  << " elapsed_seconds=" << elapsed_seconds_since(started)
+                  << std::endl;
+    }
 }
-
 struct ProviderLocalKeyRow {
     NormalizedKey key;
     u64 original_index = 0;
@@ -2017,7 +2246,7 @@ si64Matrix provider_separated_oblivious_merge_counts(
     auto is_valid_sorted = int_eq_matrix(columns[kInvalidRankCol], zero, config.role, eval, runtime);
     auto is_fk_sorted = int_eq_matrix(columns[kOriginOrderCol], zero, config.role, eval, runtime);
     auto is_pk_sorted = int_eq_matrix(columns[kOriginOrderCol], one, config.role, eval, runtime);
-    is_fk_sorted = bool_and_matrix(is_fk_sorted, is_valid_sorted, config.role, enc, eval, runtime);
+    is_fk_sorted = local_bool_and_matrix(is_fk_sorted, is_valid_sorted, config.role, enc, eval, runtime);
 
     si64Matrix running_count(padded, 1);
     running_count.mShares[0].setZero();
@@ -2034,8 +2263,8 @@ si64Matrix provider_separated_oblivious_merge_counts(
         auto same_key = int_eq_matrix(lhs_key, rhs_key, config.role, eval, runtime);
         auto current_valid = bool_row_slice(is_valid_sorted, row, 1);
         auto prev_valid = bool_row_slice(is_valid_sorted, row - 1, 1);
-        same_key = bool_and_matrix(same_key, current_valid, config.role, enc, eval, runtime);
-        same_key = bool_and_matrix(same_key, prev_valid, config.role, enc, eval, runtime);
+        same_key = local_bool_and_matrix(same_key, current_valid, config.role, enc, eval, runtime);
+        same_key = local_bool_and_matrix(same_key, prev_valid, config.role, enc, eval, runtime);
         auto previous_count = int_row_slice(running_count, row - 1, 1);
         auto candidate = previous_count + current_fk;
         auto selected = select_si64_by_bool(
@@ -2242,7 +2471,7 @@ si64Matrix provider_separated_sorted_counts(
     sbMatrix is_pk_row;
     cipher_eq(config.role, sorted_table_id, zero_sorted, is_pk_row, eval, runtime);
     auto sorted_pk_is_non_null = int_eq_public(sorted_pk_not_null, 1, config.role, eval, runtime);
-    auto output_pk_row = bool_and_matrix(is_pk_row, sorted_pk_is_non_null, config.role, enc, eval, runtime);
+    auto output_pk_row = local_bool_and_matrix(is_pk_row, sorted_pk_is_non_null, config.role, enc, eval, runtime);
     auto selected_counts = select_si64_by_bool(
         sorted_group_counts,
         zero_sorted,
@@ -2558,8 +2787,8 @@ void run_secure_multiplier_shared_values_provider_separated(const MultiplierPrep
             sbMatrix key_equal;
             cipher_eq(config.role, pk_key_rows, fk_key_shared, key_equal, eval, runtime);
             auto pk_not_null = int_eq_public(pk_null_rows, 0, config.role, eval, runtime);
-            auto valid = bool_and_matrix(key_equal, pk_not_null, config.role, enc, eval, runtime);
-            valid = bool_and_matrix(valid, fk_not_null, config.role, enc, eval, runtime);
+            auto valid = local_bool_and_matrix(key_equal, pk_not_null, config.role, enc, eval, runtime);
+            valid = local_bool_and_matrix(valid, fk_not_null, config.role, enc, eval, runtime);
             auto valid_int = bool_to_si64(valid, config.role, enc, eval, runtime);
             for (u64 fk_row = 0; fk_row < n_fk; ++fk_row) {
                 counts.mShares[0](pk_row, 0) += valid_int.mShares[0](fk_row, 0);
@@ -2786,27 +3015,6 @@ json read_json_file(const std::string& path)
     return doc;
 }
 
-sbMatrix bool_and_matrix(sbMatrix lhs, sbMatrix rhs, int role, Sh3Encryptor& enc, Sh3Evaluator& eval, Sh3Runtime& runtime)
-{
-    sbMatrix out(lhs.rows(), lhs.bitCount());
-    bool_cipher_and(role, lhs, rhs, out, enc, eval, runtime);
-    return out;
-}
-
-sbMatrix bool_or_matrix(sbMatrix lhs, sbMatrix rhs, int role, Sh3Encryptor& enc, Sh3Evaluator& eval, Sh3Runtime& runtime)
-{
-    sbMatrix out(lhs.rows(), lhs.bitCount());
-    bool_cipher_or(role, lhs, rhs, out, enc, eval, runtime);
-    return out;
-}
-
-sbMatrix bool_not_matrix(sbMatrix value, int role)
-{
-    sbMatrix out(value.rows(), value.bitCount());
-    bool_cipher_not(role, value, out);
-    return out;
-}
-
 sbMatrix bool_prefix_or_matrix(
     sbMatrix values,
     int role,
@@ -2824,7 +3032,7 @@ sbMatrix bool_prefix_or_matrix(
                 shifted.mShares[1](row, col) = prefix.mShares[1](row - offset, col);
             }
         }
-        prefix = bool_or_matrix(prefix, shifted, role, enc, eval, runtime);
+        prefix = local_bool_or_matrix(prefix, shifted, role, enc, eval, runtime);
     }
     return prefix;
 }
@@ -3041,8 +3249,8 @@ MaterializedLeafResult materialize_one_secure_leaf_fixed_cap(
     for (u64 bucket_idx = 0; bucket_idx < public_leaf_bucket_width; ++bucket_idx) {
         auto prior_or_inclusive = bool_prefix_or_matrix(remaining, role, enc, eval, runtime);
         auto has_prior = bool_shift_down_one_false(prior_or_inclusive, role);
-        auto no_prior = bool_not_matrix(has_prior, role);
-        auto representative_rows = bool_and_matrix(remaining, no_prior, role, enc, eval, runtime);
+        auto no_prior = local_bool_not_matrix(has_prior, role);
+        auto representative_rows = local_bool_and_matrix(remaining, no_prior, role, enc, eval, runtime);
 
         auto selected_values = arith_mul_bool(values, representative_rows, role, enc, eval, runtime);
         bucket_values.mShares[0](bucket_idx, 0) = selected_values.mShares[0].sum();
@@ -3052,21 +3260,21 @@ MaterializedLeafResult materialize_one_secure_leaf_fixed_cap(
         sbMatrix value_matches;
         auto values_copy = values;
         cipher_eq(role, values_copy, repeated_bucket_value, value_matches, eval, runtime);
-        auto bucket_rows = bool_and_matrix(value_matches, remaining, role, enc, eval, runtime);
+        auto bucket_rows = local_bool_and_matrix(value_matches, remaining, role, enc, eval, runtime);
         const u64 out_begin = bucket_idx * total_rows;
         for (u64 row = 0; row < total_rows; ++row) {
             bucket_bitmaps.mShares[0](out_begin + row, 0) = bucket_rows.mShares[0](row, 0);
             bucket_bitmaps.mShares[1](out_begin + row, 0) = bucket_rows.mShares[1](row, 0);
         }
 
-        auto not_bucket_rows = bool_not_matrix(bucket_rows, role);
-        remaining = bool_and_matrix(remaining, not_bucket_rows, role, enc, eval, runtime);
+        auto not_bucket_rows = local_bool_not_matrix(bucket_rows, role);
+        remaining = local_bool_and_matrix(remaining, not_bucket_rows, role, enc, eval, runtime);
     }
     const double bucket_loop_elapsed = elapsed_seconds_since(bucket_loop_started);
 
     const auto overflow_started = SteadyClock::now();
     auto leaf_overflow = bool_reduce_or_matrix(remaining, role, enc, eval, runtime);
-    model_overflow = bool_or_matrix(model_overflow, leaf_overflow, role, enc, eval, runtime);
+    model_overflow = local_bool_or_matrix(model_overflow, leaf_overflow, role, enc, eval, runtime);
     const double overflow_elapsed = elapsed_seconds_since(overflow_started);
 
     const auto write_started = SteadyClock::now();
@@ -3176,9 +3384,9 @@ MaterializedLeafResult materialize_one_secure_leaf_sorted_group(
     auto suffix_counts = segmented_suffix_sum(membership_sorted, same_next, role, enc, eval, runtime);
     auto group_counts = prefix_counts + suffix_counts - membership_sorted;
     auto group_empty = int_eq_public(group_counts, 0, role, eval, runtime);
-    auto group_has_member = bool_not_matrix(group_empty, role);
-    auto group_start = bool_not_matrix(same_previous, role);
-    auto active_group_start = bool_and_matrix(group_start, group_has_member, role, enc, eval, runtime);
+    auto group_has_member = local_bool_not_matrix(group_empty, role);
+    auto group_start = local_bool_not_matrix(same_previous, role);
+    auto active_group_start = local_bool_and_matrix(group_start, group_has_member, role, enc, eval, runtime);
     auto active_group_start_int = bool_to_arith_matrix(active_group_start, role, enc, eval, runtime);
     auto active_prefix = prefix_sum(active_group_start_int, role, enc, eval, runtime);
     auto zero_rows = shared_zero_int_matrix(total_rows, 1);
@@ -3203,7 +3411,7 @@ MaterializedLeafResult materialize_one_secure_leaf_sorted_group(
     bucket_values.mShares[1].setZero();
     for (u64 bucket_idx = 0; bucket_idx < public_leaf_bucket_width; ++bucket_idx) {
         auto rank_match = int_eq_public(active_prefix, static_cast<i64>(bucket_idx + 1), role, eval, runtime);
-        auto bucket_start = bool_and_matrix(rank_match, active_group_start, role, enc, eval, runtime);
+        auto bucket_start = local_bool_and_matrix(rank_match, active_group_start, role, enc, eval, runtime);
         auto selected_values = arith_mul_bool(values_sorted, bucket_start, role, enc, eval, runtime);
         bucket_values.mShares[0](bucket_idx, 0) = selected_values.mShares[0].sum();
         bucket_values.mShares[1](bucket_idx, 0) = selected_values.mShares[1].sum();
@@ -3215,7 +3423,7 @@ MaterializedLeafResult materialize_one_secure_leaf_sorted_group(
         role,
         eval,
         runtime);
-    auto overflow_starts = bool_and_matrix(
+    auto overflow_starts = local_bool_and_matrix(
         overflow_rank_match,
         active_group_start,
         role,
@@ -3223,7 +3431,7 @@ MaterializedLeafResult materialize_one_secure_leaf_sorted_group(
         eval,
         runtime);
     auto leaf_overflow = bool_reduce_or_matrix(overflow_starts, role, enc, eval, runtime);
-    model_overflow = bool_or_matrix(model_overflow, leaf_overflow, role, enc, eval, runtime);
+    model_overflow = local_bool_or_matrix(model_overflow, leaf_overflow, role, enc, eval, runtime);
 
     auto sort_back_key = row_ids_sorted;
     auto sort_back_payload = int_columns_to_matrix({membership_sorted, group_ranks_sorted});
@@ -3243,7 +3451,7 @@ MaterializedLeafResult materialize_one_secure_leaf_sorted_group(
     bool_init_false(role, bucket_bitmaps);
     for (u64 bucket_idx = 0; bucket_idx < public_leaf_bucket_width; ++bucket_idx) {
         auto rank_match = int_eq_public(group_rank_by_row, static_cast<i64>(bucket_idx + 1), role, eval, runtime);
-        auto bucket_rows = bool_and_matrix(rank_match, membership_by_row_bool, role, enc, eval, runtime);
+        auto bucket_rows = local_bool_and_matrix(rank_match, membership_by_row_bool, role, enc, eval, runtime);
         const u64 out_begin = bucket_idx * total_rows;
         for (u64 row = 0; row < total_rows; ++row) {
             bucket_bitmaps.mShares[0](out_begin + row, 0) = bucket_rows.mShares[0](row, 0);
@@ -3385,9 +3593,9 @@ std::vector<MaterializedLeafResult> materialize_secure_leaf_sorted_group_batch(
         auto suffix_counts = segmented_suffix_sum(membership_sorted, same_next, role, enc, eval, runtime);
         auto group_counts = prefix_counts + suffix_counts - membership_sorted;
         auto group_empty = int_eq_public(group_counts, 0, role, eval, runtime);
-        auto group_has_member = bool_not_matrix(group_empty, role);
-        auto group_start = bool_not_matrix(same_previous, role);
-        auto active_group_start = bool_and_matrix(group_start, group_has_member, role, enc, eval, runtime);
+        auto group_has_member = local_bool_not_matrix(group_empty, role);
+        auto group_start = local_bool_not_matrix(same_previous, role);
+        auto active_group_start = local_bool_and_matrix(group_start, group_has_member, role, enc, eval, runtime);
         auto active_group_start_int = bool_to_arith_matrix(active_group_start, role, enc, eval, runtime);
         auto active_prefix = prefix_sum(active_group_start_int, role, enc, eval, runtime);
         auto group_start_ranks = select_si64_by_bool(
@@ -3411,7 +3619,7 @@ std::vector<MaterializedLeafResult> materialize_secure_leaf_sorted_group_batch(
         bucket_values.mShares[1].setZero();
         for (u64 bucket_idx = 0; bucket_idx < public_leaf_bucket_width; ++bucket_idx) {
             auto rank_match = int_eq_public(active_prefix, static_cast<i64>(bucket_idx + 1), role, eval, runtime);
-            auto bucket_start = bool_and_matrix(rank_match, active_group_start, role, enc, eval, runtime);
+            auto bucket_start = local_bool_and_matrix(rank_match, active_group_start, role, enc, eval, runtime);
             auto selected_values = arith_mul_bool(values_sorted, bucket_start, role, enc, eval, runtime);
             bucket_values.mShares[0](bucket_idx, 0) = selected_values.mShares[0].sum();
             bucket_values.mShares[1](bucket_idx, 0) = selected_values.mShares[1].sum();
@@ -3423,7 +3631,7 @@ std::vector<MaterializedLeafResult> materialize_secure_leaf_sorted_group_batch(
             role,
             eval,
             runtime);
-        auto overflow_starts = bool_and_matrix(
+        auto overflow_starts = local_bool_and_matrix(
             overflow_rank_match,
             active_group_start,
             role,
@@ -3431,7 +3639,7 @@ std::vector<MaterializedLeafResult> materialize_secure_leaf_sorted_group_batch(
             eval,
             runtime);
         auto leaf_overflow = bool_reduce_or_matrix(overflow_starts, role, enc, eval, runtime);
-        model_overflow = bool_or_matrix(model_overflow, leaf_overflow, role, enc, eval, runtime);
+        model_overflow = local_bool_or_matrix(model_overflow, leaf_overflow, role, enc, eval, runtime);
 
         sort_back_columns.push_back(std::move(membership_sorted));
         sort_back_columns.push_back(std::move(group_ranks_sorted));
@@ -3493,7 +3701,7 @@ std::vector<MaterializedLeafResult> materialize_secure_leaf_sorted_group_batch(
         bool_init_false(role, bucket_bitmaps);
         for (u64 bucket_idx = 0; bucket_idx < public_leaf_bucket_width; ++bucket_idx) {
             auto rank_match = int_eq_public(group_rank_by_row, static_cast<i64>(bucket_idx + 1), role, eval, runtime);
-            auto bucket_rows = bool_and_matrix(rank_match, membership_by_row_bool, role, enc, eval, runtime);
+            auto bucket_rows = local_bool_and_matrix(rank_match, membership_by_row_bool, role, enc, eval, runtime);
             const u64 out_begin = bucket_idx * total_rows;
             for (u64 row = 0; row < total_rows; ++row) {
                 bucket_bitmaps.mShares[0](out_begin + row, 0) = bucket_rows.mShares[0](row, 0);
