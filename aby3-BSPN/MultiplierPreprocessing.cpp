@@ -578,38 +578,51 @@ NormalizedKey normalize_join_key_token(const std::string& token)
     return key;
 }
 
-std::vector<NormalizedKey> load_key_column_csv(
+template<typename Fn>
+void for_each_key_column_csv(
     const std::string& csv_path,
     u64 key_column,
-    bool has_header)
+    bool has_header,
+    Fn&& callback)
 {
     std::ifstream input(csv_path);
     if (!input.is_open()) {
         throw std::runtime_error("Failed to open CSV file: " + csv_path);
     }
 
-    std::vector<NormalizedKey> keys;
     std::string line;
     bool is_first_line = true;
+    u64 row_index = 0;
     while (std::getline(input, line)) {
         if (is_first_line && has_header) {
             is_first_line = false;
             continue;
         }
         is_first_line = false;
-        if (line.empty()) {
-            keys.push_back({});
-            continue;
+        NormalizedKey key;
+        if (!line.empty()) {
+            auto fields = parse_csv_line(line);
+            if (key_column >= fields.size()) {
+                throw std::runtime_error(
+                    "Requested key column out of range for CSV file: " + csv_path +
+                    " column=" + std::to_string(key_column));
+            }
+            key = normalize_join_key_token(fields[key_column]);
         }
-
-        auto fields = parse_csv_line(line);
-        if (key_column >= fields.size()) {
-            throw std::runtime_error(
-                "Requested key column out of range for CSV file: " + csv_path + " column=" + std::to_string(key_column)
-            );
-        }
-        keys.push_back(normalize_join_key_token(fields[key_column]));
+        callback(key, row_index);
+        ++row_index;
     }
+}
+
+std::vector<NormalizedKey> load_key_column_csv(
+    const std::string& csv_path,
+    u64 key_column,
+    bool has_header)
+{
+    std::vector<NormalizedKey> keys;
+    for_each_key_column_csv(csv_path, key_column, has_header, [&](const NormalizedKey& key, u64) {
+        keys.push_back(key);
+    });
     return keys;
 }
 
@@ -1996,6 +2009,15 @@ struct PartitionContract {
     std::vector<u64> fk_capacities;
 };
 
+struct ProviderDenseDomainState {
+    i64 domain_min = 0;
+    u64 domain_width = 0;
+    u64 raw_row_count = 0;
+    std::vector<std::uint8_t> pk_present;
+    std::vector<i64> fk_counts;
+    bool contract_failed = false;
+};
+
 PartitionContract parse_partition_contract()
 {
     PartitionContract contract;
@@ -2075,6 +2097,59 @@ u64 sum_u64(const std::vector<u64>& values)
         total += value;
     }
     return total;
+}
+
+u64 public_domain_width_inclusive(const PartitionContract& contract)
+{
+    if (contract.boundaries.size() < 2) {
+        throw std::runtime_error("Partition contract has no public domain.");
+    }
+    const __int128 lower = static_cast<__int128>(contract.boundaries.front());
+    const __int128 upper = static_cast<__int128>(contract.boundaries.back());
+    const __int128 width = upper - lower + 1;
+    if (width <= 0 || width > static_cast<__int128>(std::numeric_limits<u64>::max())) {
+        throw std::runtime_error("Public domain width is invalid.");
+    }
+    return static_cast<u64>(width);
+}
+
+u64 public_domain_offset(const PartitionContract& contract, const NormalizedKey& key)
+{
+    if (key.is_null) {
+        throw std::runtime_error("null key has no public domain offset");
+    }
+    const i64 domain_min = contract.boundaries.front();
+    const i64 domain_max = contract.boundaries.back();
+    if (key.value < domain_min || key.value > domain_max) {
+        throw std::runtime_error("public capacity contract not satisfied");
+    }
+    const unsigned __int128 offset =
+        static_cast<unsigned __int128>(static_cast<__int128>(key.value) - static_cast<__int128>(domain_min));
+    if (offset > std::numeric_limits<u64>::max()) {
+        throw std::runtime_error("Public domain offset exceeds uint64 capacity.");
+    }
+    return static_cast<u64>(offset);
+}
+
+std::pair<u64, u64> public_partition_offset_range(const PartitionContract& contract, u64 part)
+{
+    const u64 partitions = partition_count(contract);
+    if (part >= partitions) {
+        throw std::runtime_error("Public partition index out of range.");
+    }
+    const i64 domain_min = contract.boundaries.front();
+    const i64 lower = contract.boundaries[static_cast<std::size_t>(part)];
+    const i64 upper = contract.boundaries[static_cast<std::size_t>(part + 1)];
+    const __int128 begin_signed = static_cast<__int128>(lower) - static_cast<__int128>(domain_min);
+    __int128 end_signed = static_cast<__int128>(upper) - static_cast<__int128>(domain_min);
+    if (part + 1 == partitions) {
+        end_signed += 1;
+    }
+    if (begin_signed < 0 || end_signed < begin_signed ||
+        end_signed > static_cast<__int128>(std::numeric_limits<u64>::max())) {
+        throw std::runtime_error("Invalid public partition offset range.");
+    }
+    return {static_cast<u64>(begin_signed), static_cast<u64>(end_signed)};
 }
 
 u64 assign_public_partition(const PartitionContract& contract, const NormalizedKey& key)
@@ -2190,6 +2265,133 @@ bool provider_local_keys_unique_in_public_domain(
         }
     }
     return true;
+}
+
+ProviderDenseDomainState provider_local_pk_dense_domain_state(
+    const std::string& csv_path,
+    u64 key_column,
+    bool has_header,
+    const PartitionContract& contract)
+{
+    ProviderDenseDomainState state;
+    state.domain_min = contract.boundaries.front();
+    state.domain_width = public_domain_width_inclusive(contract);
+    state.pk_present.assign(static_cast<std::size_t>(state.domain_width), 0);
+    for_each_key_column_csv(csv_path, key_column, has_header, [&](const NormalizedKey& key, u64) {
+        ++state.raw_row_count;
+        if (key.is_null) {
+            state.contract_failed = true;
+            return;
+        }
+        try {
+            const u64 offset = public_domain_offset(contract, key);
+            auto& present = state.pk_present[static_cast<std::size_t>(offset)];
+            if (present != 0) {
+                state.contract_failed = true;
+            }
+            present = 1;
+        } catch (const std::exception&) {
+            state.contract_failed = true;
+        }
+    });
+    return state;
+}
+
+ProviderDenseDomainState provider_local_fk_dense_domain_state(
+    const std::string& csv_path,
+    u64 key_column,
+    bool has_header,
+    const PartitionContract& contract)
+{
+    ProviderDenseDomainState state;
+    state.domain_min = contract.boundaries.front();
+    state.domain_width = public_domain_width_inclusive(contract);
+    state.fk_counts.assign(static_cast<std::size_t>(state.domain_width), 0);
+    for_each_key_column_csv(csv_path, key_column, has_header, [&](const NormalizedKey& key, u64) {
+        ++state.raw_row_count;
+        if (key.is_null) {
+            return;
+        }
+        try {
+            const u64 offset = public_domain_offset(contract, key);
+            auto& count = state.fk_counts[static_cast<std::size_t>(offset)];
+            if (count == std::numeric_limits<i64>::max()) {
+                state.contract_failed = true;
+                return;
+            }
+            ++count;
+        } catch (const std::exception&) {
+            state.contract_failed = true;
+        }
+    });
+    return state;
+}
+
+std::vector<ProviderLocalKeyRow> provider_local_pk_rows_from_dense_state_for_part(
+    const ProviderDenseDomainState& state,
+    const PartitionContract& contract,
+    u64 part,
+    u64 capacity,
+    bool& overflow)
+{
+    overflow = false;
+    const auto range = public_partition_offset_range(contract, part);
+    std::vector<ProviderLocalKeyRow> out;
+    out.reserve(static_cast<std::size_t>(capacity));
+    u64 slot = 0;
+    for (u64 offset = range.first; offset < range.second; ++offset) {
+        if (offset >= static_cast<u64>(state.pk_present.size())) {
+            overflow = true;
+            break;
+        }
+        if (state.pk_present[static_cast<std::size_t>(offset)] == 0) {
+            continue;
+        }
+        if (slot >= capacity) {
+            overflow = true;
+            break;
+        }
+        out.push_back({NormalizedKey{state.domain_min + static_cast<i64>(offset), false}, slot, 1});
+        ++slot;
+    }
+    for (; slot < capacity; ++slot) {
+        out.push_back({NormalizedKey{0, true}, slot, 0});
+    }
+    return out;
+}
+
+std::vector<ProviderLocalKeyRow> provider_local_fk_group_rows_from_dense_state_for_part(
+    const ProviderDenseDomainState& state,
+    const PartitionContract& contract,
+    u64 part,
+    u64 capacity,
+    bool& overflow)
+{
+    overflow = false;
+    const auto range = public_partition_offset_range(contract, part);
+    std::vector<ProviderLocalKeyRow> out;
+    out.reserve(static_cast<std::size_t>(capacity));
+    u64 slot = 0;
+    for (u64 offset = range.first; offset < range.second; ++offset) {
+        if (offset >= static_cast<u64>(state.fk_counts.size())) {
+            overflow = true;
+            break;
+        }
+        const i64 count = state.fk_counts[static_cast<std::size_t>(offset)];
+        if (count == 0) {
+            continue;
+        }
+        if (slot >= capacity) {
+            overflow = true;
+            break;
+        }
+        out.push_back({NormalizedKey{state.domain_min + static_cast<i64>(offset), false}, slot, count});
+        ++slot;
+    }
+    for (; slot < capacity; ++slot) {
+        out.push_back({NormalizedKey{0, true}, slot, 0});
+    }
+    return out;
 }
 
 std::vector<ProviderLocalKeyRow> provider_local_partitioned_fk_group_rows(
@@ -2978,27 +3180,57 @@ void run_secure_multiplier_shared_values_provider_separated_streaming(const Mult
     const u64 total_pk_capacity = sum_u64(partition_contract.pk_capacities);
     const u64 total_fk_capacity = sum_u64(partition_contract.fk_capacities);
 
-    std::vector<NormalizedKey> pk_keys;
-    std::vector<NormalizedKey> fk_keys;
+    ProviderDenseDomainState pk_dense;
+    ProviderDenseDomainState fk_dense;
     u64 n_pk = 0;
     u64 n_fk = 0;
     if (config.role == config.pk_input_party) {
-        pk_keys = load_key_column_csv(config.pk_csv_path, config.pk_key_column, config.pk_has_header);
-        n_pk = static_cast<u64>(pk_keys.size());
+        const auto started = SteadyClock::now();
+        pk_dense = provider_local_pk_dense_domain_state(
+            config.pk_csv_path,
+            config.pk_key_column,
+            config.pk_has_header,
+            partition_contract);
+        n_pk = pk_dense.raw_row_count;
+        if (secure_multiplier_public_profile_enabled()) {
+            std::cerr << "bspn_multiplier_profile: event=provider_dense_pk"
+                      << " public_domain_width=" << pk_dense.domain_width
+                      << " elapsed_seconds=" << elapsed_seconds_since(started)
+                      << std::endl;
+        }
     }
     if (config.role == config.fk_input_party) {
-        fk_keys = load_key_column_csv(config.fk_csv_path, config.fk_key_column, config.fk_has_header);
-        n_fk = static_cast<u64>(fk_keys.size());
+        const auto started = SteadyClock::now();
+        fk_dense = provider_local_fk_dense_domain_state(
+            config.fk_csv_path,
+            config.fk_key_column,
+            config.fk_has_header,
+            partition_contract);
+        n_fk = fk_dense.raw_row_count;
+        if (secure_multiplier_public_profile_enabled()) {
+            std::cerr << "bspn_multiplier_profile: event=provider_dense_fk"
+                      << " public_domain_width=" << fk_dense.domain_width
+                      << " elapsed_seconds=" << elapsed_seconds_since(started)
+                      << std::endl;
+        }
     }
     sync_value_from_party(config.role, config.pk_input_party, runtime, n_pk);
     sync_value_from_party(config.role, config.fk_input_party, runtime, n_fk);
 
     u64 pk_constraint_failed = 0;
     if (config.role == config.pk_input_party) {
-        pk_constraint_failed = provider_local_keys_unique_in_public_domain(pk_keys, partition_contract) ? 0 : 1;
+        pk_constraint_failed = pk_dense.contract_failed ? 1 : 0;
     }
     sync_value_from_party(config.role, config.pk_input_party, runtime, pk_constraint_failed);
     if (pk_constraint_failed != 0) {
+        throw std::runtime_error("public capacity contract not satisfied");
+    }
+    u64 fk_constraint_failed = 0;
+    if (config.role == config.fk_input_party) {
+        fk_constraint_failed = fk_dense.contract_failed ? 1 : 0;
+    }
+    sync_value_from_party(config.role, config.fk_input_party, runtime, fk_constraint_failed);
+    if (fk_constraint_failed != 0) {
         throw std::runtime_error("public capacity contract not satisfied");
     }
 
@@ -3050,15 +3282,15 @@ void run_secure_multiplier_shared_values_provider_separated_streaming(const Mult
         u64 fk_overflow = 0;
         if (config.role == config.pk_input_party) {
             bool overflow = false;
-            const auto rows = provider_local_partition_rows_for_part(
-                pk_keys, partition_contract, part, pk_cap, overflow);
+            const auto rows = provider_local_pk_rows_from_dense_state_for_part(
+                pk_dense, partition_contract, part, pk_cap, overflow);
             populate_plain_rows(rows, plain_pk_key, plain_pk_is_null, plain_pk_original_index);
             pk_overflow = overflow ? 1 : 0;
         }
         if (config.role == config.fk_input_party) {
             bool overflow = false;
-            const auto rows = provider_local_fk_group_rows_for_part(
-                fk_keys, partition_contract, part, fk_cap, overflow);
+            const auto rows = provider_local_fk_group_rows_from_dense_state_for_part(
+                fk_dense, partition_contract, part, fk_cap, overflow);
             populate_plain_rows(rows, plain_fk_key, plain_fk_is_null, plain_fk_original_index, &plain_fk_multiplicity);
             fk_overflow = overflow ? 1 : 0;
         }
