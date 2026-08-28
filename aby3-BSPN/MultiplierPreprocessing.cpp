@@ -1859,7 +1859,13 @@ void assert_public_layer_pairs_disjoint(
     }
 }
 
-void oblivious_compare_exchange_rows_batched(
+struct StoredObliviousSwapLayer {
+    std::vector<u64> lhs_rows;
+    std::vector<u64> rhs_rows;
+    sbMatrix swap_flags;
+};
+
+sbMatrix oblivious_compare_exchange_rows_batched_with_swaps(
     std::vector<si64Matrix>& columns,
     const std::vector<u64>& field_indices,
     const std::vector<u64>& lhs_rows,
@@ -1871,7 +1877,7 @@ void oblivious_compare_exchange_rows_batched(
     Sh3Runtime& runtime)
 {
     if (lhs_rows.empty()) {
-        return;
+        return shared_false_bool_matrix(0, 1, role);
     }
     if (lhs_rows.size() != rhs_rows.size() || lhs_rows.size() != ascending.size()) {
         throw std::runtime_error("Batched oblivious compare-exchange schedule shape mismatch.");
@@ -1897,6 +1903,59 @@ void oblivious_compare_exchange_rows_batched(
         runtime);
     auto swap_flags = choose_public_bool_rows(right_less_left, left_less_right, ascending, role);
 
+    for (auto& column : columns) {
+        auto lhs_values = int_rows_gather(column, lhs_rows);
+        auto rhs_values = int_rows_gather(column, rhs_rows);
+        auto new_lhs = select_si64_by_bool(rhs_values, lhs_values, swap_flags, role, enc, eval, runtime);
+        auto new_rhs = select_si64_by_bool(lhs_values, rhs_values, swap_flags, role, enc, eval, runtime);
+        int_rows_scatter(column, lhs_rows, new_lhs);
+        int_rows_scatter(column, rhs_rows, new_rhs);
+    }
+    return swap_flags;
+}
+
+void oblivious_compare_exchange_rows_batched(
+    std::vector<si64Matrix>& columns,
+    const std::vector<u64>& field_indices,
+    const std::vector<u64>& lhs_rows,
+    const std::vector<u64>& rhs_rows,
+    const std::vector<unsigned char>& ascending,
+    int role,
+    Sh3Encryptor& enc,
+    Sh3Evaluator& eval,
+    Sh3Runtime& runtime)
+{
+    (void)oblivious_compare_exchange_rows_batched_with_swaps(
+        columns,
+        field_indices,
+        lhs_rows,
+        rhs_rows,
+        ascending,
+        role,
+        enc,
+        eval,
+        runtime);
+}
+
+void oblivious_apply_stored_swaps_rows_batched(
+    std::vector<si64Matrix>& columns,
+    const std::vector<u64>& lhs_rows,
+    const std::vector<u64>& rhs_rows,
+    const sbMatrix& stored_swap_flags,
+    int role,
+    Sh3Encryptor& enc,
+    Sh3Evaluator& eval,
+    Sh3Runtime& runtime)
+{
+    if (lhs_rows.empty()) {
+        return;
+    }
+    if (lhs_rows.size() != rhs_rows.size() ||
+        stored_swap_flags.rows() != static_cast<u64>(lhs_rows.size())) {
+        throw std::runtime_error("Stored oblivious swap layer shape mismatch.");
+    }
+    assert_public_layer_pairs_disjoint(lhs_rows, rhs_rows, columns.front().rows());
+    auto swap_flags = stored_swap_flags;
     for (auto& column : columns) {
         auto lhs_values = int_rows_gather(column, lhs_rows);
         auto rhs_values = int_rows_gather(column, rhs_rows);
@@ -1997,6 +2056,99 @@ void oblivious_bitonic_sort_rows(
                   << std::endl;
     }
 }
+
+std::vector<StoredObliviousSwapLayer> reversible_bitonic_forward_sort_rows(
+    std::vector<si64Matrix>& columns,
+    const std::vector<u64>& field_indices,
+    int role,
+    Sh3Encryptor& enc,
+    Sh3Evaluator& eval,
+    Sh3Runtime& runtime,
+    u64& layer_count,
+    u64& comparator_count)
+{
+    std::vector<StoredObliviousSwapLayer> stored_layers;
+    layer_count = 0;
+    comparator_count = 0;
+    if (columns.empty()) {
+        return stored_layers;
+    }
+    const u64 rows = columns.front().rows();
+    if (rows == 0) {
+        return stored_layers;
+    }
+    if ((rows & (rows - 1)) != 0) {
+        throw std::runtime_error("Reversible oblivious bitonic lookup requires public power-of-two padding.");
+    }
+    for (const auto& column : columns) {
+        if (column.rows() != rows || column.cols() != 1) {
+            throw std::runtime_error("Reversible oblivious lookup payload columns must all be rows x 1.");
+        }
+    }
+
+    for (u64 k = 2; k <= rows; k <<= 1) {
+        for (u64 j = k >> 1; j > 0; j >>= 1) {
+            std::vector<u64> lhs_rows;
+            std::vector<u64> rhs_rows;
+            std::vector<unsigned char> ascending_flags;
+            lhs_rows.reserve(static_cast<std::size_t>(rows / 2));
+            rhs_rows.reserve(static_cast<std::size_t>(rows / 2));
+            ascending_flags.reserve(static_cast<std::size_t>(rows / 2));
+            for (u64 i = 0; i < rows; ++i) {
+                const u64 ixj = i ^ j;
+                if (ixj <= i) {
+                    continue;
+                }
+                const bool ascending = ((i & k) == 0);
+                lhs_rows.push_back(i);
+                rhs_rows.push_back(ixj);
+                ascending_flags.push_back(ascending ? 1 : 0);
+            }
+            assert_public_layer_pairs_disjoint(lhs_rows, rhs_rows, rows);
+            auto swap_flags = oblivious_compare_exchange_rows_batched_with_swaps(
+                columns,
+                field_indices,
+                lhs_rows,
+                rhs_rows,
+                ascending_flags,
+                role,
+                enc,
+                eval,
+                runtime);
+            comparator_count += static_cast<u64>(lhs_rows.size());
+            ++layer_count;
+            stored_layers.push_back(
+                StoredObliviousSwapLayer{
+                    std::move(lhs_rows),
+                    std::move(rhs_rows),
+                    std::move(swap_flags),
+                });
+        }
+    }
+    return stored_layers;
+}
+
+void reversible_bitonic_reverse_rows(
+    std::vector<si64Matrix>& columns,
+    const std::vector<StoredObliviousSwapLayer>& stored_layers,
+    int role,
+    Sh3Encryptor& enc,
+    Sh3Evaluator& eval,
+    Sh3Runtime& runtime)
+{
+    for (auto layer_it = stored_layers.rbegin(); layer_it != stored_layers.rend(); ++layer_it) {
+        oblivious_apply_stored_swaps_rows_batched(
+            columns,
+            layer_it->lhs_rows,
+            layer_it->rhs_rows,
+            layer_it->swap_flags,
+            role,
+            enc,
+            eval,
+            runtime);
+    }
+}
+
 struct ProviderLocalKeyRow {
     NormalizedKey key;
     u64 original_index = 0;
@@ -3983,18 +4135,318 @@ std::string secure_leaf_row_value_cache_key(
     return "artifact:" + resolved_artifact_dir + "|" + kind;
 }
 
+std::vector<u64> json_u64_array_or_csv(const json& doc, const std::string& key)
+{
+    if (!doc.contains(key)) {
+        throw std::runtime_error("Secure leaf reversible lookup plan is missing " + key + ".");
+    }
+    std::vector<u64> out;
+    const auto& value = doc[key];
+    if (value.is_array()) {
+        for (const auto& item : value) {
+            out.push_back(item.get<std::uint64_t>());
+        }
+        return out;
+    }
+    if (value.is_string()) {
+        std::stringstream stream(value.get<std::string>());
+        std::string part;
+        while (std::getline(stream, part, ',')) {
+            const auto trimmed = trim_copy(part);
+            if (!trimmed.empty()) {
+                out.push_back(static_cast<u64>(std::stoull(trimmed)));
+            }
+        }
+        return out;
+    }
+    throw std::runtime_error("Secure leaf reversible lookup plan key is not an array/csv: " + key + ".");
+}
+
+u64 next_power_of_two_u64(u64 value)
+{
+    if (value <= 1) {
+        return 1;
+    }
+    u64 out = 1;
+    while (out < value) {
+        if (out > (std::numeric_limits<u64>::max() >> 1)) {
+            throw std::runtime_error("Public padded network size overflow.");
+        }
+        out <<= 1;
+    }
+    return out;
+}
+
+si64Matrix load_secure_leaf_row_values_reversible_lookup(
+    const json& plan,
+    const json& leaf_doc,
+    const std::string& plan_base_dir,
+    const std::string& plan_role_share_dir,
+    u64 total_rows,
+    int role,
+    Sh3Encryptor& enc,
+    Sh3Evaluator& eval,
+    Sh3Runtime& runtime)
+{
+    const std::string mapping_mode = plan.value("mapping_mode", std::string());
+    if (mapping_mode != "partition_replicated_reversible_bitonic_lookup") {
+        throw std::runtime_error("Unsupported secure leaf secret mapping mode: " + mapping_mode);
+    }
+    const std::string artifact_dir = leaf_doc.value("multiplier_artifact_dir", std::string());
+    if (artifact_dir.empty()) {
+        throw std::runtime_error("Secure leaf reversible lookup plan is missing multiplier_artifact_dir.");
+    }
+    const std::string kind = leaf_doc.value("multiplier_kind", std::string("mu"));
+    if (kind != "mu" && kind != "mu_nn") {
+        throw std::runtime_error("Unsupported secure multiplier leaf multiplier_kind: " + kind);
+    }
+    const auto source_capacities = json_u64_array_or_csv(plan, "partition_source_capacities");
+    const auto source_offsets = json_u64_array_or_csv(plan, "partition_source_offsets");
+    if (source_capacities.empty() || source_capacities.size() != source_offsets.size()) {
+        throw std::runtime_error("Secure leaf reversible lookup partition capacity/offset mismatch.");
+    }
+    const u64 partition_count = static_cast<u64>(source_capacities.size());
+    if (plan.value("partition_count", partition_count) != partition_count) {
+        throw std::runtime_error("Secure leaf reversible lookup partition_count mismatch.");
+    }
+    if (plan.value("public_query_slots", total_rows) != total_rows) {
+        throw std::runtime_error("Secure leaf reversible lookup query slot count mismatch.");
+    }
+    u64 source_domain_size = 0;
+    for (const auto cap : source_capacities) {
+        source_domain_size += cap;
+    }
+    if (plan.value("source_domain_size", source_domain_size) != source_domain_size) {
+        throw std::runtime_error("Secure leaf reversible lookup source domain size mismatch.");
+    }
+
+    const std::string plan_role_dir = role_dir_from_template(plan_base_dir, plan_role_share_dir, role);
+    const std::string valid_file = plan.value("mapping_valid_in_partition_share_file", std::string());
+    const std::string dense_file = plan.value("mapping_dense_key_share_file", std::string());
+    if (valid_file.empty() || dense_file.empty()) {
+        throw std::runtime_error("Secure leaf reversible lookup mapping share files are missing.");
+    }
+    const u64 mapping_rows = partition_count * total_rows;
+    auto mapping_valid = read_bool_share_pair_matrix(join_path(plan_role_dir, valid_file), mapping_rows, 1);
+    auto mapping_dense_key = read_share_pair_matrix(join_path(plan_role_dir, dense_file), mapping_rows);
+
+    const std::string resolved_artifact_dir = resolve_plan_relative_path(plan_base_dir, artifact_dir);
+    const std::string role_dir = join_path(resolved_artifact_dir, "role_" + std::to_string(role));
+    const auto full_values = read_share_pair_matrix_auto_rows(join_path(role_dir, kind + ".shares.bin"));
+    if (full_values.rows() != source_domain_size) {
+        throw std::runtime_error("Secure leaf reversible lookup source artifact row count does not match public domain size.");
+    }
+
+    si64Matrix final_values(total_rows, 1);
+    final_values.mShares[0].setZero();
+    final_values.mShares[1].setZero();
+    const bool profile = secure_multiplier_public_profile_enabled();
+    double forward_seconds = 0.0;
+    double propagate_seconds = 0.0;
+    double reverse_seconds = 0.0;
+    u64 total_forward_comparators = 0;
+    u64 total_forward_layers = 0;
+
+    for (u64 partition_id = 0; partition_id < partition_count; ++partition_id) {
+        const u64 source_capacity = source_capacities[static_cast<std::size_t>(partition_id)];
+        const u64 source_offset = source_offsets[static_cast<std::size_t>(partition_id)];
+        const u64 real_rows = source_capacity + total_rows;
+        const u64 padded_rows = next_power_of_two_u64(real_rows);
+        const u64 pad_rows = padded_rows - real_rows;
+        const u64 mapping_offset = partition_id * total_rows;
+
+        auto source_invalid = public_i64_column(0, source_capacity, role);
+        si64Matrix source_key(source_capacity, 1);
+        source_key.mShares[0].setZero();
+        source_key.mShares[1].setZero();
+        for (u64 row = 0; row < source_capacity; ++row) {
+            set_public_i64_cell(source_key, row, static_cast<i64>(source_offset + row), role);
+        }
+        auto source_origin = public_i64_column(0, source_capacity, role);
+        auto source_tie = public_i64_row_ids(source_capacity, role);
+        auto source_value = int_row_slice(full_values, source_offset, source_capacity);
+        auto source_fetched = shared_zero_int_matrix(source_capacity, 1);
+
+        auto query_valid_bool = bool_row_slice(mapping_valid, mapping_offset, total_rows);
+        auto query_valid_int = bool_to_si64(query_valid_bool, role, enc, eval, runtime);
+        auto query_invalid = public_i64_column(1, total_rows, role) - query_valid_int;
+        auto query_key = int_row_slice(mapping_dense_key, mapping_offset, total_rows);
+        auto query_origin = public_i64_column(1, total_rows, role);
+        auto query_tie = public_i64_row_ids(total_rows, role);
+        auto query_value = shared_zero_int_matrix(total_rows, 1);
+        auto query_fetched = shared_zero_int_matrix(total_rows, 1);
+
+        auto pad_invalid = public_i64_column(1, pad_rows, role);
+        auto pad_key = public_i64_column(0, pad_rows, role);
+        auto pad_origin = public_i64_column(2, pad_rows, role);
+        auto pad_tie = public_i64_row_ids(pad_rows, role);
+        auto pad_value = shared_zero_int_matrix(pad_rows, 1);
+        auto pad_fetched = shared_zero_int_matrix(pad_rows, 1);
+
+        enum ReversibleLookupColumn : u64 {
+            kInvalidRank = 0,
+            kDenseKey = 1,
+            kOrigin = 2,
+            kTie = 3,
+            kValue = 4,
+            kFetched = 5,
+        };
+        std::vector<si64Matrix> columns;
+        columns.push_back(concat_shared_row_blocks({source_invalid, query_invalid, pad_invalid}));
+        columns.push_back(concat_shared_row_blocks({source_key, query_key, pad_key}));
+        columns.push_back(concat_shared_row_blocks({source_origin, query_origin, pad_origin}));
+        columns.push_back(concat_shared_row_blocks({source_tie, query_tie, pad_tie}));
+        columns.push_back(concat_shared_row_blocks({source_value, query_value, pad_value}));
+        columns.push_back(concat_shared_row_blocks({source_fetched, query_fetched, pad_fetched}));
+        const std::vector<u64> comparator_fields = {kInvalidRank, kDenseKey, kOrigin, kTie};
+
+        u64 layer_count = 0;
+        u64 comparator_count = 0;
+        const auto forward_started = SteadyClock::now();
+        auto stored_layers = reversible_bitonic_forward_sort_rows(
+            columns,
+            comparator_fields,
+            role,
+            enc,
+            eval,
+            runtime,
+            layer_count,
+            comparator_count);
+        forward_seconds += elapsed_seconds_since(forward_started);
+        total_forward_layers += layer_count;
+        total_forward_comparators += comparator_count;
+
+        const auto propagate_started = SteadyClock::now();
+        auto is_source = int_eq_public(columns[kOrigin], 0, role, eval, runtime);
+        auto is_query = int_eq_public(columns[kOrigin], 1, role, eval, runtime);
+        auto is_active = int_eq_public(columns[kInvalidRank], 0, role, eval, runtime);
+        is_source = local_bool_and_matrix(is_source, is_active, role, enc, eval, runtime);
+        is_query = local_bool_and_matrix(is_query, is_active, role, enc, eval, runtime);
+        si64Matrix running(padded_rows, 1);
+        running.mShares[0].setZero();
+        running.mShares[1].setZero();
+        si64Matrix fetched(padded_rows, 1);
+        fetched.mShares[0].setZero();
+        fetched.mShares[1].setZero();
+        auto zero_row = shared_zero_int_matrix(1, 1);
+        for (u64 row = 0; row < padded_rows; ++row) {
+            auto value_row = int_row_slice(columns[kValue], row, 1);
+            auto source_flag = bool_row_slice(is_source, row, 1);
+            auto query_flag = bool_row_slice(is_query, row, 1);
+            auto source_payload = select_si64_by_bool(value_row, zero_row, source_flag, role, enc, eval, runtime);
+            si64Matrix current_running(1, 1);
+            if (row == 0) {
+                current_running = source_payload;
+            } else {
+                auto lhs_key = int_row_slice(columns[kDenseKey], row, 1);
+                auto rhs_key = int_row_slice(columns[kDenseKey], row - 1, 1);
+                auto same_key = int_eq_matrix(lhs_key, rhs_key, role, eval, runtime);
+                auto current_active = bool_row_slice(is_active, row, 1);
+                auto prev_active = bool_row_slice(is_active, row - 1, 1);
+                same_key = local_bool_and_matrix(same_key, current_active, role, enc, eval, runtime);
+                same_key = local_bool_and_matrix(same_key, prev_active, role, enc, eval, runtime);
+                auto previous_running = int_row_slice(running, row - 1, 1);
+                auto same_group_value = select_si64_by_bool(
+                    source_payload,
+                    previous_running,
+                    source_flag,
+                    role,
+                    enc,
+                    eval,
+                    runtime);
+                current_running = select_si64_by_bool(
+                    same_group_value,
+                    source_payload,
+                    same_key,
+                    role,
+                    enc,
+                    eval,
+                    runtime);
+            }
+            running.mShares[0](row, 0) = current_running.mShares[0](0, 0);
+            running.mShares[1](row, 0) = current_running.mShares[1](0, 0);
+            auto fetched_row = select_si64_by_bool(current_running, zero_row, query_flag, role, enc, eval, runtime);
+            fetched.mShares[0](row, 0) = fetched_row.mShares[0](0, 0);
+            fetched.mShares[1](row, 0) = fetched_row.mShares[1](0, 0);
+        }
+        columns[kFetched] = std::move(fetched);
+        propagate_seconds += elapsed_seconds_since(propagate_started);
+
+        const auto reverse_started = SteadyClock::now();
+        reversible_bitonic_reverse_rows(columns, stored_layers, role, enc, eval, runtime);
+        reverse_seconds += elapsed_seconds_since(reverse_started);
+        stored_layers.clear();
+
+        auto partition_values = int_row_slice(columns[kFetched], source_capacity, total_rows);
+        auto partition_invalid = int_row_slice(columns[kInvalidRank], source_capacity, total_rows);
+        auto partition_valid = int_eq_public(partition_invalid, 0, role, eval, runtime);
+        auto zero_slots = shared_zero_int_matrix(total_rows, 1);
+        auto selected_values = select_si64_by_bool(
+            partition_values,
+            zero_slots,
+            partition_valid,
+            role,
+            enc,
+            eval,
+            runtime);
+        final_values = final_values + selected_values;
+
+        if (profile && role == 0) {
+            std::cerr << "bspn_multiplier_profile: event=reversible_lookup_partition"
+                      << " partition=" << partition_id
+                      << " source_capacity=" << source_capacity
+                      << " query_slots=" << total_rows
+                      << " padded_rows=" << padded_rows
+                      << " layers=" << layer_count
+                      << " forward_comparators=" << comparator_count
+                      << " reverse_swaps=" << comparator_count
+                      << std::endl;
+        }
+    }
+
+    if (profile && role == 0) {
+        std::cerr << "bspn_multiplier_profile: event=reversible_lookup_total"
+                  << " partitions=" << partition_count
+                  << " query_slots=" << total_rows
+                  << " forward_layers=" << total_forward_layers
+                  << " forward_comparators=" << total_forward_comparators
+                  << " reverse_swaps=" << total_forward_comparators
+                  << " forward_seconds=" << forward_seconds
+                  << " propagation_seconds=" << propagate_seconds
+                  << " reverse_seconds=" << reverse_seconds
+                  << std::endl;
+    }
+    return final_values;
+}
+
 si64Matrix load_secure_leaf_row_values(
     const json& plan,
     const json& leaf_doc,
     const std::string& plan_base_dir,
     const std::string& plan_role_share_dir,
     u64 total_rows,
-    int role)
+    int role,
+    Sh3Encryptor& enc,
+    Sh3Evaluator& eval,
+    Sh3Runtime& runtime)
 {
     const std::string sampled_row_values_file = leaf_doc.value("sampled_row_values_share_file", std::string());
     if (!sampled_row_values_file.empty()) {
         const std::string plan_role_dir = role_dir_from_template(plan_base_dir, plan_role_share_dir, role);
         return read_share_pair_matrix(join_path(plan_role_dir, sampled_row_values_file), total_rows);
+    }
+
+    if (plan.value("mapping_mode", std::string()) == "partition_replicated_reversible_bitonic_lookup") {
+        return load_secure_leaf_row_values_reversible_lookup(
+            plan,
+            leaf_doc,
+            plan_base_dir,
+            plan_role_share_dir,
+            total_rows,
+            role,
+            enc,
+            eval,
+            runtime);
     }
 
     if (!plan.contains("sample_row_id_by_position") || !plan["sample_row_id_by_position"].is_array()) {
@@ -4723,7 +5175,10 @@ void run_secure_leaf_materialize(const MultiplierPreprocessConfig& config)
                     plan_base_dir,
                     plan_role_share_dir,
                     total_rows,
-                    config.role);
+                    config.role,
+                    enc,
+                    eval,
+                    runtime);
                 cache_iter = row_value_cache.emplace(row_value_key, std::move(row_values)).first;
                 secure_leaf_profile_log(
                     config.role,
@@ -4806,7 +5261,10 @@ void run_secure_leaf_materialize(const MultiplierPreprocessConfig& config)
                     plan_base_dir,
                     plan_role_share_dir,
                     total_rows,
-                    config.role);
+                    config.role,
+                    enc,
+                    eval,
+                    runtime);
                 cache_iter = row_value_cache.emplace(row_value_key, std::move(row_values)).first;
             }
             results.push_back(materialize_one_secure_leaf_fixed_cap(
