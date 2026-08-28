@@ -4177,6 +4177,32 @@ u64 next_power_of_two_u64(u64 value)
     return out;
 }
 
+u64 ceil_log2_u64(u64 value)
+{
+    if (value <= 1) {
+        return 0;
+    }
+    u64 layers = 0;
+    u64 current = 1;
+    while (current < value) {
+        current <<= 1;
+        ++layers;
+    }
+    return layers;
+}
+
+si64Matrix int_shift_down_one_zero(const si64Matrix& values)
+{
+    si64Matrix shifted(values.rows(), values.cols());
+    shifted.mShares[0].setZero();
+    shifted.mShares[1].setZero();
+    for (u64 row = 1; row < values.rows(); ++row) {
+        shifted.mShares[0].row(row) = values.mShares[0].row(row - 1);
+        shifted.mShares[1].row(row) = values.mShares[1].row(row - 1);
+    }
+    return shifted;
+}
+
 si64Matrix load_secure_leaf_row_values_reversible_lookup(
     const json& plan,
     const json& leaf_doc,
@@ -4326,53 +4352,35 @@ si64Matrix load_secure_leaf_row_values_reversible_lookup(
         auto is_active = int_eq_public(columns[kInvalidRank], 0, role, eval, runtime);
         is_source = local_bool_and_matrix(is_source, is_active, role, enc, eval, runtime);
         is_query = local_bool_and_matrix(is_query, is_active, role, enc, eval, runtime);
-        si64Matrix running(padded_rows, 1);
-        running.mShares[0].setZero();
-        running.mShares[1].setZero();
-        si64Matrix fetched(padded_rows, 1);
-        fetched.mShares[0].setZero();
-        fetched.mShares[1].setZero();
-        auto zero_row = shared_zero_int_matrix(1, 1);
-        for (u64 row = 0; row < padded_rows; ++row) {
-            auto value_row = int_row_slice(columns[kValue], row, 1);
-            auto source_flag = bool_row_slice(is_source, row, 1);
-            auto query_flag = bool_row_slice(is_query, row, 1);
-            auto source_payload = select_si64_by_bool(value_row, zero_row, source_flag, role, enc, eval, runtime);
-            si64Matrix current_running(1, 1);
-            if (row == 0) {
-                current_running = source_payload;
-            } else {
-                auto lhs_key = int_row_slice(columns[kDenseKey], row, 1);
-                auto rhs_key = int_row_slice(columns[kDenseKey], row - 1, 1);
-                auto same_key = int_eq_matrix(lhs_key, rhs_key, role, eval, runtime);
-                auto current_active = bool_row_slice(is_active, row, 1);
-                auto prev_active = bool_row_slice(is_active, row - 1, 1);
-                same_key = local_bool_and_matrix(same_key, current_active, role, enc, eval, runtime);
-                same_key = local_bool_and_matrix(same_key, prev_active, role, enc, eval, runtime);
-                auto previous_running = int_row_slice(running, row - 1, 1);
-                auto same_group_value = select_si64_by_bool(
-                    source_payload,
-                    previous_running,
-                    source_flag,
-                    role,
-                    enc,
-                    eval,
-                    runtime);
-                current_running = select_si64_by_bool(
-                    same_group_value,
-                    source_payload,
-                    same_key,
-                    role,
-                    enc,
-                    eval,
-                    runtime);
-            }
-            running.mShares[0](row, 0) = current_running.mShares[0](0, 0);
-            running.mShares[1](row, 0) = current_running.mShares[1](0, 0);
-            auto fetched_row = select_si64_by_bool(current_running, zero_row, query_flag, role, enc, eval, runtime);
-            fetched.mShares[0](row, 0) = fetched_row.mShares[0](0, 0);
-            fetched.mShares[1](row, 0) = fetched_row.mShares[1](0, 0);
-        }
+        auto previous_key = int_shift_down_one_zero(columns[kDenseKey]);
+        auto previous_active = bool_shift_down_one_false(is_active, role);
+        auto same_previous = int_eq_matrix(columns[kDenseKey], previous_key, role, eval, runtime);
+        same_previous = local_bool_and_matrix(same_previous, is_active, role, enc, eval, runtime);
+        same_previous = local_bool_and_matrix(same_previous, previous_active, role, enc, eval, runtime);
+        auto zero_records = shared_zero_int_matrix(padded_rows, 1);
+        auto source_payload = select_si64_by_bool(
+            columns[kValue],
+            zero_records,
+            is_source,
+            role,
+            enc,
+            eval,
+            runtime);
+        auto running = segmented_prefix_sum(
+            source_payload,
+            same_previous,
+            role,
+            enc,
+            eval,
+            runtime);
+        auto fetched = select_si64_by_bool(
+            running,
+            zero_records,
+            is_query,
+            role,
+            enc,
+            eval,
+            runtime);
         columns[kFetched] = std::move(fetched);
         const double partition_propagate_seconds = elapsed_seconds_since(propagate_started);
         propagate_seconds += partition_propagate_seconds;
@@ -4409,6 +4417,7 @@ si64Matrix load_secure_leaf_row_values_reversible_lookup(
                       << " layers=" << layer_count
                       << " forward_comparators=" << comparator_count
                       << " reverse_swaps=" << comparator_count
+                      << " parallel_scan_layers=" << ceil_log2_u64(padded_rows)
                       << " swap_bit_shares=" << comparator_count
                       << " swap_bit_pair_bytes_estimate=" << (comparator_count * sizeof(i64) * 2)
                       << " forward_seconds=" << partition_forward_seconds
@@ -4427,6 +4436,7 @@ si64Matrix load_secure_leaf_row_values_reversible_lookup(
                   << " forward_comparators=" << total_forward_comparators
                   << " reverse_swaps=" << total_forward_comparators
                   << " swap_bit_shares=" << total_forward_comparators
+                  << " propagation_mode=parallel_segmented_prefix_sum"
                   << " mapping_load_seconds=" << load_seconds
                   << " forward_seconds=" << forward_seconds
                   << " propagation_seconds=" << propagate_seconds
@@ -5132,10 +5142,28 @@ void run_secure_leaf_materialize(const MultiplierPreprocessConfig& config)
         plan.value("multiplier_fixed_cap", plan.value("public_leaf_bucket_width", std::uint64_t(8))));
     const std::string plan_base_dir = dirname_from_path(config.secure_leaf_plan_path);
     const std::string plan_role_share_dir = plan.value("role_share_dir", std::string("secure_leaf_plan/role_{role}"));
+    const bool reversible_lookup_plan =
+        plan.value("mapping_mode", std::string()) == "partition_replicated_reversible_bitonic_lookup";
+    const bool public_capacity_contract_validated =
+        plan.value("public_capacity_contract_validated", false) &&
+        plan.value("capacity_contract", std::string()) == "public_fixed_model_capacity" &&
+        public_leaf_bucket_width >= total_rows;
+    const bool skip_secret_overflow_reveal =
+        secure_multiplier_forbid_server_reveal_enabled() &&
+        reversible_lookup_plan &&
+        public_capacity_contract_validated;
+    if (secure_multiplier_forbid_server_reveal_enabled() && !skip_secret_overflow_reveal) {
+        throw std::runtime_error(
+            "privacy-aligned secure leaf materializer forbids server reveal without a public fixed capacity contract");
+    }
 
     std::unordered_map<std::string, si64Matrix> row_value_cache;
     sbMatrix model_overflow = shared_false_bool_matrix(1, 1, config.role);
     const bool use_sorted_group = secure_leaf_sorted_group_enabled();
+    if (secure_multiplier_forbid_server_reveal_enabled() && use_sorted_group) {
+        throw std::runtime_error(
+            "privacy-aligned secure leaf materializer forbids sorted_group because it uses comparison-revealing sort");
+    }
     const auto strategy_name = secure_leaf_materialize_strategy_name();
     const auto profile_level = secure_leaf_profile_level();
     const auto leaves = plan.value("leaves", json::array());
@@ -5303,10 +5331,12 @@ void run_secure_leaf_materialize(const MultiplierPreprocessConfig& config)
                 leaves.size()));
         }
     }
-    i64Matrix plain_overflow(1, 1);
-    enc.revealAll(runtime, model_overflow, plain_overflow).get();
-    if ((plain_overflow(0, 0) & 1) != 0) {
-        throw std::runtime_error("multiplier_fixed_cap too small");
+    if (!skip_secret_overflow_reveal) {
+        i64Matrix plain_overflow(1, 1);
+        enc.revealAll(runtime, model_overflow, plain_overflow).get();
+        if ((plain_overflow(0, 0) & 1) != 0) {
+            throw std::runtime_error("multiplier_fixed_cap too small");
+        }
     }
     if (config.role == 0) {
         ensure_dir(config.output_prefix);
