@@ -4220,6 +4220,7 @@ si64Matrix load_secure_leaf_row_values_reversible_lookup(
         throw std::runtime_error("Secure leaf reversible lookup source domain size mismatch.");
     }
 
+    const auto load_started = SteadyClock::now();
     const std::string plan_role_dir = role_dir_from_template(plan_base_dir, plan_role_share_dir, role);
     const std::string valid_file = plan.value("mapping_valid_in_partition_share_file", std::string());
     const std::string dense_file = plan.value("mapping_dense_key_share_file", std::string());
@@ -4236,6 +4237,7 @@ si64Matrix load_secure_leaf_row_values_reversible_lookup(
     if (full_values.rows() != source_domain_size) {
         throw std::runtime_error("Secure leaf reversible lookup source artifact row count does not match public domain size.");
     }
+    const double load_seconds = elapsed_seconds_since(load_started);
 
     si64Matrix final_values(total_rows, 1);
     final_values.mShares[0].setZero();
@@ -4244,6 +4246,7 @@ si64Matrix load_secure_leaf_row_values_reversible_lookup(
     double forward_seconds = 0.0;
     double propagate_seconds = 0.0;
     double reverse_seconds = 0.0;
+    double mask_sum_seconds = 0.0;
     u64 total_forward_comparators = 0;
     u64 total_forward_layers = 0;
 
@@ -4312,7 +4315,8 @@ si64Matrix load_secure_leaf_row_values_reversible_lookup(
             runtime,
             layer_count,
             comparator_count);
-        forward_seconds += elapsed_seconds_since(forward_started);
+        const double partition_forward_seconds = elapsed_seconds_since(forward_started);
+        forward_seconds += partition_forward_seconds;
         total_forward_layers += layer_count;
         total_forward_comparators += comparator_count;
 
@@ -4370,13 +4374,16 @@ si64Matrix load_secure_leaf_row_values_reversible_lookup(
             fetched.mShares[1](row, 0) = fetched_row.mShares[1](0, 0);
         }
         columns[kFetched] = std::move(fetched);
-        propagate_seconds += elapsed_seconds_since(propagate_started);
+        const double partition_propagate_seconds = elapsed_seconds_since(propagate_started);
+        propagate_seconds += partition_propagate_seconds;
 
         const auto reverse_started = SteadyClock::now();
         reversible_bitonic_reverse_rows(columns, stored_layers, role, enc, eval, runtime);
-        reverse_seconds += elapsed_seconds_since(reverse_started);
+        const double partition_reverse_seconds = elapsed_seconds_since(reverse_started);
+        reverse_seconds += partition_reverse_seconds;
         stored_layers.clear();
 
+        const auto mask_started = SteadyClock::now();
         auto partition_values = int_row_slice(columns[kFetched], source_capacity, total_rows);
         auto partition_invalid = int_row_slice(columns[kInvalidRank], source_capacity, total_rows);
         auto partition_valid = int_eq_public(partition_invalid, 0, role, eval, runtime);
@@ -4390,6 +4397,8 @@ si64Matrix load_secure_leaf_row_values_reversible_lookup(
             eval,
             runtime);
         final_values = final_values + selected_values;
+        const double partition_mask_seconds = elapsed_seconds_since(mask_started);
+        mask_sum_seconds += partition_mask_seconds;
 
         if (profile && role == 0) {
             std::cerr << "bspn_multiplier_profile: event=reversible_lookup_partition"
@@ -4400,6 +4409,12 @@ si64Matrix load_secure_leaf_row_values_reversible_lookup(
                       << " layers=" << layer_count
                       << " forward_comparators=" << comparator_count
                       << " reverse_swaps=" << comparator_count
+                      << " swap_bit_shares=" << comparator_count
+                      << " swap_bit_pair_bytes_estimate=" << (comparator_count * sizeof(i64) * 2)
+                      << " forward_seconds=" << partition_forward_seconds
+                      << " propagation_seconds=" << partition_propagate_seconds
+                      << " reverse_seconds=" << partition_reverse_seconds
+                      << " mask_sum_seconds=" << partition_mask_seconds
                       << std::endl;
         }
     }
@@ -4411,9 +4426,12 @@ si64Matrix load_secure_leaf_row_values_reversible_lookup(
                   << " forward_layers=" << total_forward_layers
                   << " forward_comparators=" << total_forward_comparators
                   << " reverse_swaps=" << total_forward_comparators
+                  << " swap_bit_shares=" << total_forward_comparators
+                  << " mapping_load_seconds=" << load_seconds
                   << " forward_seconds=" << forward_seconds
                   << " propagation_seconds=" << propagate_seconds
                   << " reverse_seconds=" << reverse_seconds
+                  << " mask_sum_seconds=" << mask_sum_seconds
                   << std::endl;
     }
     return final_values;
