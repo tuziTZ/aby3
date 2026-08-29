@@ -4082,6 +4082,11 @@ void write_secure_leaf_counts_manifest(
     const std::vector<MaterializedLeafResult>& leaves,
     u64 total_rows);
 
+void write_secure_leaf_contribution_manifest(
+    const std::string& output_prefix,
+    const std::vector<MaterializedLeafResult>& leaves,
+    u64 total_rows);
+
 std::string role_dir_from_template(
     const std::string& base_dir,
     const std::string& role_share_dir,
@@ -5120,6 +5125,35 @@ void write_secure_leaf_counts_manifest(
     write_text_file(join_path(output_prefix, "secure_leaf_counts.json"), content.str());
 }
 
+void write_secure_leaf_contribution_manifest(
+    const std::string& output_prefix,
+    const std::vector<MaterializedLeafResult>& leaves,
+    u64 total_rows)
+{
+    std::ostringstream content;
+    content << "{\n";
+    content << "  \"format_name\": \"BSPN_SECURE_MULTIPLIER_LEAF_CONTRIBUTIONS\",\n";
+    content << "  \"format_version\": 1,\n";
+    content << "  \"total_rows\": " << total_rows << ",\n";
+    content << "  \"share_kind\": \"ABY3_REPLICATED_PAIR_I64\",\n";
+    content << "  \"row_value_contribution_only\": true,\n";
+    content << "  \"leaves\": [\n";
+    for (std::size_t idx = 0; idx < leaves.size(); ++idx) {
+        const auto& leaf = leaves[idx];
+        content << "    {";
+        content << "\"leaf_node_id\": " << leaf.leaf_node_id << ", ";
+        content << "\"product_group_id\": " << leaf.product_group_id << ", ";
+        content << "\"public_bucket_width\": " << leaf.public_bucket_width << ", ";
+        content << "\"secure_multiplier_leaf_bucket_mode\": \"" << leaf.bucket_mode << "\", ";
+        content << "\"row_values_share_file\": \"leaf_" << leaf.leaf_node_id << ".row_values.shares.bin\"";
+        content << "}" << (idx + 1 == leaves.size() ? "\n" : ",\n");
+    }
+    content << "  ],\n";
+    content << "  \"role_share_dir\": \"role_{role}\"\n";
+    content << "}\n";
+    write_text_file(join_path(output_prefix, "secure_leaf_contributions.json"), content.str());
+}
+
 void run_secure_leaf_materialize(const MultiplierPreprocessConfig& config)
 {
     if (config.role < 0 || config.role > 2) {
@@ -5144,13 +5178,15 @@ void run_secure_leaf_materialize(const MultiplierPreprocessConfig& config)
     const std::string plan_role_share_dir = plan.value("role_share_dir", std::string("secure_leaf_plan/role_{role}"));
     const bool reversible_lookup_plan =
         plan.value("mapping_mode", std::string()) == "partition_replicated_reversible_bitonic_lookup";
+    const bool aggregate_row_value_plan =
+        plan.value("row_value_source_mode", std::string()) == "round7_partition_contribution_aggregate";
     const bool public_capacity_contract_validated =
         plan.value("public_capacity_contract_validated", false) &&
         plan.value("capacity_contract", std::string()) == "public_fixed_model_capacity" &&
         public_leaf_bucket_width >= total_rows;
     const bool skip_secret_overflow_reveal =
         secure_multiplier_forbid_server_reveal_enabled() &&
-        reversible_lookup_plan &&
+        (reversible_lookup_plan || aggregate_row_value_plan) &&
         public_capacity_contract_validated;
     if (secure_multiplier_forbid_server_reveal_enabled() && !skip_secret_overflow_reveal) {
         throw std::runtime_error(
@@ -5180,6 +5216,70 @@ void run_secure_leaf_materialize(const MultiplierPreprocessConfig& config)
             {"cap", public_leaf_bucket_width},
             {"secure_leaf_count", static_cast<std::uint64_t>(leaves.size())},
         });
+
+    if (plan.value("row_value_contribution_only", false)) {
+        if (!reversible_lookup_plan && !aggregate_row_value_plan) {
+            throw std::runtime_error("row_value_contribution_only requires reversible lookup or aggregate row-value mode.");
+        }
+        if (!skip_secret_overflow_reveal) {
+            throw std::runtime_error(
+                "row_value_contribution_only requires the privacy-aligned public fixed capacity contract");
+        }
+        ensure_dir(config.output_prefix);
+        for (std::size_t leaf_idx = 0; leaf_idx < leaves.size(); ++leaf_idx) {
+            const auto& leaf_doc = leaves[leaf_idx];
+            const auto row_values = load_secure_leaf_row_values(
+                plan,
+                leaf_doc,
+                plan_base_dir,
+                plan_role_share_dir,
+                total_rows,
+                config.role,
+                enc,
+                eval,
+                runtime);
+            const auto leaf_node_id = leaf_doc.value("leaf_node_id", std::uint64_t(0));
+            const std::string role_dir = join_path(config.output_prefix, "role_" + std::to_string(config.role));
+            ensure_dir(role_dir);
+            write_share_pair_matrix(
+                join_path(role_dir, "leaf_" + std::to_string(leaf_node_id) + ".row_values.shares.bin"),
+                row_values);
+            MaterializedLeafResult result;
+            result.leaf_node_id = leaf_node_id;
+            result.product_group_id = leaf_doc.value("product_group_id", std::uint64_t(0));
+            result.public_bucket_width = public_leaf_bucket_width;
+            result.real_bucket_count = total_rows;
+            result.bucket_mode = "row_value_contribution_only";
+            result.include_row_values = true;
+            results.push_back(result);
+            secure_leaf_profile_log(
+                config.role,
+                profile_level,
+                SecureLeafProfileLevel::Group,
+                {
+                    {"event", "row_value_contribution_written"},
+                    {"leaf_index", static_cast<std::uint64_t>(leaf_idx)},
+                    {"leaf_node_id", leaf_node_id},
+                    {"rows", total_rows},
+                });
+        }
+        if (config.role == 0) {
+            ensure_dir(config.output_prefix);
+            write_secure_leaf_contribution_manifest(config.output_prefix, results, total_rows);
+        }
+        secure_leaf_profile_log(
+            config.role,
+            profile_level,
+            SecureLeafProfileLevel::Group,
+            {
+                {"event", "materialize_end"},
+                {"strategy", "row_value_contribution_only"},
+                {"rows", total_rows},
+                {"secure_leaf_count", static_cast<std::uint64_t>(leaves.size())},
+                {"status", "ok"},
+            });
+        return;
+    }
 
     if (use_sorted_group) {
         std::vector<std::string> group_order;

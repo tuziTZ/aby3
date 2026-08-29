@@ -3962,6 +3962,16 @@ std::vector<SecureRationalShare> evaluate_leaf_product_batch_values(
                 match_masks,
                 context,
                 eval_stats != nullptr ? &eval_stats->phase1_batch_dot_calls : nullptr);
+            if (model.manifest().secure_multiplier_row_value_overlay_only &&
+                !model.manifest().secure_multiplier_leaf_row_value_node_ids.empty()) {
+                const auto& overlay_leaf_ids = model.manifest().secure_multiplier_leaf_row_value_node_ids;
+                for (std::size_t child_idx = 0; child_idx < leaf_children.size(); ++child_idx) {
+                    const auto node_id = leaf_children[child_idx]->node_id;
+                    if (std::find(overlay_leaf_ids.begin(), overlay_leaf_ids.end(), node_id) != overlay_leaf_ids.end()) {
+                        local_ids[child_idx] = global_rows_shared;
+                    }
+                }
+            }
             if (context.debug_internal_reveal && std::getenv("BSPN_DEBUG_LEAF_EVIDENCE_FLAGS") != nullptr) {
                 if (context.role == 0) {
                     std::cerr << "bspn_debug_leaf_local_id_counts:"
@@ -4107,7 +4117,6 @@ std::vector<SecureRationalShare> evaluate_leaf_product_batch_values(
     if (needs_target_numerator) {
         const auto phase_start = SteadyClock::now();
         const bool use_row_values =
-            !use_row_weights_for_rows &&
             bspn_use_row_value_eval() &&
             model.secret_shared_payload().leaf_row_values_loaded;
         if (use_row_values) {
@@ -5839,6 +5848,8 @@ void FlatBSPNModel::load_public_manifest(const std::string& manifest_path) {
             manifest_.secure_multiplier_bucket_mapping.push_back(mapping);
         }
     }
+    manifest_.secure_multiplier_row_value_overlay_only =
+        manifest_doc.value("secure_multiplier_row_value_overlay_only", false);
     manifest_.has_leaf_row_values = manifest_doc.value("has_leaf_row_values", false);
     manifest_.leaf_row_value_total_rows = manifest_doc.value("leaf_row_value_total_rows", std::uint64_t(0));
     manifest_.leaf_row_value_node_ids.clear();
@@ -5911,8 +5922,17 @@ void FlatBSPNModel::load_public_manifest(const std::string& manifest_path) {
         throw std::runtime_error("FlatBSPN payload_layout_version must be >= 4 for padded secure evaluation.");
     }
     if (manifest_.secure_multiplier_materialized &&
-        manifest_.secure_multiplier_bucket_indices.empty()) {
+        manifest_.secure_multiplier_bucket_indices.empty() &&
+        manifest_.secure_multiplier_leaf_row_value_node_ids.empty()) {
         throw std::runtime_error("secure_multiplier_materialized requires secure_multiplier_bucket_indices.");
+    }
+    if (manifest_.secure_multiplier_row_value_overlay_only &&
+        !manifest_.secure_multiplier_bucket_indices.empty()) {
+        throw std::runtime_error("row-value-only secure multiplier overlay cannot declare bucket indices.");
+    }
+    if (manifest_.secure_multiplier_row_value_overlay_only &&
+        manifest_.secure_multiplier_leaf_row_value_node_ids.empty()) {
+        throw std::runtime_error("row-value-only secure multiplier overlay requires row-value node ids.");
     }
 
     const auto raw_nodes = read_binary_records<PackedRawNodeRecord>(join_path(base_dir_, "nodes.bin"));
@@ -6430,12 +6450,14 @@ secret_shared_payload_.dense_bucket_bitmaps_loaded = true;
     }
 
     if (manifest_.secure_multiplier_materialized ||
-        !manifest_.secure_multiplier_bucket_indices.empty()) {
+        !manifest_.secure_multiplier_bucket_indices.empty() ||
+        !manifest_.secure_multiplier_leaf_row_value_node_ids.empty()) {
         if (context.role < 0 || context.role > 2) {
             throw std::runtime_error("Secure multiplier share overlay requires role in {0,1,2}.");
         }
         const std::size_t secure_bucket_count = manifest_.secure_multiplier_bucket_indices.size();
-        if (secure_bucket_count == 0) {
+        const bool has_row_value_overlay = !manifest_.secure_multiplier_leaf_row_value_node_ids.empty();
+        if (secure_bucket_count == 0 && !has_row_value_overlay) {
             throw std::runtime_error("Secure multiplier materialized payload has no bucket indices.");
         }
         const std::string share_root = join_path(base_dir_, manifest_.secure_share_payload_dir.empty()
@@ -6582,51 +6604,53 @@ secret_shared_payload_.dense_bucket_bitmaps_loaded = true;
             bool_share_encoding = share_manifest_doc.value("bool_share_encoding", std::string("i64_pair_v1"));
         }
         const std::string role_dir = join_path(share_root, "role_" + std::to_string(context.role));
-        const auto shared_values = read_fixed_share_pair_column<kFlatBSPNDecimal>(
-            join_path(role_dir, "bucket_values.shares.bin"),
-            secure_bucket_count);
-        const auto shared_lowers = read_fixed_share_pair_column<kFlatBSPNDecimal>(
-            join_path(role_dir, "bucket_lowers.shares.bin"),
-            secure_bucket_count);
-        const auto shared_uppers = read_fixed_share_pair_column<kFlatBSPNDecimal>(
-            join_path(role_dir, "bucket_uppers.shares.bin"),
-            secure_bucket_count);
-        sbMatrix shared_bitmaps;
-        const std::string bitmap_share_path = join_path(role_dir, "leaf_bitmaps.shares.bin");
-        if (bool_share_encoding == "bitpacked_pair_lsb_v1") {
-            shared_bitmaps = read_bool_share_pair_column_bitpacked(
-                bitmap_share_path,
-                secure_bucket_count * static_cast<std::size_t>(manifest_.total_rows));
-        } else if (bool_share_encoding == "i64_pair_v1" || bool_share_encoding.empty()) {
-            shared_bitmaps = read_bool_share_pair_column(
-                bitmap_share_path,
-                secure_bucket_count * static_cast<std::size_t>(manifest_.total_rows));
-        } else {
-            throw std::runtime_error("Unsupported bool_share_encoding in secure share manifest: " + bool_share_encoding);
-        }
-
-        for (std::size_t local_idx = 0; local_idx < secure_bucket_count; ++local_idx) {
-            const std::uint32_t bucket_index = manifest_.secure_multiplier_bucket_indices[local_idx];
-            if (bucket_index >= secret_shared_payload_.dense_bucket_bitmaps.size() ||
-                bucket_index >= static_cast<std::uint32_t>(secret_shared_payload_.bucket_values.rows())) {
-                throw std::runtime_error("Secure multiplier bucket index is out of bounds.");
+        if (secure_bucket_count > 0) {
+            const auto shared_values = read_fixed_share_pair_column<kFlatBSPNDecimal>(
+                join_path(role_dir, "bucket_values.shares.bin"),
+                secure_bucket_count);
+            const auto shared_lowers = read_fixed_share_pair_column<kFlatBSPNDecimal>(
+                join_path(role_dir, "bucket_lowers.shares.bin"),
+                secure_bucket_count);
+            const auto shared_uppers = read_fixed_share_pair_column<kFlatBSPNDecimal>(
+                join_path(role_dir, "bucket_uppers.shares.bin"),
+                secure_bucket_count);
+            sbMatrix shared_bitmaps;
+            const std::string bitmap_share_path = join_path(role_dir, "leaf_bitmaps.shares.bin");
+            if (bool_share_encoding == "bitpacked_pair_lsb_v1") {
+                shared_bitmaps = read_bool_share_pair_column_bitpacked(
+                    bitmap_share_path,
+                    secure_bucket_count * static_cast<std::size_t>(manifest_.total_rows));
+            } else if (bool_share_encoding == "i64_pair_v1" || bool_share_encoding.empty()) {
+                shared_bitmaps = read_bool_share_pair_column(
+                    bitmap_share_path,
+                    secure_bucket_count * static_cast<std::size_t>(manifest_.total_rows));
+            } else {
+                throw std::runtime_error("Unsupported bool_share_encoding in secure share manifest: " + bool_share_encoding);
             }
-            secret_shared_payload_.bucket_values[0](bucket_index, 0) = shared_values[0](static_cast<u64>(local_idx), 0);
-            secret_shared_payload_.bucket_values[1](bucket_index, 0) = shared_values[1](static_cast<u64>(local_idx), 0);
-            secret_shared_payload_.bucket_lowers[0](bucket_index, 0) = shared_lowers[0](static_cast<u64>(local_idx), 0);
-            secret_shared_payload_.bucket_lowers[1](bucket_index, 0) = shared_lowers[1](static_cast<u64>(local_idx), 0);
-            secret_shared_payload_.bucket_uppers[0](bucket_index, 0) = shared_uppers[0](static_cast<u64>(local_idx), 0);
-            secret_shared_payload_.bucket_uppers[1](bucket_index, 0) = shared_uppers[1](static_cast<u64>(local_idx), 0);
 
-            sbMatrix bitmap(static_cast<u64>(manifest_.total_rows), shared_bitmaps.bitCount());
-            const u64 source_begin = static_cast<u64>(local_idx) * static_cast<u64>(manifest_.total_rows);
-            for (u64 row = 0; row < static_cast<u64>(manifest_.total_rows); ++row) {
-                for (u64 col = 0; col < static_cast<u64>(shared_bitmaps.mShares[0].cols()); ++col) {
-                    bitmap.mShares[0](row, col) = shared_bitmaps.mShares[0](source_begin + row, col);
-                    bitmap.mShares[1](row, col) = shared_bitmaps.mShares[1](source_begin + row, col);
+            for (std::size_t local_idx = 0; local_idx < secure_bucket_count; ++local_idx) {
+                const std::uint32_t bucket_index = manifest_.secure_multiplier_bucket_indices[local_idx];
+                if (bucket_index >= secret_shared_payload_.dense_bucket_bitmaps.size() ||
+                    bucket_index >= static_cast<std::uint32_t>(secret_shared_payload_.bucket_values.rows())) {
+                    throw std::runtime_error("Secure multiplier bucket index is out of bounds.");
                 }
+                secret_shared_payload_.bucket_values[0](bucket_index, 0) = shared_values[0](static_cast<u64>(local_idx), 0);
+                secret_shared_payload_.bucket_values[1](bucket_index, 0) = shared_values[1](static_cast<u64>(local_idx), 0);
+                secret_shared_payload_.bucket_lowers[0](bucket_index, 0) = shared_lowers[0](static_cast<u64>(local_idx), 0);
+                secret_shared_payload_.bucket_lowers[1](bucket_index, 0) = shared_lowers[1](static_cast<u64>(local_idx), 0);
+                secret_shared_payload_.bucket_uppers[0](bucket_index, 0) = shared_uppers[0](static_cast<u64>(local_idx), 0);
+                secret_shared_payload_.bucket_uppers[1](bucket_index, 0) = shared_uppers[1](static_cast<u64>(local_idx), 0);
+
+                sbMatrix bitmap(static_cast<u64>(manifest_.total_rows), shared_bitmaps.bitCount());
+                const u64 source_begin = static_cast<u64>(local_idx) * static_cast<u64>(manifest_.total_rows);
+                for (u64 row = 0; row < static_cast<u64>(manifest_.total_rows); ++row) {
+                    for (u64 col = 0; col < static_cast<u64>(shared_bitmaps.mShares[0].cols()); ++col) {
+                        bitmap.mShares[0](row, col) = shared_bitmaps.mShares[0](source_begin + row, col);
+                        bitmap.mShares[1](row, col) = shared_bitmaps.mShares[1](source_begin + row, col);
+                    }
+                }
+                secret_shared_payload_.dense_bucket_bitmaps[bucket_index] = std::move(bitmap);
             }
-            secret_shared_payload_.dense_bucket_bitmaps[bucket_index] = std::move(bitmap);
         }
         if (secret_shared_payload_.leaf_row_values_loaded &&
             !manifest_.secure_multiplier_leaf_row_value_node_ids.empty()) {

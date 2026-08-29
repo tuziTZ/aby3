@@ -89,6 +89,7 @@ struct FlatBSPNManifest {
     std::string secure_share_bool_encoding = "bitpacked_pair_lsb_v1";
     std::vector<std::uint32_t> secure_multiplier_bucket_indices;
     std::vector<FlatSecureBucketMapping> secure_multiplier_bucket_mapping;
+    bool secure_multiplier_row_value_overlay_only = false;
     bool has_leaf_row_values = false;
     std::vector<std::uint32_t> leaf_row_value_node_ids;
     std::vector<std::uint64_t> leaf_row_value_offsets;
