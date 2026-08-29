@@ -139,6 +139,10 @@ bool bspn_use_row_value_eval() {
     return normalized != "0" && normalized != "false" && normalized != "FALSE" && normalized != "off";
 }
 
+bool bspn_multiplier_product_local_overlay_rows() {
+    return bspn_env_flag_enabled("BSPN_MULTIPLIER_PRODUCT_LOCAL_OVERLAY_ROWS");
+}
+
 BSPNNetworkConfig bspn_network_config_from_env() {
     BSPNNetworkConfig config;
     config.hosts = parse_bspn_hosts_env(std::getenv("ABY3_PARTY_HOSTS"));
@@ -3857,6 +3861,7 @@ std::vector<SecureRationalShare> evaluate_leaf_product_batch_values(
     const bool needs_target_numerator = public_factor_feature_count != 0;
     const bool needs_leaf_domain_filter =
         needs_evidence_filter ||
+        needs_target_numerator ||
         (factor.factor.requires_model_eval && !needs_target_numerator);
     const bool public_single_target_factor = public_factor_feature_count <= 1;
     const std::size_t max_columns = static_cast<std::size_t>(secret_feature_scope.cols());
@@ -3962,7 +3967,8 @@ std::vector<SecureRationalShare> evaluate_leaf_product_batch_values(
                 match_masks,
                 context,
                 eval_stats != nullptr ? &eval_stats->phase1_batch_dot_calls : nullptr);
-            if (model.manifest().secure_multiplier_row_value_overlay_only &&
+            if (!bspn_multiplier_product_local_overlay_rows() &&
+                model.manifest().secure_multiplier_row_value_overlay_only &&
                 !model.manifest().secure_multiplier_leaf_row_value_node_ids.empty()) {
                 const auto& overlay_leaf_ids = model.manifest().secure_multiplier_leaf_row_value_node_ids;
                 for (std::size_t child_idx = 0; child_idx < leaf_children.size(); ++child_idx) {
