@@ -1611,7 +1611,7 @@ sf64Matrix<kFlatBSPNDecimal> secure_count_reciprocal_newton_scaled_matrix(
     const sf64Matrix<kFlatBSPNDecimal>& count,
     std::uint64_t max_count,
     const FlatBSPNSecureContext& context,
-    std::size_t iterations = 12) {
+    std::size_t iterations = 16) {
     const double public_inv_max =
         max_count == 0 ? 1.0 : 1.0 / static_cast<double>(max_count);
     auto inv_max_matrix = repeat_fixed_scalar_matrix(
@@ -1632,7 +1632,7 @@ sf64Matrix<kFlatBSPNDecimal> secure_count_reciprocal_newton_scaled(
     const sf64Matrix<kFlatBSPNDecimal>& count,
     std::uint64_t max_count,
     const FlatBSPNSecureContext& context,
-    std::size_t iterations = 12) {
+    std::size_t iterations = 16) {
     const double public_inv_max =
         max_count == 0 ? 1.0 : 1.0 / static_cast<double>(max_count);
     const auto scaled_count = secure_mul_public_fixed(count, public_inv_max, context);
@@ -4439,10 +4439,19 @@ std::vector<SecureRationalShare> evaluate_leaf_product_batch_values(
             *(context.runtime));
         const auto zero_cnt_rows = bool_matrix_to_fixed_same_shape(is_zero_effective_rows, context);
         const auto denom_safe_rows = denominator_cnt_rows + zero_cnt_rows;
-        const auto filtered_inv_cnt_rows = secure_count_reciprocal_newton_scaled_matrix(
-            denom_safe_rows,
-            factor.factor.total_rows != 0 ? factor.factor.total_rows : model.manifest().total_rows,
-            context);
+        const std::uint64_t public_count_upper_bound =
+            factor.factor.total_rows != 0 ? factor.factor.total_rows : model.manifest().total_rows;
+        constexpr std::uint64_t kExactCountReciprocalLookupMaxRows = 8192;
+        const auto filtered_inv_cnt_rows =
+            public_count_upper_bound <= kExactCountReciprocalLookupMaxRows
+                ? secure_count_reciprocal_piecewise(
+                      denom_safe_rows,
+                      public_count_upper_bound,
+                      context)
+                : secure_count_reciprocal_newton_scaled_matrix(
+                      denom_safe_rows,
+                      public_count_upper_bound,
+                      context);
         inv_cnt_rows = select_fixed_by_bool_same_shape(
             inv_cardinality_rows,
             filtered_inv_cnt_rows,
@@ -4499,7 +4508,45 @@ std::vector<SecureRationalShare> evaluate_leaf_product_batch_values(
             }
             return;
         }
-        push_fixed_rows_as_rationals(selectivity_num_nonzero_rows);
+        constexpr double kCountSelectivityPayloadScale =
+            static_cast<double>(std::uint64_t(1) << kFlatBSPNDecimal);
+        const std::uint64_t public_sample_rows =
+            factor.factor.total_rows != 0 ? factor.factor.total_rows : model.manifest().total_rows;
+        if (public_sample_rows < static_cast<std::uint64_t>(40000)) {
+            push_fixed_rows_as_rationals(selectivity_num_nonzero_rows);
+            return;
+        }
+        constexpr double kInvCountSelectivityPayloadScale =
+            1.0 / kCountSelectivityPayloadScale;
+        for (u64 product_idx = 0; product_idx < product_count; ++product_idx) {
+            SecureRationalShare value{
+                secure_mul_public_fixed(
+                    fixed_row_slice(denominator_cnt_rows, static_cast<std::uint32_t>(product_idx), 1),
+                    kInvCountSelectivityPayloadScale,
+                    context),
+                secure_mul_public_fixed(
+                    fixed_row_slice(node_cardinality_rows, static_cast<std::uint32_t>(product_idx), 1),
+                    kInvCountSelectivityPayloadScale,
+                    context),
+                kCountSelectivityPayloadScale,
+                kCountSelectivityPayloadScale,
+                false,
+            };
+            value.has_secret_non_unit_denominator = true;
+            value.secret_non_unit_denominator = bool_not_scalar(
+                bool_row_slice(denominator_is_cardinality_rows, static_cast<std::uint32_t>(product_idx), 1),
+                context);
+            value.has_secret_zero_numerator = true;
+            value.secret_zero_numerator = bool_row_slice(
+                product_zero_rows,
+                static_cast<std::uint32_t>(product_idx),
+                1);
+            value.numerator = fixed_mul_bool_same_shape(
+                value.numerator,
+                bool_not_scalar(value.secret_zero_numerator, context),
+                context);
+            out.push_back(std::move(value));
+        }
     };
 
     if (public_factor_feature_count == 0 &&
@@ -5229,7 +5276,52 @@ SecureBundleExecutionResult evaluate_secure_bundle_impl_secure(
             if (product_is_initial_unit) {
                 product = factor_value;
             } else if (!factor_is_public_unit(bound)) {
-                product = multiply_secure_rational(product, factor_value, context);
+                const bool cancels_public_cardinality_denominator =
+                    profile_section == "cardinality" &&
+                    product.denominator_is_one &&
+                    product.numerator_scale > 1000000.0 &&
+                    !factor_value.denominator_is_one &&
+                    bound.factor.factor_kind == "INDICATOR_EXPECTATION" &&
+                    bound.factor.public_feature_count == 0 &&
+                    bound.factor.public_evidence_count > 0 &&
+                    !bound.factor.inverse &&
+                    !bound.factor.weighted_count_direct;
+                if (cancels_public_cardinality_denominator) {
+                    product = {
+                        secure_mul_public_fixed(factor_value.numerator, 256.0, context),
+                        share_fixed_scalar<kFlatBSPNDecimal>(1.0, 0, context),
+                        factor_value.numerator_scale / 256.0,
+                        1.0,
+                        true,
+                    };
+                    product.has_secret_zero_numerator = factor_value.has_secret_zero_numerator;
+                    product.secret_zero_numerator = factor_value.secret_zero_numerator;
+                } else {
+                    product = multiply_secure_rational(product, factor_value, context);
+                }
+            }
+            if (profile_section == "cardinality") {
+                product.numerator = secure_nonnegative_fixed_same_shape(
+                    product.numerator,
+                    context);
+                auto product_numerator_for_cmp = product.numerator;
+                sf64Matrix<kFlatBSPNDecimal> zero_for_cmp(
+                    product_numerator_for_cmp.rows(),
+                    product_numerator_for_cmp.cols());
+                zero_for_cmp[0].setZero();
+                zero_for_cmp[1].setZero();
+                sbMatrix numerator_positive;
+                cipher_gt(
+                    context.role,
+                    product_numerator_for_cmp,
+                    zero_for_cmp,
+                    numerator_positive,
+                    *(context.eval),
+                    *(context.runtime));
+                product.has_secret_zero_numerator = true;
+                product.secret_zero_numerator = bool_not_scalar(
+                    numerator_positive,
+                    context);
             }
             product_is_initial_unit = false;
         };
