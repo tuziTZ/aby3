@@ -5,6 +5,7 @@
 #include "aby3-GORAM/benchmark.h"
 #include "aby3-BSPN/FlatBSPN.h"
 #include "aby3-BSPN/MultiplierPreprocessing.h"
+#include "m2_fixed_block_eval.h"
 
 using namespace oc;
 using namespace aby3;
@@ -20,6 +21,10 @@ int main(int argc, char** argv) {
   if(cmd.isSet("bspn_flat_eval")){
     BSPN_flat_eval(cmd);
     return 0;
+  }
+
+  if(cmd.isSet("m2_fixed_block_eval")){
+    return M2_fixed_block_eval(cmd);
   }
 
   if(cmd.isSet("privGraph")){
