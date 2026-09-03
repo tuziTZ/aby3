@@ -193,6 +193,55 @@ std::string require_manifest_string(const json& manifest, const std::string& key
     return value;
 }
 
+void require_privacy_aligned_offline_manifest(const json& manifest) {
+    require_bool(
+        manifest.value("offline_materialization_privacy_status", std::string()) == "privacy_aligned_production",
+        "offline materialization is not privacy-aligned production");
+    require_bool(
+        manifest.value("offline_materializer_id", std::string()) == "m2_fixed_block_materialize",
+        "offline materializer id is not accepted for production");
+    require_bool(
+        manifest.value("production_clear_payload_present", true) == false,
+        "production clear payload provenance is forbidden");
+    require_bool(
+        manifest.value("materializer_clear_coordinator", true) == false,
+        "central clear coordinator provenance is forbidden");
+    require_bool(
+        manifest.value("provider_separation", false) == true,
+        "provider separation provenance missing");
+    require_bool(
+        manifest.value("no_cross_provider_plaintext", false) == true,
+        "no-cross-provider-plaintext provenance missing");
+    require_bool(
+        manifest.value("no_combined_clear_model", false) == true,
+        "combined clear model provenance missing");
+    require_bool(
+        manifest.value("share_only_cross_relation_alignment", false) == true,
+        "share-only cross-relation alignment provenance missing");
+    require_bool(
+        manifest.value("secure_m2_statistics", false) == true,
+        "secure M2 statistics provenance missing");
+    require_bool(
+        manifest.value("secure_anchor_selection", false) == true,
+        "secure anchor selection provenance missing");
+    require_bool(
+        manifest.value("secure_fixed_block_materialization", false) == true,
+        "secure fixed-block materialization provenance missing");
+    require_bool(
+        manifest.value("fixed_public_capacity", false) == true,
+        "fixed public capacity provenance missing");
+    require_bool(
+        manifest.value("secret_occupancy", false) == true,
+        "secret occupancy provenance missing");
+    require_bool(
+        manifest.value("no_reveal_open", false) == true,
+        "no reveal/open provenance missing");
+    require_bool(
+        manifest.value("no_plaintext_fallback", false) == true,
+        "no plaintext fallback provenance missing");
+    (void)require_manifest_string(manifest, "privacy_provenance_hash");
+}
+
 std::vector<Record> load_records(
     const std::string& payload_path,
     const json& manifest,
@@ -868,6 +917,7 @@ int M2_fixed_block_eval(const oc::CLP& cmd) {
     const bool clear = cmd.isSet("cleartext_mirror");
     const bool secure_validate_only = cmd.isSet("secure_payload_validate_only");
     const bool secure_evaluate = cmd.isSet("secure_evaluate");
+    const bool require_privacy_aligned_offline = cmd.isSet("require_privacy_aligned_offline");
     const auto manifest = read_json_file(manifest_path);
     require_bool(manifest.value("endianness", std::string()) == "little", "bad manifest endianness");
     require_bool(manifest.value("overflow_count", 0) == 0, "nonzero overflow marker");
@@ -876,6 +926,9 @@ int M2_fixed_block_eval(const oc::CLP& cmd) {
     (void)require_manifest_string(manifest, "frozen_config_hash");
     (void)require_manifest_string(manifest, "sample_provenance_hash");
     (void)require_manifest_string(manifest, "multiplier_provenance_hash");
+    if (require_privacy_aligned_offline) {
+        require_privacy_aligned_offline_manifest(manifest);
+    }
     if (secure_validate_only || secure_evaluate) {
         require_bool(manifest.value("magic", std::string()) == "M2FBLOCKSHARE02", "bad manifest share magic");
         require_bool(manifest.value("schema_version", 0) == static_cast<int>(kShareSchemaVersion), "bad manifest share schema version");
@@ -924,6 +977,7 @@ int M2_fixed_block_eval(const oc::CLP& cmd) {
     if (!clear) {
         throw std::runtime_error("m2_fixed_block_eval requires either -cleartext_mirror, -secure_payload_validate_only, or -secure_evaluate");
     }
+    require_bool(!require_privacy_aligned_offline, "cleartext mirror cannot satisfy privacy-aligned offline production");
     require_bool(manifest.value("magic", std::string()) == "M2FBLOCKPAYLOAD", "bad manifest magic");
     require_bool(manifest.value("schema_version", 0) == static_cast<int>(kSchemaVersion), "bad manifest schema version");
     const auto records = load_records(payload_path, manifest, static_cast<std::uint32_t>(role));
