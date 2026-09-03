@@ -1,5 +1,6 @@
 #include "m2_fixed_block_materialize.h"
 
+#include "aby3-Basic/Basics.h"
 #include "aby3-Basic/BuildingBlocks.h"
 
 #include <nlohmann/json.hpp>
@@ -77,11 +78,18 @@ struct PublicRecordSchedule {
 
 struct SecureM2StatsEvidence {
     bool executed = false;
+    bool output_written = false;
     std::uint64_t row_count = 0;
     std::uint64_t edge_count = 0;
     std::uint64_t secure_gt_count = 0;
     std::uint64_t secure_fanout_add_count = 0;
     std::uint64_t secure_log_bucket_compare_count = 0;
+    std::uint64_t bool_to_arith_count = 0;
+    std::string output_dir;
+    std::string m_path;
+    std::string f_path;
+    std::string r_path;
+    std::string stratum_id_path;
 };
 
 struct MaterializeConfig {
@@ -332,6 +340,38 @@ si64Matrix share_public_i64_column(
     return shared;
 }
 
+si64Matrix bool_to_arith(sbMatrix value, int role, Sh3Encryptor& enc, Sh3Evaluator& eval, Sh3Runtime& runtime) {
+    si64Matrix out(value.rows(), 1);
+    out.mShares[0].setZero();
+    out.mShares[1].setZero();
+    bool2arith(role, value, out, enc, eval, runtime);
+    return out;
+}
+
+void add_public_multiple_inplace(si64Matrix& dst, const si64Matrix& src, i64 multiplier) {
+    dst.mShares[0] += src.mShares[0] * multiplier;
+    dst.mShares[1] += src.mShares[1] * multiplier;
+}
+
+void write_share_pair_matrix_atomic(const std::string& path, const si64Matrix& values) {
+    ensure_dir(dirname_from_path(path));
+    const std::string tmp = path + ".tmp";
+    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        throw std::runtime_error("cannot write temp share-pair matrix: " + tmp);
+    }
+    for (u64 row = 0; row < values.rows(); ++row) {
+        const i64 lhs = values.mShares[0](row, 0);
+        const i64 rhs = values.mShares[1](row, 0);
+        out.write(reinterpret_cast<const char*>(&lhs), sizeof(lhs));
+        out.write(reinterpret_cast<const char*>(&rhs), sizeof(rhs));
+    }
+    out.close();
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+        throw std::runtime_error("cannot publish share-pair matrix " + path + ": " + std::strerror(errno));
+    }
+}
+
 std::vector<PublicRecordSchedule> load_public_schedule(const json& config, std::uint32_t anchors, std::uint32_t edges) {
     require_bool(config.contains("public_record_schedule") && config.at("public_record_schedule").is_array(),
                  "config requires public_record_schedule");
@@ -423,6 +463,26 @@ void validate_privacy_inputs(const MaterializeConfig& args, const json& config) 
     require_bool(config.value("materializer_clear_coordinator", false) == false,
                  "central clear coordinator provenance is forbidden");
     if (args.require_privacy_aligned_input) {
+        require_bool(config.value("trusted_production_offline", false) == true,
+                     "production materializer requires trusted_production_offline=true");
+        require_bool(config.value("synthetic_fixture_materialization", false) == false,
+                     "synthetic/fixture materialization cannot be used as production offline input");
+        require_bool(!config.contains("python_estimate"),
+                     "production offline config must not contain python_estimate");
+        require_bool(!config.contains("exact"),
+                     "production offline config must not contain exact ground truth");
+        require_bool(!config.contains("exact_results"),
+                     "production offline config must not contain exact results");
+        require_bool(config.value("sample_mapping_secure", false) == true,
+                     "production offline config requires secure sample mapping provenance");
+        require_bool(config.value("secure_anchor_selection", false) == true,
+                     "production offline config requires secure anchor selection provenance");
+        require_bool(config.value("secure_fixed_block_materialization", false) == true,
+                     "production offline config requires secure fixed-block materialization provenance");
+        require_bool(config.value("fixed_block_materialization_mode", std::string()) == "secure_mpc_fixed_block_v1",
+                     "production offline config requires secure_mpc_fixed_block_v1 materialization mode");
+        require_bool(config.value("public_record_schedule_source", std::string()) == "query_independent_public_capacity_schedule",
+                     "production offline config requires query-independent public capacity schedule");
         require_bool(file_exists(join_path(args.provider_share_root, "manifest.json")),
                      "provider share root requires manifest.json");
         require_bool(file_exists(join_path(args.multiplier_share_root, "manifest.json")),
@@ -437,12 +497,16 @@ void validate_privacy_inputs(const MaterializeConfig& args, const json& config) 
                      "provider exporter read more than one relation");
         require_bool(provider_manifest.value("production_clear_payload_present", false) == false,
                      "provider manifest permits production clear payload");
+        require_bool(provider_manifest.value("synthetic_payload", false) == false,
+                     "synthetic provider payload cannot be used as production offline input");
         require_bool(multiplier_manifest.value("construction_mode", std::string()) == "privacy_aligned",
                      "multiplier input is not privacy-aligned");
         require_bool(multiplier_manifest.value("plaintext_count_then_share", true) == false,
                      "multiplier input was clear-count-then-share");
         require_bool(multiplier_manifest.value("provider_local_fk_group_count", false) == true,
                      "multiplier input lacks provider-local grouped count provenance");
+        require_bool(multiplier_manifest.value("trusted_remote_three_host_evidence", false) == true,
+                     "multiplier input lacks trusted remote three-host evidence");
     }
 }
 
@@ -500,10 +564,15 @@ SecureM2StatsEvidence run_secure_m2_statistics(
         mu_by_edge.push_back(matrix_from_share_pairs(read_share_pair_indices(path, indices)));
     }
     auto zero = zero_matrix(indices.size());
+    si64Matrix m = zero_matrix(indices.size());
     for (auto& mu : mu_by_edge) {
         sbMatrix positive;
         cipher_gt(args.role, mu, zero, positive, eval, runtime);
+        auto positive_int = bool_to_arith(positive, args.role, enc, eval, runtime);
+        const auto edge_idx = static_cast<std::size_t>(&mu - &mu_by_edge[0]);
+        add_public_multiple_inplace(m, positive_int, static_cast<i64>(1ull << edge_idx));
         evidence.secure_gt_count += indices.size();
+        evidence.bool_to_arith_count += indices.size();
     }
     si64Matrix fanout = zero_matrix(indices.size());
     for (auto& mu : mu_by_edge) {
@@ -511,11 +580,47 @@ SecureM2StatsEvidence run_secure_m2_statistics(
         fanout.mShares[1] += mu.mShares[1];
         evidence.secure_fanout_add_count += indices.size();
     }
-    for (int threshold = 1; threshold <= 20; ++threshold) {
+    const auto f_max = static_cast<int>(config.value("m2_f_max", 20));
+    const auto r_max = static_cast<int>(config.value("m2_r_max", 20));
+    require_bool(f_max >= 0 && f_max <= 62, "m2_f_max outside supported range");
+    require_bool(r_max >= 0 && r_max <= 62, "m2_r_max outside supported range");
+    si64Matrix f = zero_matrix(indices.size());
+    for (int bucket = 1; bucket <= f_max; ++bucket) {
+        const i64 threshold = (static_cast<i64>(1) << bucket) - 2;
         auto public_threshold = share_public_i64_column(std::vector<i64>(indices.size(), threshold), args.role, enc, runtime);
         sbMatrix gt_threshold;
         cipher_gt(args.role, fanout, public_threshold, gt_threshold, eval, runtime);
+        auto gt_int = bool_to_arith(gt_threshold, args.role, enc, eval, runtime);
+        add_public_multiple_inplace(f, gt_int, 1);
         evidence.secure_log_bucket_compare_count += indices.size();
+        evidence.bool_to_arith_count += indices.size();
+    }
+
+    const auto output_dir = config.value("m2_statistics_output_dir", std::string());
+    if (!output_dir.empty()) {
+        require_bool(config.value("m2_statistics_has_provider_local_rarity_shares", false) == true,
+                     "m2 S1 output requires provider-local rarity share provenance");
+        const auto rarity_column = config.value("m2_statistics_rarity_column", std::string("rarity_bucket.shares.bin"));
+        const auto role_dir = join_path(args.provider_share_root, "role_" + std::to_string(args.role));
+        const auto r = matrix_from_share_pairs(read_share_pair_indices(join_path(role_dir, rarity_column), indices));
+        const auto role_output_dir = join_path(output_dir, "role_" + std::to_string(args.role));
+        auto stratum_id = zero_matrix(indices.size());
+        const i64 f_domain = static_cast<i64>(f_max) + 1;
+        const i64 r_domain = static_cast<i64>(r_max) + 1;
+        add_public_multiple_inplace(stratum_id, m, f_domain * r_domain);
+        add_public_multiple_inplace(stratum_id, f, r_domain);
+        add_public_multiple_inplace(stratum_id, r, 1);
+
+        evidence.output_dir = output_dir;
+        evidence.m_path = join_path(role_output_dir, "m.shares.bin");
+        evidence.f_path = join_path(role_output_dir, "f.shares.bin");
+        evidence.r_path = join_path(role_output_dir, "r.shares.bin");
+        evidence.stratum_id_path = join_path(role_output_dir, "stratum_id.shares.bin");
+        write_share_pair_matrix_atomic(evidence.m_path, m);
+        write_share_pair_matrix_atomic(evidence.f_path, f);
+        write_share_pair_matrix_atomic(evidence.r_path, r);
+        write_share_pair_matrix_atomic(evidence.stratum_id_path, stratum_id);
+        evidence.output_written = true;
     }
     evidence.executed = true;
     evidence.row_count = indices.size();
@@ -591,6 +696,7 @@ json manifest_from_config(
 	    const json& comm,
 	    const SecureM2StatsEvidence& stats) {
     json manifest;
+    const bool trusted_production = config.value("trusted_production_offline", false);
     manifest["magic"] = "M2FBLOCKSHARE02";
     manifest["schema_version"] = static_cast<int>(kShareSchemaVersion);
     manifest["endianness"] = "little";
@@ -608,9 +714,13 @@ json manifest_from_config(
     manifest["sample_provenance_hash"] = require_string(config, "sample_provenance_hash");
     manifest["multiplier_provenance_hash"] = require_string(config, "multiplier_provenance_hash");
     manifest["privacy_provenance_hash"] = require_string(config, "privacy_provenance_hash");
-    manifest["offline_materialization_privacy_status"] = "privacy_aligned_production";
+    manifest["offline_materialization_privacy_status"] = trusted_production
+        ? "privacy_aligned_production"
+        : "bounded_fixture_not_production";
     manifest["offline_materializer_id"] = "m2_fixed_block_materialize";
-    manifest["role_payload_source"] = "role_local_secure_materializer";
+    manifest["role_payload_source"] = trusted_production
+        ? "role_local_secure_materializer"
+        : "bounded_fixture_role_share_serializer";
     manifest["production_clear_payload_present"] = false;
     manifest["materializer_clear_coordinator"] = false;
     manifest["provider_separation"] = true;
@@ -618,9 +728,11 @@ json manifest_from_config(
     manifest["no_combined_clear_model"] = true;
     manifest["share_only_cross_relation_alignment"] = true;
     manifest["share_only_key_alignment"] = true;
-    manifest["secure_m2_statistics"] = true;
-    manifest["secure_anchor_selection"] = true;
-    manifest["secure_fixed_block_materialization"] = true;
+    manifest["trusted_production_offline"] = trusted_production;
+    manifest["synthetic_fixture_materialization"] = config.value("synthetic_fixture_materialization", !trusted_production);
+    manifest["secure_m2_statistics"] = stats.executed;
+    manifest["secure_anchor_selection"] = trusted_production && config.value("secure_anchor_selection", false);
+    manifest["secure_fixed_block_materialization"] = trusted_production && config.value("secure_fixed_block_materialization", false);
     manifest["fixed_public_capacity"] = true;
     manifest["secret_occupancy"] = true;
     manifest["no_reveal_open"] = true;
@@ -636,21 +748,31 @@ json manifest_from_config(
     manifest["m2_statistics_runtime"] = {
         {"source", stats.executed ? "accepted_multiplier_role_shares" : "not_executed_for_bounded_fixture"},
         {"executed", stats.executed},
+        {"output_written", stats.output_written},
+        {"output_dir", stats.output_dir},
+        {"m_path", stats.m_path},
+        {"f_path", stats.f_path},
+        {"r_path", stats.r_path},
+        {"stratum_id_path", stats.stratum_id_path},
         {"row_count", stats.row_count},
         {"edge_count", stats.edge_count},
         {"secure_gt_count", stats.secure_gt_count},
         {"secure_fanout_add_count", stats.secure_fanout_add_count},
         {"secure_log_bucket_compare_count", stats.secure_log_bucket_compare_count},
+        {"bool_to_arith_count", stats.bool_to_arith_count},
+        {"fanout_bucket_formula", "floor(log2(1+sum_mu)) via fanout > 2^bucket-2"},
+        {"stratum_id_formula", "((m * (f_max+1)) + f) * (r_max+1) + r"},
         {"reveal_count", 0},
         {"open_count", 0}
     };
     manifest["materializer_runtime"] = {
-        {"secure_materializer_executed", true},
+        {"secure_materializer_executed", trusted_production},
         {"three_role_protocol_executed", true},
         {"plaintext_fallback_used", false},
         {"reveal_count", 0},
         {"open_count", 0},
-        {"m2_statistics_runtime_executed", stats.executed}
+        {"m2_statistics_runtime_executed", stats.executed},
+        {"trusted_production_offline", trusted_production}
     };
     manifest["secret_fields"] = {"basis_id", "flags", "value_raw", "weight_raw", "m", "f", "r", "selection", "sample_weight"};
     return manifest;
@@ -730,7 +852,10 @@ int M2_fixed_block_materialize(const oc::CLP& cmd) {
                 {"edge_count", stats_evidence.edge_count},
                 {"secure_gt_count", stats_evidence.secure_gt_count},
                 {"secure_fanout_add_count", stats_evidence.secure_fanout_add_count},
-                {"secure_log_bucket_compare_count", stats_evidence.secure_log_bucket_compare_count}
+                {"secure_log_bucket_compare_count", stats_evidence.secure_log_bucket_compare_count},
+                {"bool_to_arith_count", stats_evidence.bool_to_arith_count},
+                {"output_written", stats_evidence.output_written},
+                {"output_dir", stats_evidence.output_dir}
             }},
             {"secure_materializer_executed", true},
             {"three_role_protocol_executed", true},
@@ -753,11 +878,18 @@ int M2_fixed_block_materialize(const oc::CLP& cmd) {
         {"communication", comm},
         {"m2_statistics_runtime", {
             {"executed", stats_evidence.executed},
+            {"output_written", stats_evidence.output_written},
+            {"output_dir", stats_evidence.output_dir},
+            {"m_path", stats_evidence.m_path},
+            {"f_path", stats_evidence.f_path},
+            {"r_path", stats_evidence.r_path},
+            {"stratum_id_path", stats_evidence.stratum_id_path},
             {"row_count", stats_evidence.row_count},
             {"edge_count", stats_evidence.edge_count},
             {"secure_gt_count", stats_evidence.secure_gt_count},
             {"secure_fanout_add_count", stats_evidence.secure_fanout_add_count},
-            {"secure_log_bucket_compare_count", stats_evidence.secure_log_bucket_compare_count}
+            {"secure_log_bucket_compare_count", stats_evidence.secure_log_bucket_compare_count},
+            {"bool_to_arith_count", stats_evidence.bool_to_arith_count}
         }},
         {"secure_materializer_executed", true},
         {"three_role_protocol_executed", true},
