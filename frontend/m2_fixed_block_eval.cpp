@@ -79,6 +79,7 @@ struct Query {
     std::string query_id;
     std::vector<std::uint32_t> required_edges;
     std::vector<Predicate> predicates;
+    std::vector<std::int64_t> anchor_mask_values;
 };
 
 struct SecurePredicate {
@@ -92,6 +93,7 @@ struct SecureQuery {
     std::vector<std::uint32_t> required_edges;
     std::vector<SecurePredicate> predicates;
     std::vector<SecurePredicate> anchor_predicates;
+    std::string anchor_mask_share_bin;
 };
 
 struct SecurePayload {
@@ -187,8 +189,13 @@ std::vector<Record> load_records(
     require_bool(manifest.value("record_bytes", 0) == static_cast<int>(sizeof(Record)), "bad record size");
     const std::size_t expected_size = sizeof(Header) + static_cast<std::size_t>(header.record_count) * sizeof(Record);
     require_bool(bytes.size() == expected_size, "extra trailing payload or truncated record area");
-    const std::uint64_t actual_checksum = fnv1a64(bytes.data() + sizeof(Header), bytes.size() - sizeof(Header));
-    require_bool(actual_checksum == header.payload_checksum, "bad payload checksum");
+    const bool external_checksum = manifest.value("payload_checksum_algorithm", std::string("fnv1a64")) == "external_sha256";
+    if (external_checksum) {
+        require_bool(header.payload_checksum == 0, "external checksum payload must set header checksum to zero");
+    } else {
+        const std::uint64_t actual_checksum = fnv1a64(bytes.data() + sizeof(Header), bytes.size() - sizeof(Header));
+        require_bool(actual_checksum == header.payload_checksum, "bad payload checksum");
+    }
 
     std::vector<Record> records;
     records.reserve(header.record_count);
@@ -225,8 +232,13 @@ SecurePayload load_secure_share_payload(
     require_bool(manifest.value("overflow_count", 0) == 0, "nonzero fixed-block share overflow marker");
     const std::size_t expected_size = sizeof(Header) + static_cast<std::size_t>(header.record_count) * sizeof(SecureShareRecord);
     require_bool(bytes.size() == expected_size, "extra trailing fixed-block share payload or truncated record area");
-    const std::uint64_t actual_checksum = fnv1a64(bytes.data() + sizeof(Header), bytes.size() - sizeof(Header));
-    require_bool(actual_checksum == header.payload_checksum, "bad fixed-block share payload checksum");
+    const bool external_checksum = manifest.value("payload_checksum_algorithm", std::string("fnv1a64")) == "external_sha256";
+    if (external_checksum) {
+        require_bool(header.payload_checksum == 0, "external checksum share payload must set header checksum to zero");
+    } else {
+        const std::uint64_t actual_checksum = fnv1a64(bytes.data() + sizeof(Header), bytes.size() - sizeof(Header));
+        require_bool(actual_checksum == header.payload_checksum, "bad fixed-block share payload checksum");
+    }
     SecurePayload payload;
     payload.anchor_slots = header.anchor_slots;
     payload.edge_count = header.edge_count;
@@ -259,8 +271,7 @@ SecurePayload load_secure_share_payload(
     return payload;
 }
 
-Query load_query(const std::string& query_path, std::uint32_t edge_count) {
-    const auto q = read_json_file(query_path);
+Query load_query_from_json(const json& q, std::uint32_t edge_count) {
     Query query;
     query.query_id = q.value("query_id", std::string("fixture"));
     for (const auto& item : q.at("required_edges")) {
@@ -277,7 +288,28 @@ Query load_query(const std::string& query_path, std::uint32_t edge_count) {
         require_bool(pred.edge_index < edge_count, "predicate references unknown edge");
         query.predicates.push_back(pred);
     }
+    if (q.contains("anchor_mask_values")) {
+        for (const auto& item : q.at("anchor_mask_values")) {
+            query.anchor_mask_values.push_back(item.get<std::int64_t>());
+        }
+    }
     return query;
+}
+
+std::vector<Query> load_query_bundle(const std::string& query_path, std::uint32_t edge_count) {
+    const auto bundle = read_json_file(query_path);
+    std::vector<Query> queries;
+    const auto& items = bundle.is_array() ? bundle : bundle.at("queries");
+    for (const auto& item : items) {
+        queries.push_back(load_query_from_json(item, edge_count));
+    }
+    require_bool(!queries.empty(), "query bundle is empty");
+    return queries;
+}
+
+Query load_query(const std::string& query_path, std::uint32_t edge_count) {
+    const auto q = read_json_file(query_path);
+    return load_query_from_json(q, edge_count);
 }
 
 SecureQuery load_secure_query(const std::string& query_path, std::uint32_t edge_count) {
@@ -302,6 +334,9 @@ SecureQuery load_secure_query(const std::string& query_path, std::uint32_t edge_
         require_bool(pred.edge_index < edge_count, "secure predicate references unknown edge");
         query.predicates.push_back(pred);
     }
+    if (q.contains("anchor_mask_share_bin")) {
+        query.anchor_mask_share_bin = q.at("anchor_mask_share_bin").get<std::string>();
+    }
     if (q.contains("anchor_predicates")) {
         for (const auto& item : q.at("anchor_predicates")) {
             SecurePredicate pred{
@@ -311,6 +346,11 @@ SecureQuery load_secure_query(const std::string& query_path, std::uint32_t edge_
             query.anchor_predicates.push_back(pred);
         }
     }
+    require_bool(!query.anchor_mask_share_bin.empty() || !q.contains("anchor_mask_required"), "missing secure anchor mask share file");
+    require_bool(q.value("anchor_mask_public", false) == false, "secure query must not expose anchor mask values");
+    require_bool(q.value("legacy_evaluator_allowed", false) == false, "legacy evaluator must not be allowed");
+    require_bool(q.value("validate_only_for_production", false) == false, "validate-only mode forbidden for production");
+    require_bool(q.value("evaluator_id", std::string("m2_fixed_block_v2")) == "m2_fixed_block_v2", "wrong evaluator id");
     return query;
 }
 
@@ -343,6 +383,18 @@ si64Matrix repeat_secret_scalar(const SecurePredicate& pred, std::size_t rows) {
     for (std::size_t row = 0; row < rows; ++row) {
         out.mShares[0](static_cast<u64>(row), 0) = pred.basis_share0;
         out.mShares[1](static_cast<u64>(row), 0) = pred.basis_share1;
+    }
+    return out;
+}
+
+si64Matrix load_share_pair_vector(const std::string& path, std::size_t rows) {
+    const auto bytes = read_binary(path);
+    require_bool(bytes.size() == rows * sizeof(i64) * 2, "bad share-pair vector size");
+    si64Matrix out(rows, 1);
+    std::size_t offset = 0;
+    for (std::size_t row = 0; row < rows; ++row) {
+        out.mShares[0](static_cast<u64>(row), 0) = read_plain<i64>(bytes, offset);
+        out.mShares[1](static_cast<u64>(row), 0) = read_plain<i64>(bytes, offset);
     }
     return out;
 }
@@ -395,6 +447,9 @@ json evaluate_secure(
     anchor_weight.mShares[0].setZero();
     anchor_weight.mShares[1].setZero();
     si64Matrix anchor_mask = share_public_i64_column(std::vector<i64>(payload.anchor_slots, 1), role, enc, runtime);
+    if (!query.anchor_mask_share_bin.empty()) {
+        anchor_mask = load_share_pair_vector(query.anchor_mask_share_bin, payload.anchor_slots);
+    }
     for (const auto& anchor_pred : query.anchor_predicates) {
         std::vector<std::uint32_t> record_indices;
         for (std::uint32_t idx = 0; idx < payload.record_count; ++idx) {
@@ -405,6 +460,7 @@ json evaluate_secure(
         require_bool(!record_indices.empty(), "anchor predicate has no public fixed-block records");
         auto basis = slice_si64_rows(payload.basis, record_indices);
         auto flags = slice_si64_rows(payload.flags, record_indices);
+        auto values = slice_si64_rows(payload.value_raw, record_indices);
         auto predicate_basis = repeat_secret_scalar(anchor_pred, record_indices.size());
         sbMatrix basis_eq;
         cipher_eq(role, basis, predicate_basis, basis_eq, eval, runtime);
@@ -420,8 +476,12 @@ json evaluate_secure(
         si64Matrix selected_anchor(payload.anchor_slots, 1);
         selected_anchor.mShares[0].setZero();
         selected_anchor.mShares[1].setZero();
+        si64Matrix selected_records(record_indices.size(), 1);
+        selected_records.mShares[0].setZero();
+        selected_records.mShares[1].setZero();
+        cipher_mul(role, values, valid_mask, selected_records, eval, enc, runtime);
         for (std::size_t row = 0; row < record_indices.size(); ++row) {
-            add_row_to_anchor(selected_anchor, payload.anchor_slots_by_record[record_indices[row]], valid_mask, row);
+            add_row_to_anchor(selected_anchor, payload.anchor_slots_by_record[record_indices[row]], selected_records, row);
         }
         si64Matrix next_mask(payload.anchor_slots, 1);
         next_mask.mShares[0].setZero();
@@ -611,6 +671,11 @@ json evaluate_clear(const std::vector<Record>& records, const json& manifest, co
     std::uint64_t mux_count = 0;
     std::uint64_t multiply_count = 0;
     std::uint64_t dummy_contribution_count = 0;
+    std::vector<std::int64_t> anchor_mask = query.anchor_mask_values;
+    if (anchor_mask.empty()) {
+        anchor_mask.assign(anchors, static_cast<std::int64_t>(std::uint64_t{1} << fixed_bits));
+    }
+    require_bool(anchor_mask.size() == anchors, "bad clear anchor mask size");
     for (std::uint32_t anchor = 0; anchor < anchors; ++anchor) {
         std::int64_t anchor_weight = static_cast<std::int64_t>(std::uint64_t{1} << fixed_bits);
         std::int64_t product = static_cast<std::int64_t>(std::uint64_t{1} << fixed_bits);
@@ -648,7 +713,8 @@ json evaluate_clear(const std::vector<Record>& records, const json& manifest, co
             multiply_count += 1;
         }
         if (all_edges_present) {
-            total_raw += fixed_mul_raw(anchor_weight, product, fixed_bits);
+            const auto masked_product = fixed_mul_raw(product, anchor_mask[anchor], fixed_bits);
+            total_raw += fixed_mul_raw(anchor_weight, masked_product, fixed_bits);
             multiply_count += 1;
         }
     }
@@ -681,6 +747,23 @@ json evaluate_clear(const std::vector<Record>& records, const json& manifest, co
     };
 }
 
+json evaluate_clear_bundle(const std::vector<Record>& records, const json& manifest, const std::vector<Query>& queries) {
+    json rows = json::array();
+    double max_abs_delta = 0.0;
+    for (const auto& query : queries) {
+        rows.push_back(evaluate_clear(records, manifest, query));
+    }
+    return json{
+        {"mode", "cleartext_bundle"},
+        {"evaluator_id", "m2_fixed_block_v2"},
+        {"query_count", rows.size()},
+        {"queries", rows},
+        {"max_abs_delta_internal", max_abs_delta},
+        {"plaintext_fallback_used", false},
+        {"legacy_evaluator_used", false}
+    };
+}
+
 }  // namespace
 
 int M2_fixed_block_eval(const oc::CLP& cmd) {
@@ -691,7 +774,8 @@ int M2_fixed_block_eval(const oc::CLP& cmd) {
     const std::string manifest_path = cmd.getOr<std::string>("fixed_block_manifest_json", "");
     const std::string payload_path = cmd.getOr<std::string>("fixed_block_payload_bin", "");
     const std::string query_path = cmd.getOr<std::string>("fixed_block_query_json", "");
-    if (manifest_path.empty() || payload_path.empty() || query_path.empty()) {
+    const std::string query_bundle_path = cmd.getOr<std::string>("fixed_block_query_bundle_json", "");
+    if (manifest_path.empty() || payload_path.empty() || (query_path.empty() && query_bundle_path.empty())) {
         throw std::runtime_error("m2_fixed_block_eval requires manifest, payload, and query paths");
     }
     const bool clear = cmd.isSet("cleartext_mirror");
@@ -743,7 +827,12 @@ int M2_fixed_block_eval(const oc::CLP& cmd) {
     require_bool(manifest.value("magic", std::string()) == "M2FBLOCKPAYLOAD", "bad manifest magic");
     require_bool(manifest.value("schema_version", 0) == static_cast<int>(kSchemaVersion), "bad manifest schema version");
     const auto records = load_records(payload_path, manifest, static_cast<std::uint32_t>(role));
-    const auto query = load_query(query_path, manifest.at("edge_count").get<std::uint32_t>());
-    std::cout << evaluate_clear(records, manifest, query).dump() << std::endl;
+    if (!query_bundle_path.empty()) {
+        const auto queries = load_query_bundle(query_bundle_path, manifest.at("edge_count").get<std::uint32_t>());
+        std::cout << evaluate_clear_bundle(records, manifest, queries).dump() << std::endl;
+    } else {
+        const auto query = load_query(query_path, manifest.at("edge_count").get<std::uint32_t>());
+        std::cout << evaluate_clear(records, manifest, query).dump() << std::endl;
+    }
     return 0;
 }
