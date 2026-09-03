@@ -6,6 +6,7 @@
 #include "aby3-BSPN/FlatBSPN.h"
 #include "aby3-BSPN/MultiplierPreprocessing.h"
 #include "m2_fixed_block_eval.h"
+#include "m2_fixed_block_materialize.h"
 
 using namespace oc;
 using namespace aby3;
@@ -25,6 +26,10 @@ int main(int argc, char** argv) {
 
   if(cmd.isSet("m2_fixed_block_eval")){
     return M2_fixed_block_eval(cmd);
+  }
+
+  if(cmd.isSet("m2_fixed_block_materialize")){
+    return M2_fixed_block_materialize(cmd);
   }
 
   if(cmd.isSet("privGraph")){
