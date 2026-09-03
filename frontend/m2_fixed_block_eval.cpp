@@ -164,6 +164,27 @@ void require_bool(bool condition, const std::string& message) {
     }
 }
 
+void reset_transport_stats(Sh3Runtime& runtime) {
+    runtime.mComm.mNext.resetStats();
+    runtime.mComm.mPrev.resetStats();
+}
+
+json transport_stats(Sh3Runtime& runtime) {
+    const auto next_sent = runtime.mComm.mNext.getTotalDataSent();
+    const auto prev_sent = runtime.mComm.mPrev.getTotalDataSent();
+    const auto next_recv = runtime.mComm.mNext.getTotalDataRecv();
+    const auto prev_recv = runtime.mComm.mPrev.getTotalDataRecv();
+    return json{
+        {"counter_source", "cryptoTools::Channel"},
+        {"bytes_sent_next", next_sent},
+        {"bytes_sent_prev", prev_sent},
+        {"bytes_sent_total", next_sent + prev_sent},
+        {"bytes_received_next", next_recv},
+        {"bytes_received_prev", prev_recv},
+        {"bytes_received_total", next_recv + prev_recv}
+    };
+}
+
 std::string require_manifest_string(const json& manifest, const std::string& key) {
     require_bool(manifest.contains(key), "missing manifest field: " + key);
     require_bool(manifest.at(key).is_string(), "manifest field is not a string: " + key);
@@ -654,6 +675,7 @@ json evaluate_secure(
             {"conversion", conversion_count},
             {"rounds", 0}
         }},
+        {"result_share_file_bytes", 16},
         {"output_share_path", output_share_path}
     };
 }
@@ -790,13 +812,22 @@ json evaluate_secure_bundle(
     json rows = json::array();
     std::uint64_t secure_gate_count = 0;
     std::uint64_t communication_count = 0;
+    std::uint64_t bytes_sent_total = 0;
+    std::uint64_t bytes_received_total = 0;
     for (const auto& query : queries) {
         const auto output_path = output_share_dir + "/" + query.query_id + ".role_" + std::to_string(role) + ".shares.bin";
+        reset_transport_stats(runtime);
         auto row = evaluate_secure(payload, query, role, enc, eval, runtime, output_path);
+        const auto comm = transport_stats(runtime);
+        row["communication"] = comm;
+        row["bytes_sent_total"] = comm.value("bytes_sent_total", static_cast<std::uint64_t>(0));
+        row["bytes_received_total"] = comm.value("bytes_received_total", static_cast<std::uint64_t>(0));
         secure_gate_count += row.value("secure_gate_count", static_cast<std::uint64_t>(0));
         if (row.contains("operation_counts")) {
             communication_count += row.at("operation_counts").value("multiplication", static_cast<std::uint64_t>(0));
         }
+        bytes_sent_total += comm.value("bytes_sent_total", static_cast<std::uint64_t>(0));
+        bytes_received_total += comm.value("bytes_received_total", static_cast<std::uint64_t>(0));
         rows.push_back(row);
     }
     return json{
@@ -812,6 +843,9 @@ json evaluate_secure_bundle(
         {"reveal_count", 0},
         {"open_count", 0},
         {"secure_gate_count", secure_gate_count},
+        {"communication_counter_source", "cryptoTools::Channel"},
+        {"bytes_sent_total", bytes_sent_total},
+        {"bytes_received_total", bytes_received_total},
         {"communication_count_proxy", communication_count},
         {"queries", rows}
     };
@@ -863,7 +897,13 @@ int M2_fixed_block_eval(const oc::CLP& cmd) {
                 std::cout << evaluate_secure_bundle(payload, queries, role, enc, eval, runtime, output_share_dir).dump() << std::endl;
             } else {
                 const auto query = load_secure_query(query_path, payload.edge_count);
-                std::cout << evaluate_secure(payload, query, role, enc, eval, runtime, output_share_path).dump() << std::endl;
+                reset_transport_stats(runtime);
+                auto row = evaluate_secure(payload, query, role, enc, eval, runtime, output_share_path);
+                const auto comm = transport_stats(runtime);
+                row["communication"] = comm;
+                row["bytes_sent_total"] = comm.value("bytes_sent_total", static_cast<std::uint64_t>(0));
+                row["bytes_received_total"] = comm.value("bytes_received_total", static_cast<std::uint64_t>(0));
+                std::cout << row.dump() << std::endl;
             }
             return 0;
         }
