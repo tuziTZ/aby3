@@ -312,8 +312,7 @@ Query load_query(const std::string& query_path, std::uint32_t edge_count) {
     return load_query_from_json(q, edge_count);
 }
 
-SecureQuery load_secure_query(const std::string& query_path, std::uint32_t edge_count) {
-    const auto q = read_json_file(query_path);
+SecureQuery load_secure_query_from_json(const json& q, std::uint32_t edge_count) {
     SecureQuery query;
     query.query_id = q.value("query_id", std::string("secure_fixture"));
     require_bool(q.value("predicate_literals_in_public_query", true) == false, "secure query must not expose predicate literals");
@@ -352,6 +351,22 @@ SecureQuery load_secure_query(const std::string& query_path, std::uint32_t edge_
     require_bool(q.value("validate_only_for_production", false) == false, "validate-only mode forbidden for production");
     require_bool(q.value("evaluator_id", std::string("m2_fixed_block_v2")) == "m2_fixed_block_v2", "wrong evaluator id");
     return query;
+}
+
+SecureQuery load_secure_query(const std::string& query_path, std::uint32_t edge_count) {
+    const auto q = read_json_file(query_path);
+    return load_secure_query_from_json(q, edge_count);
+}
+
+std::vector<SecureQuery> load_secure_query_bundle(const std::string& query_path, std::uint32_t edge_count) {
+    const auto bundle = read_json_file(query_path);
+    std::vector<SecureQuery> queries;
+    const auto& items = bundle.is_array() ? bundle : bundle.at("queries");
+    for (const auto& item : items) {
+        queries.push_back(load_secure_query_from_json(item, edge_count));
+    }
+    require_bool(!queries.empty(), "secure query bundle is empty");
+    return queries;
 }
 
 si64Matrix share_public_i64_column(
@@ -592,7 +607,7 @@ json evaluate_secure(
         eval.asyncMul(runtime, product, weights, weighted_fixed).get();
         weighted.mShares[0] = weighted_fixed.i64Cast().mShares[0];
         weighted.mShares[1] = weighted_fixed.i64Cast().mShares[1];
-        if (!query.anchor_predicates.empty()) {
+        if (!query.anchor_predicates.empty() || !query.anchor_mask_share_bin.empty()) {
             sf64Matrix<D16> mask(payload.anchor_slots, 1);
             mask.i64Cast().mShares[0] = anchor_mask.mShares[0];
             mask.i64Cast().mShares[1] = anchor_mask.mShares[1];
@@ -764,6 +779,44 @@ json evaluate_clear_bundle(const std::vector<Record>& records, const json& manif
     };
 }
 
+json evaluate_secure_bundle(
+    const SecurePayload& payload,
+    const std::vector<SecureQuery>& queries,
+    int role,
+    Sh3Encryptor& enc,
+    Sh3Evaluator& eval,
+    Sh3Runtime& runtime,
+    const std::string& output_share_dir) {
+    json rows = json::array();
+    std::uint64_t secure_gate_count = 0;
+    std::uint64_t communication_count = 0;
+    for (const auto& query : queries) {
+        const auto output_path = output_share_dir + "/" + query.query_id + ".role_" + std::to_string(role) + ".shares.bin";
+        auto row = evaluate_secure(payload, query, role, enc, eval, runtime, output_path);
+        secure_gate_count += row.value("secure_gate_count", static_cast<std::uint64_t>(0));
+        if (row.contains("operation_counts")) {
+            communication_count += row.at("operation_counts").value("multiplication", static_cast<std::uint64_t>(0));
+        }
+        rows.push_back(row);
+    }
+    return json{
+        {"mode", "secure_evaluate_bundle"},
+        {"evaluator_id", "m2_fixed_block_v2"},
+        {"query_count", rows.size()},
+        {"role", role},
+        {"secure_evaluation_executed", true},
+        {"three_role_protocol_executed", true},
+        {"client_reconstruction_executed", false},
+        {"plaintext_fallback_used", false},
+        {"legacy_evaluator_used", false},
+        {"reveal_count", 0},
+        {"open_count", 0},
+        {"secure_gate_count", secure_gate_count},
+        {"communication_count_proxy", communication_count},
+        {"queries", rows}
+    };
+}
+
 }  // namespace
 
 int M2_fixed_block_eval(const oc::CLP& cmd) {
@@ -797,14 +850,21 @@ int M2_fixed_block_eval(const oc::CLP& cmd) {
         const auto load_ended = std::chrono::steady_clock::now();
         if (secure_evaluate) {
             const std::string output_share_path = cmd.getOr<std::string>("fixed_block_output_share_bin", "");
-            require_bool(!output_share_path.empty(), "secure evaluation requires --fixed_block_output_share_bin");
+            const std::string output_share_dir = cmd.getOr<std::string>("fixed_block_output_share_dir", "");
+            require_bool(!output_share_path.empty() || !output_share_dir.empty(), "secure evaluation requires --fixed_block_output_share_bin or --fixed_block_output_share_dir");
             IOService ios;
             Sh3Encryptor enc;
             Sh3Evaluator eval;
             Sh3Runtime runtime;
             basic_setup(static_cast<u64>(role), ios, enc, eval, runtime);
-            const auto query = load_secure_query(query_path, payload.edge_count);
-            std::cout << evaluate_secure(payload, query, role, enc, eval, runtime, output_share_path).dump() << std::endl;
+            if (!query_bundle_path.empty()) {
+                require_bool(!output_share_dir.empty(), "secure query bundle requires --fixed_block_output_share_dir");
+                const auto queries = load_secure_query_bundle(query_bundle_path, payload.edge_count);
+                std::cout << evaluate_secure_bundle(payload, queries, role, enc, eval, runtime, output_share_dir).dump() << std::endl;
+            } else {
+                const auto query = load_secure_query(query_path, payload.edge_count);
+                std::cout << evaluate_secure(payload, query, role, enc, eval, runtime, output_share_path).dump() << std::endl;
+            }
             return 0;
         }
         std::cout << json{
