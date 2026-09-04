@@ -353,6 +353,23 @@ void add_public_multiple_inplace(si64Matrix& dst, const si64Matrix& src, i64 mul
     dst.mShares[1] += src.mShares[1] * multiplier;
 }
 
+si64Matrix select_by_bool(
+    const si64Matrix& true_value,
+    const si64Matrix& false_value,
+    sbMatrix flag,
+    int role,
+    Sh3Encryptor& enc,
+    Sh3Evaluator& eval,
+    Sh3Runtime& runtime) {
+    auto flag_int = bool_to_arith(flag, role, enc, eval, runtime);
+    auto delta = true_value - false_value;
+    si64Matrix selected_delta(true_value.rows(), true_value.cols());
+    selected_delta.mShares[0].setZero();
+    selected_delta.mShares[1].setZero();
+    cipher_mul(role, delta, flag_int, selected_delta, eval, enc, runtime);
+    return false_value + selected_delta;
+}
+
 void write_share_pair_matrix_atomic(const std::string& path, const si64Matrix& values) {
     ensure_dir(dirname_from_path(path));
     const std::string tmp = path + ".tmp";
@@ -600,9 +617,40 @@ SecureM2StatsEvidence run_secure_m2_statistics(
     if (!output_dir.empty()) {
         require_bool(config.value("m2_statistics_has_provider_local_rarity_shares", false) == true,
                      "m2 S1 output requires provider-local rarity share provenance");
-        const auto rarity_column = config.value("m2_statistics_rarity_column", std::string("rarity_bucket.shares.bin"));
         const auto role_dir = join_path(args.provider_share_root, "role_" + std::to_string(args.role));
-        const auto r = matrix_from_share_pairs(read_share_pair_indices(join_path(role_dir, rarity_column), indices));
+        const auto provider_manifest = read_json_file(join_path(args.provider_share_root, "manifest.json"));
+        if (config.value("m2_statistics_require_real_rarity", false)) {
+            require_bool(provider_manifest.value("provider_local_rarity_real", false) == true,
+                         "real M2 S1 requires true provider-local rarity artifact");
+            require_bool(provider_manifest.value("synthetic_payload", false) == false,
+                         "real M2 S1 forbids synthetic rarity payload");
+            require_bool(provider_manifest.value("combined_clear_rarity_artifact", true) == false,
+                         "real M2 S1 forbids combined clear rarity artifact");
+        }
+        si64Matrix r = zero_matrix(indices.size());
+        if (config.contains("m2_statistics_rarity_edge_columns")) {
+            require_bool(config.at("m2_statistics_rarity_edge_columns").is_array(),
+                         "m2_statistics_rarity_edge_columns must be an array");
+            bool loaded_any = false;
+            for (const auto& item : config.at("m2_statistics_rarity_edge_columns")) {
+                require_bool(item.is_string(), "rarity edge column path must be a string");
+                auto edge_r = matrix_from_share_pairs(read_share_pair_indices(join_path(role_dir, item.get<std::string>()), indices));
+                if (!loaded_any) {
+                    r = edge_r;
+                    loaded_any = true;
+                    continue;
+                }
+                sbMatrix gt_current;
+                cipher_gt(args.role, edge_r, r, gt_current, eval, runtime);
+                r = select_by_bool(edge_r, r, gt_current, args.role, enc, eval, runtime);
+                evidence.secure_gt_count += indices.size();
+                evidence.bool_to_arith_count += indices.size();
+            }
+            require_bool(loaded_any, "m2_statistics_rarity_edge_columns is empty");
+        } else {
+            const auto rarity_column = config.value("m2_statistics_rarity_column", std::string("rarity_bucket.shares.bin"));
+            r = matrix_from_share_pairs(read_share_pair_indices(join_path(role_dir, rarity_column), indices));
+        }
         const auto role_output_dir = join_path(output_dir, "role_" + std::to_string(args.role));
         auto stratum_id = zero_matrix(indices.size());
         const i64 f_domain = static_cast<i64>(f_max) + 1;
