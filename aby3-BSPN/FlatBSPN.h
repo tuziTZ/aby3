@@ -1,9 +1,12 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
+#include <nlohmann/json.hpp>
 #include <aby3/sh3/Sh3Encryptor.h>
 #include <aby3/sh3/Sh3Evaluator.h>
 #include <aby3/sh3/Sh3FixedPoint.h>
@@ -53,6 +56,32 @@ struct FlatSecureBucketMapping {
     std::uint64_t leaf_local_bucket_idx = 0;
 };
 
+struct FlatConditionalDenseSidecarDescriptor {
+    std::uint32_t edge_index = 0;
+    std::string edge_label;
+    std::string edge_id;
+    std::string relationship_id;
+    std::string predicate_column;
+    std::string capability_id;
+    std::string conditional_kind = "equality";
+    std::uint64_t public_L = 0;
+    std::uint64_t slot_offset = 0;
+    std::uint64_t payload_total_width = 0;
+    std::uint64_t sample_rows = 0;
+    std::string dictionary_hash;
+    std::string model_hash;
+    std::string sample_identity_hash;
+    std::uint64_t fixed_decimal_bits = 16;
+    std::string share_kind;
+    std::array<std::string, 3> mu_paths;
+    std::array<std::string, 3> mu_nn_paths;
+    std::array<std::string, 3> dictionary_paths;
+    std::array<std::string, 3> dense_count_paths;
+    std::array<std::string, 3> selected_overflow_paths;
+    std::array<std::string, 3> sample_order_integrity_paths;
+    std::array<std::string, 3> valid_slot_paths;
+};
+
 struct FlatBSPNManifest {
     std::string model_id;
     std::string table_name;
@@ -78,6 +107,7 @@ struct FlatBSPNManifest {
     std::uint64_t node_cardinality_count = 0;
     std::uint64_t node_inv_cardinality_count = 0;
     std::uint64_t payload_layout_version = 0;
+    std::string public_structure_mode = "secret_scope_legacy";
     std::string bucket_padding_scope = "global";
     std::string secret_payload_dir = "secret";
     std::string secret_payload_encoding;
@@ -104,7 +134,17 @@ struct FlatBSPNManifest {
     std::string leaf_bucket_weight_sum_encoding;
     std::vector<std::uint32_t> secure_multiplier_leaf_row_value_node_ids;
     std::vector<std::uint64_t> secure_multiplier_leaf_row_value_offsets;
+    std::vector<std::string> secure_multiplier_leaf_row_value_relationship_ids;
+    std::vector<std::string> secure_multiplier_leaf_row_value_kinds;
     std::uint64_t secure_multiplier_leaf_row_value_total_rows = 0;
+    std::string conditional_dense_sidecar_schema;
+    std::vector<FlatConditionalDenseSidecarDescriptor> conditional_dense_sidecars;
+    std::string direct_mask_value_schema;
+    std::uint64_t direct_mask_value_total_rows = 0;
+    std::map<std::string, std::array<std::string, 3>> direct_mask_column_value_share_paths;
+    std::string direct_edge_count_schema;
+    std::uint64_t direct_edge_count_total_rows = 0;
+    std::map<std::string, std::array<std::string, 3>> direct_edge_count_share_paths;
 };
 
 struct FlatEvidenceInterval {
@@ -126,24 +166,32 @@ struct FlatFactorSpec {
     std::vector<int> feature_inverted_scope;
     std::vector<std::vector<FlatEvidenceInterval>> evidence;
     std::uint64_t public_feature_count = 0;
+    std::vector<int> public_feature_column_ids;
+    std::string shared_evidence_scan_id;
     std::uint64_t public_evidence_count = 0;
     std::uint64_t total_rows = 0;
     bool weighted_count_direct = false;
     bool requires_model_eval = false;
 };
 
-inline constexpr Decimal kFlatBSPNDecimal = D16;
+// Legacy flat artifacts remain D16 on disk. The evaluator uses D20 in memory;
+// each model share manifest records its stored precision for local rescaling.
+inline constexpr std::uint64_t kFlatBSPNStoredDecimalBits = 16;
+inline constexpr Decimal kFlatBSPNDecimal = static_cast<Decimal>(20);
 
 struct FlatBSPNSecureContext {
     int role = -1;
     int model_owner_party = 0;
     int query_owner_party = 0;
+    int result_receiver_party = -1;
     bool debug_reveal = false;
     bool debug_internal_reveal = false;
     bool factor_trace_shares = false;
     bool leaf_product_trace_shares = false;
     bool sum_node_trace_shares = false;
     bool product_sum_trace_shares = false;
+    std::uint64_t query_index = 0;
+    std::string query_label;
     oc::IOService* io_service = nullptr;
     Sh3Encryptor* enc = nullptr;
     Sh3Evaluator* eval = nullptr;
@@ -214,6 +262,16 @@ struct FlatSecureQueryPayload {
     std::uint64_t factor_count = 0;
     std::uint64_t max_factor_column_count = 0;
     std::vector<FlatDenseSecretFactorBinding> secret_factor_bindings;
+    std::uint64_t conditional_edge_count = 0;
+    std::vector<std::int64_t> conditional_literals;
+    std::vector<std::int64_t> conditional_use_cm;
+    std::vector<std::int64_t> conditional_lower_bounds;
+    std::vector<std::int64_t> conditional_upper_bounds;
+    std::vector<std::int64_t> conditional_has_lower;
+    std::vector<std::int64_t> conditional_has_upper;
+    std::vector<std::int64_t> conditional_open_lower;
+    std::vector<std::int64_t> conditional_open_upper;
+    std::string conditional_factor_semantics_version;
 };
 
 struct FlatSecureQueryTensorPayload {
@@ -229,6 +287,14 @@ struct FlatSecureQueryTensorPayload {
     i64Matrix relevant_scope;
     i64Matrix feature_inverted_scope;
     i64Matrix factor_column_counts;
+    i64Matrix conditional_literals;
+    i64Matrix conditional_use_cm;
+    i64Matrix conditional_lower_bounds;
+    i64Matrix conditional_upper_bounds;
+    i64Matrix conditional_has_lower;
+    i64Matrix conditional_has_upper;
+    i64Matrix conditional_open_lower;
+    i64Matrix conditional_open_upper;
 
     sf64Matrix<kFlatBSPNDecimal> lower_bounds_shared;
     sf64Matrix<kFlatBSPNDecimal> upper_bounds_shared;
@@ -242,6 +308,14 @@ struct FlatSecureQueryTensorPayload {
     si64Matrix relevant_scope_shared;
     si64Matrix feature_inverted_scope_shared;
     si64Matrix factor_column_counts_shared;
+    si64Matrix conditional_literals_shared;
+    si64Matrix conditional_use_cm_shared;
+    si64Matrix conditional_lower_bounds_shared;
+    si64Matrix conditional_upper_bounds_shared;
+    si64Matrix conditional_has_lower_shared;
+    si64Matrix conditional_has_upper_shared;
+    si64Matrix conditional_open_lower_shared;
+    si64Matrix conditional_open_upper_shared;
     bool shared_loaded = false;
 };
 
@@ -257,6 +331,10 @@ public:
     void load_public_manifest(const std::string& manifest_path);
     void load_secret_payload();
     void load_secret_payload(const FlatBSPNSecureContext& context);
+    nlohmann::json apply_conditional_dense_query_payload(
+        const nlohmann::json& public_doc,
+        const FlatSecureQueryTensorPayload& shared_query_payload,
+        const FlatBSPNSecureContext& context);
     sbMatrix share_bucket_bitmap_stack(
         const std::vector<std::uint32_t>& bucket_indices,
         const FlatBSPNSecureContext& context) const;
@@ -287,6 +365,8 @@ private:
     bool secure_share_payload_loaded_ = false;
     FlatBSPNSecretHostPayload secret_host_payload_;
     FlatBSPNSecretSharedPayload secret_shared_payload_;
+    sf64Matrix<kFlatBSPNDecimal> conditional_scalar_leaf_row_values_;
+    bool conditional_scalar_leaf_row_values_loaded_ = false;
 };
 
 FlatSecureQueryPayload load_secure_query_payload_json(const std::string& payload_json_path);
@@ -297,5 +377,6 @@ FlatSecureQueryTensorPayload share_secure_query_tensor_payload(
 
 void BSPN_secure_bundle_eval(const oc::CLP& cmd);
 void BSPN_flat_eval(const oc::CLP& cmd);
+void BSPN_mask_selftest(const oc::CLP& cmd);
 
 }  // namespace aby3

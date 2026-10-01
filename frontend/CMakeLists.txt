@@ -9,6 +9,7 @@
 #############################################
 
 file(GLOB_RECURSE SRC_FRONTEND ${CMAKE_SOURCE_DIR}/frontend/*.cpp)
+list(APPEND SRC_FRONTEND ${CMAKE_SOURCE_DIR}/frontend/m2_conditional_multiplier_eval.cpp)
 include_directories(${CMAKE_SOURCE_DIR}/frontend/)
 
 add_executable(frontend ${SRC_FRONTEND})

@@ -14,6 +14,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <cstdio>
 #include <sstream>
@@ -21,8 +22,10 @@
 #include <string>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #include <random>
+#include <set>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -43,9 +46,39 @@ using json = nlohmann::json;
 constexpr int kMultiplierFixedDecimalBits = 16;
 constexpr i64 kMultiplierFixedOne = static_cast<i64>(1) << kMultiplierFixedDecimalBits;
 constexpr int kSecureLeafMaterializerVersion = 2;
+constexpr const char* kConditionalFixedParentPayloadMode = "fixed_parent_payload_v1";
+constexpr const char* kConditionalSampleMarkerStoredReverseMode = "sample_marker_stored_reverse_v1";
+constexpr const char* kConditionalSampleMarkerCapReorderMode = "sample_marker_partition_cap_reorder_v1";
+constexpr const char* kConditionalSampleMarkerSidecarName = "conditional_multiplier_sample_marker_stored_reverse_v1";
+constexpr const char* kConditionalSampleMarkerCapReorderSidecarName = "conditional_multiplier_sample_marker_partition_cap_reorder_v1";
+constexpr const char* kConditionalDensePayloadMode = "fixed_dictionary_dense_counts_v1";
 
 using SteadyClock = std::chrono::steady_clock;
 using TimePoint = SteadyClock::time_point;
+
+std::string utc_now_iso8601()
+{
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t tt = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+    gmtime_r(&tt, &tm);
+    std::ostringstream out;
+    out << std::put_time(&tm, "%Y-%m-%dT%H:%M:%SZ");
+    return out.str();
+}
+
+std::uint64_t multiplier_peak_rss_bytes()
+{
+    struct rusage usage {};
+    if (getrusage(RUSAGE_SELF, &usage) != 0) {
+        return 0;
+    }
+#if defined(__APPLE__)
+    return static_cast<std::uint64_t>(usage.ru_maxrss);
+#else
+    return static_cast<std::uint64_t>(usage.ru_maxrss) * 1024ULL;
+#endif
+}
 
 enum class SecureLeafProfileLevel {
     None = 0,
@@ -76,7 +109,27 @@ struct MultiplierPreprocessConfig {
     int pk_input_party = 0;
     int fk_input_party = 1;
     u64 secure_sort_min_size = 32;
+    u64 comm_threads = 64;
+    std::string conditional_multiplier_mode = "off";
+    std::string conditional_edge_id;
+    std::string conditional_column_id;
+    u64 conditional_value_column = 0;
+    u64 conditional_public_cap_L = 0;
+    bool conditional_sidecar_only = false;
+    std::string provider_sample_share_root;
+    std::string provider_fk_share_root;
 };
+
+bool provider_pre_shared_inputs_enabled(const MultiplierPreprocessConfig& config)
+{
+    const bool sample = !config.provider_sample_share_root.empty();
+    const bool fk = !config.provider_fk_share_root.empty();
+    if (sample != fk) {
+        throw std::runtime_error(
+            "provider pre-shared input requires both --provider_sample_share_root and --provider_fk_share_root.");
+    }
+    return sample && fk;
+}
 
 bool env_flag_enabled(const char* name, bool default_value)
 {
@@ -139,9 +192,19 @@ bool secure_multiplier_streaming_artifact_enabled()
     return env_flag_enabled("BSPN_MULTIPLIER_STREAMING_ARTIFACT", false);
 }
 
+bool secure_multiplier_defer_global_manifest_enabled()
+{
+    return env_flag_enabled("BSPN_MULTIPLIER_DEFER_GLOBAL_MANIFEST", false);
+}
+
 bool secure_multiplier_forbid_server_reveal_enabled()
 {
     return env_flag_enabled("BSPN_MULTIPLIER_FORBID_SERVER_REVEAL", false);
+}
+
+bool sample_marker_reorder_only_enabled()
+{
+    return env_flag_enabled("BSPN_SAMPLE_MARKER_REORDER_ONLY", false);
 }
 
 bool secure_leaf_sorted_group_enabled()
@@ -152,6 +215,84 @@ bool secure_leaf_sorted_group_enabled()
     }
     const std::string normalized(value);
     return normalized == "sorted_group" || normalized == "sort_group" || normalized == "grouped_sort";
+}
+
+bool conditional_multiplier_fixed_payload_enabled(const MultiplierPreprocessConfig& config)
+{
+    return config.conditional_multiplier_mode == kConditionalFixedParentPayloadMode;
+}
+
+bool conditional_multiplier_sample_marker_stored_reverse_enabled(const MultiplierPreprocessConfig& config)
+{
+    return config.conditional_multiplier_mode == kConditionalSampleMarkerStoredReverseMode ||
+        config.conditional_multiplier_mode == kConditionalSampleMarkerCapReorderMode;
+}
+
+std::string conditional_payload_mode()
+{
+    const char* value = std::getenv("BSPN_CONDITIONAL_PAYLOAD_MODE");
+    if (value == nullptr || *value == '\0') {
+        return "bounded_sparse_category_count_valid_v1";
+    }
+    return std::string(value);
+}
+
+bool fixed_dictionary_dense_counts_enabled()
+{
+    return conditional_payload_mode() == kConditionalDensePayloadMode;
+}
+
+void validate_conditional_multiplier_config(const MultiplierPreprocessConfig& config)
+{
+    if (config.conditional_multiplier_mode == "off") {
+        if (config.conditional_sidecar_only) {
+            throw std::runtime_error(
+                "--conditional_sidecar_only requires --conditional_multiplier_mode fixed_parent_payload_v1.");
+        }
+        return;
+    }
+    if (config.conditional_multiplier_mode != kConditionalFixedParentPayloadMode &&
+        config.conditional_multiplier_mode != kConditionalSampleMarkerStoredReverseMode &&
+        config.conditional_multiplier_mode != kConditionalSampleMarkerCapReorderMode) {
+        throw std::runtime_error(
+            "Unsupported --conditional_multiplier_mode. Use off, fixed_parent_payload_v1, sample_marker_stored_reverse_v1, or sample_marker_partition_cap_reorder_v1.");
+    }
+    if (conditional_multiplier_sample_marker_stored_reverse_enabled(config) && config.conditional_sidecar_only) {
+        throw std::runtime_error(
+            "sample_marker_stored_reverse_v1 fuses scalar and conditional payload and does not support --conditional_sidecar_only.");
+    }
+    if (env_flag_enabled("BSPN_CONDITIONAL_GENERIC_CAPABILITY_V2", false)) {
+        if (config.conditional_edge_id.empty() || config.conditional_column_id.empty() ||
+            config.conditional_public_cap_L == 0 || config.conditional_public_cap_L > 512) {
+            throw std::runtime_error(
+                "Generic conditional capability V2 requires non-empty edge/column identifiers and public width in [1,512].");
+        }
+        if (!conditional_multiplier_sample_marker_stored_reverse_enabled(config) ||
+            !fixed_dictionary_dense_counts_enabled()) {
+            throw std::runtime_error(
+                "Generic conditional capability V2 requires sample-marker cap reorder with fixed dictionary dense counts.");
+        }
+        return;
+    }
+    if (config.conditional_edge_id == "movie_companies" &&
+        config.conditional_column_id == "company_type_id" &&
+        config.conditional_public_cap_L == 2) {
+        return;
+    }
+    if (config.conditional_edge_id == "movie_info_idx" &&
+        config.conditional_column_id == "info_type_id" &&
+        config.conditional_public_cap_L == 4) {
+        return;
+    }
+    if (config.conditional_edge_id == "movie_info" &&
+        config.conditional_column_id == "info_type_id" &&
+        config.conditional_public_cap_L == 16) {
+        return;
+    }
+    throw std::runtime_error(
+        "Unsupported conditional multiplier edge/column/cap; supported: "
+        "movie_companies.company_type_id:L=2, movie_info_idx.info_type_id:L=4, "
+        "and movie_info.info_type_id:L=16.");
 }
 
 std::vector<i64> parse_i64_csv_env(const char* name)
@@ -195,6 +336,38 @@ std::vector<u64> parse_u64_csv_env(const char* name)
             throw std::runtime_error(std::string("Negative capacity in ") + name + ".");
         }
         values.push_back(static_cast<u64>(value));
+    }
+    return values;
+}
+
+std::vector<i64> read_i64_lines_file(const std::string& path)
+{
+    std::ifstream input(path);
+    if (!input.is_open()) {
+        throw std::runtime_error("Failed to open fixed dictionary file: " + path);
+    }
+    std::vector<i64> values;
+    std::string line;
+    u64 row = 0;
+    while (std::getline(input, line)) {
+        line.erase(std::remove_if(line.begin(), line.end(), [](unsigned char ch) {
+            return std::isspace(ch) != 0;
+        }), line.end());
+        if (line.empty()) {
+            continue;
+        }
+        std::size_t parsed = 0;
+        i64 value = 0;
+        try {
+            value = std::stoll(line, &parsed, 10);
+        } catch (const std::exception&) {
+            throw std::runtime_error("Invalid fixed dictionary integer at row " + std::to_string(row));
+        }
+        if (parsed != line.size()) {
+            throw std::runtime_error("Invalid fixed dictionary integer suffix at row " + std::to_string(row));
+        }
+        values.push_back(value);
+        ++row;
     }
     return values;
 }
@@ -323,6 +496,10 @@ void secure_share_i64_column(
 
 std::string json_escape(const std::string& input);
 void write_text_file(const std::string& path, const std::string& content);
+void write_streaming_manifest_atomic(const std::string& path, const json& doc);
+si64Matrix int_shift_down_one_zero(const si64Matrix& values);
+sbMatrix bool_shift_down_one_false(sbMatrix values, int role);
+void multiplier_public_barrier(int role, Sh3Runtime& runtime);
 sbMatrix local_bool_not_matrix(sbMatrix value, int role)
 {
     sbMatrix out(value.rows(), value.bitCount());
@@ -626,6 +803,58 @@ std::vector<NormalizedKey> load_key_column_csv(
     return keys;
 }
 
+template<typename Fn>
+void for_each_key_value_columns_csv(
+    const std::string& csv_path,
+    u64 key_column,
+    u64 value_column,
+    bool has_header,
+    Fn&& callback)
+{
+    std::ifstream input(csv_path);
+    if (!input.is_open()) {
+        throw std::runtime_error("Failed to open CSV file: " + csv_path);
+    }
+
+    std::string line;
+    bool is_first_line = true;
+    u64 row_index = 0;
+    while (std::getline(input, line)) {
+        if (is_first_line && has_header) {
+            is_first_line = false;
+            continue;
+        }
+        is_first_line = false;
+        NormalizedKey key;
+        NormalizedKey value;
+        if (!line.empty()) {
+            auto fields = parse_csv_line(line);
+            if (key_column >= fields.size() || value_column >= fields.size()) {
+                throw std::runtime_error(
+                    "Requested key/value column out of range for CSV file: " + csv_path);
+            }
+            key = normalize_join_key_token(fields[key_column]);
+            value = normalize_join_key_token(fields[value_column]);
+        }
+        callback(key, value, row_index);
+        ++row_index;
+    }
+}
+
+std::vector<NormalizedKey> load_value_column_csv(
+    const std::string& csv_path,
+    u64 key_column,
+    u64 value_column,
+    bool has_header)
+{
+    std::vector<NormalizedKey> values;
+    for_each_key_value_columns_csv(csv_path, key_column, value_column, has_header,
+        [&](const NormalizedKey&, const NormalizedKey& value, u64) {
+            values.push_back(value);
+        });
+    return values;
+}
+
 void ensure_dir(const std::string& path)
 {
     if (path.empty()) {
@@ -752,6 +981,17 @@ si64Matrix read_share_pair_matrix(const std::string& path, u64 rows)
         out.mShares[1](row, 0) = raw[static_cast<std::size_t>(row) * 2 + 1];
     }
     return out;
+}
+
+std::string role_format_path(std::string path, int role)
+{
+    const std::string token = "{role}";
+    std::size_t pos = 0;
+    while ((pos = path.find(token, pos)) != std::string::npos) {
+        path.replace(pos, token.size(), std::to_string(role));
+        pos += std::to_string(role).size();
+    }
+    return path;
 }
 
 si64Matrix read_share_pair_matrix_auto_rows(const std::string& path)
@@ -1144,6 +1384,9 @@ MultiplierPreprocessConfig parse_config(const CLP& cmd)
     if (cmd.isSet("multiplier_mode")) {
         config.mode = cmd.getMany<std::string>("multiplier_mode")[0];
     }
+    if (cmd.isSet("conditional_multiplier_mode")) {
+        config.conditional_multiplier_mode = cmd.getMany<std::string>("conditional_multiplier_mode")[0];
+    }
 
     if (config.mode == "secure_leaf_materialize") {
         config.secure_leaf_plan_path = read_required_string("secure_leaf_plan_json");
@@ -1183,6 +1426,35 @@ MultiplierPreprocessConfig parse_config(const CLP& cmd)
     config.pk_has_header = cmd.isSet("pk_has_header");
     config.fk_has_header = cmd.isSet("fk_has_header");
     config.secure_sort_min_size = read_optional_u64("secure_sort_min_size", 32);
+    int comm_threads = static_cast<int>(config.comm_threads);
+    if (cmd.isSet("-comm-threads")) {
+        comm_threads = cmd.getMany<int>("-comm-threads")[0];
+    } else if (cmd.isSet("comm-threads")) {
+        comm_threads = cmd.getMany<int>("comm-threads")[0];
+    } else if (cmd.isSet("comm_threads")) {
+        comm_threads = cmd.getMany<int>("comm_threads")[0];
+    }
+    if (comm_threads <= 0) {
+        throw std::runtime_error("--comm-threads must be a positive integer.");
+    }
+    config.comm_threads = static_cast<u64>(comm_threads);
+    if (cmd.isSet("conditional_edge_id")) {
+        config.conditional_edge_id = cmd.getMany<std::string>("conditional_edge_id")[0];
+    }
+    if (cmd.isSet("conditional_column_id")) {
+        config.conditional_column_id = cmd.getMany<std::string>("conditional_column_id")[0];
+    }
+    config.conditional_value_column = read_optional_u64("conditional_value_column", 0);
+    config.conditional_public_cap_L = read_optional_u64("conditional_public_cap_L", 0);
+    config.conditional_sidecar_only = cmd.isSet("conditional_sidecar_only");
+    if (cmd.isSet("provider_sample_share_root")) {
+        config.provider_sample_share_root = cmd.getMany<std::string>("provider_sample_share_root")[0];
+    }
+    if (cmd.isSet("provider_fk_share_root")) {
+        config.provider_fk_share_root = cmd.getMany<std::string>("provider_fk_share_root")[0];
+    }
+    (void)provider_pre_shared_inputs_enabled(config);
+    validate_conditional_multiplier_config(config);
 
     return config;
 }
@@ -2153,6 +2425,10 @@ struct ProviderLocalKeyRow {
     NormalizedKey key;
     u64 original_index = 0;
     i64 multiplicity = 1;
+    std::vector<i64> conditional_slot_category;
+    std::vector<i64> conditional_slot_count;
+    std::vector<i64> conditional_slot_valid;
+    i64 conditional_overflow = 0;
 };
 
 struct PartitionContract {
@@ -2167,6 +2443,7 @@ struct ProviderDenseDomainState {
     u64 raw_row_count = 0;
     std::vector<std::uint8_t> pk_present;
     std::vector<i64> fk_counts;
+    std::vector<std::map<i64, i64>> fk_conditional_counts;
     bool contract_failed = false;
 };
 
@@ -2479,6 +2756,72 @@ ProviderDenseDomainState provider_local_fk_dense_domain_state(
     return state;
 }
 
+ProviderDenseDomainState provider_local_fk_dense_domain_state_with_conditional(
+    const std::string& csv_path,
+    u64 key_column,
+    u64 value_column,
+    bool has_header,
+    const PartitionContract& contract,
+    u64 cap_l)
+{
+    ProviderDenseDomainState state;
+    state.domain_min = contract.boundaries.front();
+    state.domain_width = public_domain_width_inclusive(contract);
+    state.fk_counts.assign(static_cast<std::size_t>(state.domain_width), 0);
+    state.fk_conditional_counts.resize(static_cast<std::size_t>(state.domain_width));
+    for_each_key_value_columns_csv(csv_path, key_column, value_column, has_header,
+        [&](const NormalizedKey& key, const NormalizedKey& value, u64) {
+            ++state.raw_row_count;
+            if (key.is_null) {
+                return;
+            }
+            try {
+                const u64 offset = public_domain_offset(contract, key);
+                auto& count = state.fk_counts[static_cast<std::size_t>(offset)];
+                if (count == std::numeric_limits<i64>::max()) {
+                    state.contract_failed = true;
+                    return;
+                }
+                ++count;
+                if (!value.is_null) {
+                    auto& category_counts = state.fk_conditional_counts[static_cast<std::size_t>(offset)];
+                    i64& category_count = category_counts[value.value];
+                    if (category_count == std::numeric_limits<i64>::max()) {
+                        state.contract_failed = true;
+                        return;
+                    }
+                    ++category_count;
+                }
+            } catch (const std::exception&) {
+                state.contract_failed = true;
+            }
+        });
+    (void)cap_l;
+    return state;
+}
+
+void populate_conditional_slots_from_counts(
+    ProviderLocalKeyRow& row,
+    const std::map<i64, i64>& counts,
+    u64 cap_l)
+{
+    row.conditional_slot_category.assign(static_cast<std::size_t>(cap_l), 0);
+    row.conditional_slot_count.assign(static_cast<std::size_t>(cap_l), 0);
+    row.conditional_slot_valid.assign(static_cast<std::size_t>(cap_l), 0);
+    row.conditional_overflow = 0;
+    u64 slot = 0;
+    for (const auto& item : counts) {
+        if (slot < cap_l) {
+            row.conditional_slot_category[static_cast<std::size_t>(slot)] = item.first;
+            row.conditional_slot_count[static_cast<std::size_t>(slot)] = item.second;
+            row.conditional_slot_valid[static_cast<std::size_t>(slot)] = 1;
+        } else {
+            row.conditional_overflow = 1;
+        }
+        ++slot;
+    }
+}
+
 std::vector<ProviderLocalKeyRow> provider_local_pk_rows_from_dense_state_for_part(
     const ProviderDenseDomainState& state,
     const PartitionContract& contract,
@@ -2546,6 +2889,43 @@ std::vector<ProviderLocalKeyRow> provider_local_fk_group_rows_from_dense_state_f
     return out;
 }
 
+std::vector<ProviderLocalKeyRow> provider_local_fk_conditional_group_rows_from_dense_state_for_part(
+    const ProviderDenseDomainState& state,
+    const PartitionContract& contract,
+    u64 part,
+    u64 capacity,
+    u64 cap_l,
+    bool& overflow)
+{
+    auto out = provider_local_fk_group_rows_from_dense_state_for_part(
+        state,
+        contract,
+        part,
+        capacity,
+        overflow);
+    const auto range = public_partition_offset_range(contract, part);
+    for (auto& row : out) {
+        if (row.key.is_null) {
+            row.conditional_slot_category.assign(static_cast<std::size_t>(cap_l), 0);
+            row.conditional_slot_count.assign(static_cast<std::size_t>(cap_l), 0);
+            row.conditional_slot_valid.assign(static_cast<std::size_t>(cap_l), 0);
+            row.conditional_overflow = 0;
+            continue;
+        }
+        const u64 offset = static_cast<u64>(row.key.value - state.domain_min);
+        if (offset < range.first || offset >= range.second ||
+            offset >= static_cast<u64>(state.fk_conditional_counts.size())) {
+            overflow = true;
+            continue;
+        }
+        populate_conditional_slots_from_counts(
+            row,
+            state.fk_conditional_counts[static_cast<std::size_t>(offset)],
+            cap_l);
+    }
+    return out;
+}
+
 std::vector<ProviderLocalKeyRow> provider_local_partitioned_fk_group_rows(
     const std::vector<NormalizedKey>& keys,
     const PartitionContract& contract,
@@ -2598,6 +2978,89 @@ std::vector<ProviderLocalKeyRow> provider_local_partitioned_fk_group_rows(
         }
         for (; slot < capacities[static_cast<std::size_t>(part)]; ++slot) {
             out.push_back({NormalizedKey{0, true}, slot, 0});
+        }
+    }
+    return out;
+}
+
+std::vector<ProviderLocalKeyRow> provider_local_partitioned_fk_conditional_group_rows(
+    const std::vector<NormalizedKey>& keys,
+    const std::vector<NormalizedKey>& values,
+    const PartitionContract& contract,
+    const std::vector<u64>& capacities,
+    u64 cap_l,
+    bool& overflow)
+{
+    if (keys.size() != values.size()) {
+        throw std::runtime_error("Conditional FK key/value row count mismatch.");
+    }
+    const u64 partitions = partition_count(contract);
+    std::vector<std::unordered_map<i64, i64>> counts(static_cast<std::size_t>(partitions));
+    std::vector<std::map<i64, std::map<i64, i64>>> conditional_counts(static_cast<std::size_t>(partitions));
+    overflow = false;
+    for (u64 idx = 0; idx < static_cast<u64>(keys.size()); ++idx) {
+        const auto& key = keys[static_cast<std::size_t>(idx)];
+        if (key.is_null) {
+            continue;
+        }
+        u64 part = 0;
+        try {
+            part = assign_public_partition(contract, key);
+        } catch (const std::exception&) {
+            overflow = true;
+            continue;
+        }
+        auto& part_counts = counts[static_cast<std::size_t>(part)];
+        i64& value = part_counts[key.value];
+        if (value == std::numeric_limits<i64>::max()) {
+            overflow = true;
+            continue;
+        }
+        ++value;
+        const auto& category = values[static_cast<std::size_t>(idx)];
+        if (!category.is_null) {
+            i64& category_count = conditional_counts[static_cast<std::size_t>(part)][key.value][category.value];
+            if (category_count == std::numeric_limits<i64>::max()) {
+                overflow = true;
+                continue;
+            }
+            ++category_count;
+        }
+        if (part_counts.size() > capacities[static_cast<std::size_t>(part)]) {
+            overflow = true;
+        }
+    }
+
+    std::vector<ProviderLocalKeyRow> out;
+    out.reserve(sum_u64(capacities));
+    for (u64 part = 0; part < partitions; ++part) {
+        std::vector<ProviderLocalKeyRow> rows;
+        rows.reserve(counts[static_cast<std::size_t>(part)].size());
+        for (const auto& item : counts[static_cast<std::size_t>(part)]) {
+            ProviderLocalKeyRow row{NormalizedKey{item.first, false}, 0, item.second};
+            const auto& by_key = conditional_counts[static_cast<std::size_t>(part)];
+            auto found = by_key.find(item.first);
+            if (found != by_key.end()) {
+                populate_conditional_slots_from_counts(row, found->second, cap_l);
+            } else {
+                populate_conditional_slots_from_counts(row, {}, cap_l);
+            }
+            rows.push_back(std::move(row));
+        }
+        std::sort(rows.begin(), rows.end(), [](const ProviderLocalKeyRow& lhs, const ProviderLocalKeyRow& rhs) {
+            return lhs.key.value < rhs.key.value;
+        });
+        u64 slot = 0;
+        for (; slot < static_cast<u64>(rows.size()) &&
+               slot < capacities[static_cast<std::size_t>(part)]; ++slot) {
+            auto row = rows[static_cast<std::size_t>(slot)];
+            row.original_index = slot;
+            out.push_back(row);
+        }
+        for (; slot < capacities[static_cast<std::size_t>(part)]; ++slot) {
+            ProviderLocalKeyRow row{NormalizedKey{0, true}, slot, 0};
+            populate_conditional_slots_from_counts(row, {}, cap_l);
+            out.push_back(std::move(row));
         }
     }
     return out;
@@ -2723,6 +3186,42 @@ void populate_plain_rows(
         original_index(row, 0) = static_cast<i64>(local_row.original_index);
         if (multiplicity != nullptr) {
             (*multiplicity)(row, 0) = local_row.multiplicity;
+        }
+    }
+}
+
+void populate_plain_conditional_rows(
+    const std::vector<ProviderLocalKeyRow>& rows,
+    u64 cap_l,
+    std::vector<i64Matrix>& slot_category,
+    std::vector<i64Matrix>& slot_count,
+    std::vector<i64Matrix>& slot_valid,
+    i64Matrix& overflow)
+{
+    slot_category.assign(static_cast<std::size_t>(cap_l), i64Matrix(static_cast<u64>(rows.size()), 1));
+    slot_count.assign(static_cast<std::size_t>(cap_l), i64Matrix(static_cast<u64>(rows.size()), 1));
+    slot_valid.assign(static_cast<std::size_t>(cap_l), i64Matrix(static_cast<u64>(rows.size()), 1));
+    overflow.resize(static_cast<u64>(rows.size()), 1);
+    overflow.setZero();
+    for (u64 slot = 0; slot < cap_l; ++slot) {
+        slot_category[static_cast<std::size_t>(slot)].setZero();
+        slot_count[static_cast<std::size_t>(slot)].setZero();
+        slot_valid[static_cast<std::size_t>(slot)].setZero();
+    }
+    for (u64 row = 0; row < static_cast<u64>(rows.size()); ++row) {
+        const auto& local_row = rows[static_cast<std::size_t>(row)];
+        overflow(row, 0) = local_row.conditional_overflow;
+        for (u64 slot = 0; slot < cap_l; ++slot) {
+            const auto idx = static_cast<std::size_t>(slot);
+            if (idx < local_row.conditional_slot_category.size()) {
+                slot_category[idx](row, 0) = local_row.conditional_slot_category[idx];
+            }
+            if (idx < local_row.conditional_slot_count.size()) {
+                slot_count[idx](row, 0) = local_row.conditional_slot_count[idx];
+            }
+            if (idx < local_row.conditional_slot_valid.size()) {
+                slot_valid[idx](row, 0) = local_row.conditional_slot_valid[idx];
+            }
         }
     }
 }
@@ -2870,6 +3369,1750 @@ si64Matrix provider_separated_oblivious_merge_counts(
         counts.mShares[1](row, 0) = output_columns[kOutputCountCol].mShares[1](row, 0);
     }
     return counts;
+}
+
+struct ConditionalMergeResult {
+    si64Matrix counts;
+    si64Matrix dictionary;
+    std::vector<si64Matrix> slot_category;
+    std::vector<si64Matrix> slot_count;
+    std::vector<si64Matrix> slot_valid;
+    si64Matrix overflow;
+    si64Matrix marker_valid;
+    si64Matrix model_slot;
+    si64Matrix integrity_evidence;
+};
+
+ConditionalMergeResult provider_separated_oblivious_merge_counts_with_conditional(
+    const MultiplierPreprocessConfig& config,
+    const si64Matrix& pk_key_shared,
+    const si64Matrix& pk_null_shared,
+    const si64Matrix& pk_original_index_shared,
+    const si64Matrix& fk_key_shared,
+    const si64Matrix& fk_null_shared,
+    const si64Matrix& fk_original_index_shared,
+    const si64Matrix& fk_multiplicity_shared,
+    const std::vector<si64Matrix>& fk_slot_category_shared,
+    const std::vector<si64Matrix>& fk_slot_count_shared,
+    const std::vector<si64Matrix>& fk_slot_valid_shared,
+    const si64Matrix& fk_overflow_shared,
+    u64 n_pk,
+    u64 n_fk,
+    Sh3Encryptor& enc,
+    Sh3Evaluator& eval,
+    Sh3Runtime& runtime)
+{
+    const u64 cap_l = config.conditional_public_cap_L;
+    if (fk_slot_category_shared.size() != static_cast<std::size_t>(cap_l) ||
+        fk_slot_count_shared.size() != static_cast<std::size_t>(cap_l) ||
+        fk_slot_valid_shared.size() != static_cast<std::size_t>(cap_l)) {
+        throw std::runtime_error("Conditional payload slot vector shape mismatch.");
+    }
+    const u64 padded = roundUpToPowerOfTwo(std::max<u64>(1, n_pk + n_fk));
+    const u64 pad_rows = padded - n_pk - n_fk;
+
+    auto pk_not_null_flag = int_eq_public(pk_null_shared, 0, config.role, eval, runtime);
+    auto fk_not_null_flag = int_eq_public(fk_null_shared, 0, config.role, eval, runtime);
+    auto pk_not_null = bool_to_si64(pk_not_null_flag, config.role, enc, eval, runtime);
+    auto pk_invalid = public_i64_column(1, n_pk, config.role) - pk_not_null;
+    auto fk_not_null = bool_to_si64(fk_not_null_flag, config.role, enc, eval, runtime);
+    auto fk_invalid = public_i64_column(1, n_fk, config.role) - fk_not_null;
+    si64Matrix fk_mass(n_fk, 1);
+    fk_mass.mShares[0].setZero();
+    fk_mass.mShares[1].setZero();
+    cipher_mul(config.role, fk_multiplicity_shared, fk_not_null, fk_mass, eval, enc, runtime);
+
+    auto pk_table_id = public_i64_column(1, n_pk, config.role);
+    auto fk_table_id = public_i64_column(0, n_fk, config.role);
+    auto pad_table_id = public_i64_column(2, pad_rows, config.role);
+    auto pad_invalid = public_i64_column(1, pad_rows, config.role);
+    auto pad_key = public_i64_column(0, pad_rows, config.role);
+    auto pad_original_index = public_i64_row_ids(pad_rows, config.role);
+    auto pad_fk_contrib = public_i64_column(0, pad_rows, config.role);
+    auto key = concat_shared_row_blocks({pk_key_shared, fk_key_shared, pad_key});
+    auto invalid_rank = concat_shared_row_blocks({pk_invalid, fk_invalid, pad_invalid});
+    auto origin_order = concat_shared_row_blocks({pk_table_id, fk_table_id, pad_table_id});
+    auto original_index = concat_shared_row_blocks({pk_original_index_shared, fk_original_index_shared, pad_original_index});
+    auto fk_contrib = concat_shared_row_blocks({
+        public_i64_column(0, n_pk, config.role),
+        fk_mass,
+        pad_fk_contrib,
+    });
+
+    std::vector<si64Matrix> columns = {
+        invalid_rank,
+        key,
+        origin_order,
+        original_index,
+        fk_contrib,
+    };
+    constexpr u64 kInvalidRankCol = 0;
+    constexpr u64 kKeyCol = 1;
+    constexpr u64 kOriginOrderCol = 2;
+    constexpr u64 kOriginalIndexCol = 3;
+    constexpr u64 kFkContribCol = 4;
+    const u64 conditional_col_start = static_cast<u64>(columns.size());
+    for (u64 slot = 0; slot < cap_l; ++slot) {
+        columns.push_back(concat_shared_row_blocks({
+            public_i64_column(0, n_pk, config.role),
+            fk_slot_category_shared[static_cast<std::size_t>(slot)],
+            public_i64_column(0, pad_rows, config.role),
+        }));
+        columns.push_back(concat_shared_row_blocks({
+            public_i64_column(0, n_pk, config.role),
+            fk_slot_count_shared[static_cast<std::size_t>(slot)],
+            public_i64_column(0, pad_rows, config.role),
+        }));
+        columns.push_back(concat_shared_row_blocks({
+            public_i64_column(0, n_pk, config.role),
+            fk_slot_valid_shared[static_cast<std::size_t>(slot)],
+            public_i64_column(0, pad_rows, config.role),
+        }));
+    }
+    const u64 overflow_col = static_cast<u64>(columns.size());
+    columns.push_back(concat_shared_row_blocks({
+        public_i64_column(0, n_pk, config.role),
+        fk_overflow_shared,
+        public_i64_column(0, pad_rows, config.role),
+    }));
+
+    oblivious_bitonic_sort_rows(
+        columns,
+        {kInvalidRankCol, kKeyCol, kOriginOrderCol, kOriginalIndexCol},
+        config.role,
+        enc,
+        eval,
+        runtime);
+
+    auto zero = public_i64_column(0, padded, config.role);
+    auto one = public_i64_column(1, padded, config.role);
+    auto is_valid_sorted = int_eq_matrix(columns[kInvalidRankCol], zero, config.role, eval, runtime);
+    auto is_pk_sorted = int_eq_matrix(columns[kOriginOrderCol], one, config.role, eval, runtime);
+
+    std::vector<si64Matrix> running_columns;
+    running_columns.push_back(columns[kFkContribCol]);
+    for (u64 col = conditional_col_start; col <= overflow_col; ++col) {
+        running_columns.push_back(columns[static_cast<std::size_t>(col)]);
+    }
+    for (auto& running : running_columns) {
+        running.mShares[0].setZero();
+        running.mShares[1].setZero();
+    }
+
+    for (u64 row = 0; row < padded; ++row) {
+        std::vector<si64Matrix> current_columns;
+        current_columns.reserve(running_columns.size());
+        current_columns.push_back(int_row_slice(columns[kFkContribCol], row, 1));
+        for (u64 col = conditional_col_start; col <= overflow_col; ++col) {
+            current_columns.push_back(int_row_slice(columns[static_cast<std::size_t>(col)], row, 1));
+        }
+        if (row == 0) {
+            for (u64 idx = 0; idx < static_cast<u64>(running_columns.size()); ++idx) {
+                running_columns[static_cast<std::size_t>(idx)].mShares[0](row, 0) =
+                    current_columns[static_cast<std::size_t>(idx)].mShares[0](0, 0);
+                running_columns[static_cast<std::size_t>(idx)].mShares[1](row, 0) =
+                    current_columns[static_cast<std::size_t>(idx)].mShares[1](0, 0);
+            }
+            continue;
+        }
+        auto lhs_key = int_row_slice(columns[kKeyCol], row, 1);
+        auto rhs_key = int_row_slice(columns[kKeyCol], row - 1, 1);
+        auto same_key = int_eq_matrix(lhs_key, rhs_key, config.role, eval, runtime);
+        auto current_valid = bool_row_slice(is_valid_sorted, row, 1);
+        auto prev_valid = bool_row_slice(is_valid_sorted, row - 1, 1);
+        same_key = local_bool_and_matrix(same_key, current_valid, config.role, enc, eval, runtime);
+        same_key = local_bool_and_matrix(same_key, prev_valid, config.role, enc, eval, runtime);
+        for (u64 idx = 0; idx < static_cast<u64>(running_columns.size()); ++idx) {
+            auto previous = int_row_slice(running_columns[static_cast<std::size_t>(idx)], row - 1, 1);
+            auto current = current_columns[static_cast<std::size_t>(idx)];
+            auto candidate = previous + current;
+            auto selected = select_si64_by_bool(
+                candidate,
+                current,
+                same_key,
+                config.role,
+                enc,
+                eval,
+                runtime);
+            running_columns[static_cast<std::size_t>(idx)].mShares[0](row, 0) = selected.mShares[0](0, 0);
+            running_columns[static_cast<std::size_t>(idx)].mShares[1](row, 0) = selected.mShares[1](0, 0);
+        }
+    }
+
+    std::vector<si64Matrix> selected_columns;
+    selected_columns.reserve(running_columns.size());
+    for (const auto& running : running_columns) {
+        selected_columns.push_back(select_si64_by_bool(
+            running,
+            shared_zero_int_matrix(padded, 1),
+            is_pk_sorted,
+            config.role,
+            enc,
+            eval,
+            runtime));
+    }
+    auto is_pk_int = bool_to_si64(is_pk_sorted, config.role, enc, eval, runtime);
+    auto non_pk_order = public_i64_column(1, padded, config.role) - is_pk_int;
+
+    std::vector<si64Matrix> output_columns = {
+        non_pk_order,
+        columns[kOriginalIndexCol],
+    };
+    for (const auto& selected : selected_columns) {
+        output_columns.push_back(selected);
+    }
+    constexpr u64 kOutputOrderCol = 0;
+    constexpr u64 kOutputOriginalIndexCol = 1;
+    oblivious_bitonic_sort_rows(
+        output_columns,
+        {kOutputOrderCol, kOutputOriginalIndexCol},
+        config.role,
+        enc,
+        eval,
+        runtime);
+
+    ConditionalMergeResult result;
+    result.counts.resize(n_pk, 1);
+    result.counts.mShares[0].setZero();
+    result.counts.mShares[1].setZero();
+    result.slot_category.assign(static_cast<std::size_t>(cap_l), si64Matrix(n_pk, 1));
+    result.slot_count.assign(static_cast<std::size_t>(cap_l), si64Matrix(n_pk, 1));
+    result.slot_valid.assign(static_cast<std::size_t>(cap_l), si64Matrix(n_pk, 1));
+    result.overflow.resize(n_pk, 1);
+    result.overflow.mShares[0].setZero();
+    result.overflow.mShares[1].setZero();
+    for (u64 slot = 0; slot < cap_l; ++slot) {
+        result.slot_category[static_cast<std::size_t>(slot)].mShares[0].setZero();
+        result.slot_category[static_cast<std::size_t>(slot)].mShares[1].setZero();
+        result.slot_count[static_cast<std::size_t>(slot)].mShares[0].setZero();
+        result.slot_count[static_cast<std::size_t>(slot)].mShares[1].setZero();
+        result.slot_valid[static_cast<std::size_t>(slot)].mShares[0].setZero();
+        result.slot_valid[static_cast<std::size_t>(slot)].mShares[1].setZero();
+    }
+    for (u64 row = 0; row < n_pk; ++row) {
+        result.counts.mShares[0](row, 0) = output_columns[2].mShares[0](row, 0);
+        result.counts.mShares[1](row, 0) = output_columns[2].mShares[1](row, 0);
+        u64 out_col = 3;
+        for (u64 slot = 0; slot < cap_l; ++slot) {
+            result.slot_category[static_cast<std::size_t>(slot)].mShares[0](row, 0) =
+                output_columns[static_cast<std::size_t>(out_col)].mShares[0](row, 0);
+            result.slot_category[static_cast<std::size_t>(slot)].mShares[1](row, 0) =
+                output_columns[static_cast<std::size_t>(out_col)].mShares[1](row, 0);
+            ++out_col;
+            result.slot_count[static_cast<std::size_t>(slot)].mShares[0](row, 0) =
+                output_columns[static_cast<std::size_t>(out_col)].mShares[0](row, 0);
+            result.slot_count[static_cast<std::size_t>(slot)].mShares[1](row, 0) =
+                output_columns[static_cast<std::size_t>(out_col)].mShares[1](row, 0);
+            ++out_col;
+            result.slot_valid[static_cast<std::size_t>(slot)].mShares[0](row, 0) =
+                output_columns[static_cast<std::size_t>(out_col)].mShares[0](row, 0);
+            result.slot_valid[static_cast<std::size_t>(slot)].mShares[1](row, 0) =
+                output_columns[static_cast<std::size_t>(out_col)].mShares[1](row, 0);
+            ++out_col;
+        }
+        result.overflow.mShares[0](row, 0) = output_columns[static_cast<std::size_t>(out_col)].mShares[0](row, 0);
+        result.overflow.mShares[1](row, 0) = output_columns[static_cast<std::size_t>(out_col)].mShares[1](row, 0);
+    }
+    return result;
+}
+
+ConditionalMergeResult provider_separated_partitioned_oblivious_merge_counts_with_conditional(
+    const MultiplierPreprocessConfig& config,
+    const PartitionContract& contract,
+    const si64Matrix& pk_key_shared,
+    const si64Matrix& pk_null_shared,
+    const si64Matrix& pk_original_index_shared,
+    const si64Matrix& fk_key_shared,
+    const si64Matrix& fk_null_shared,
+    const si64Matrix& fk_original_index_shared,
+    const si64Matrix& fk_multiplicity_shared,
+    const std::vector<si64Matrix>& fk_slot_category_shared,
+    const std::vector<si64Matrix>& fk_slot_count_shared,
+    const std::vector<si64Matrix>& fk_slot_valid_shared,
+    const si64Matrix& fk_overflow_shared,
+    Sh3Encryptor& enc,
+    Sh3Evaluator& eval,
+    Sh3Runtime& runtime)
+{
+    const u64 partitions = partition_count(contract);
+    const u64 total_pk_capacity = sum_u64(contract.pk_capacities);
+    const u64 cap_l = config.conditional_public_cap_L;
+    ConditionalMergeResult result;
+    result.counts.resize(total_pk_capacity, 1);
+    result.counts.mShares[0].setZero();
+    result.counts.mShares[1].setZero();
+    result.slot_category.assign(static_cast<std::size_t>(cap_l), si64Matrix(total_pk_capacity, 1));
+    result.slot_count.assign(static_cast<std::size_t>(cap_l), si64Matrix(total_pk_capacity, 1));
+    result.slot_valid.assign(static_cast<std::size_t>(cap_l), si64Matrix(total_pk_capacity, 1));
+    result.overflow.resize(total_pk_capacity, 1);
+    result.overflow.mShares[0].setZero();
+    result.overflow.mShares[1].setZero();
+    for (u64 slot = 0; slot < cap_l; ++slot) {
+        result.slot_category[static_cast<std::size_t>(slot)].mShares[0].setZero();
+        result.slot_category[static_cast<std::size_t>(slot)].mShares[1].setZero();
+        result.slot_count[static_cast<std::size_t>(slot)].mShares[0].setZero();
+        result.slot_count[static_cast<std::size_t>(slot)].mShares[1].setZero();
+        result.slot_valid[static_cast<std::size_t>(slot)].mShares[0].setZero();
+        result.slot_valid[static_cast<std::size_t>(slot)].mShares[1].setZero();
+    }
+
+    u64 pk_offset = 0;
+    u64 fk_offset = 0;
+    for (u64 part = 0; part < partitions; ++part) {
+        const u64 pk_cap = contract.pk_capacities[static_cast<std::size_t>(part)];
+        const u64 fk_cap = contract.fk_capacities[static_cast<std::size_t>(part)];
+        std::vector<si64Matrix> part_slot_category;
+        std::vector<si64Matrix> part_slot_count;
+        std::vector<si64Matrix> part_slot_valid;
+        for (u64 slot = 0; slot < cap_l; ++slot) {
+            part_slot_category.push_back(int_row_slice(
+                fk_slot_category_shared[static_cast<std::size_t>(slot)],
+                fk_offset,
+                fk_cap));
+            part_slot_count.push_back(int_row_slice(
+                fk_slot_count_shared[static_cast<std::size_t>(slot)],
+                fk_offset,
+                fk_cap));
+            part_slot_valid.push_back(int_row_slice(
+                fk_slot_valid_shared[static_cast<std::size_t>(slot)],
+                fk_offset,
+                fk_cap));
+        }
+        auto part_result = provider_separated_oblivious_merge_counts_with_conditional(
+            config,
+            int_row_slice(pk_key_shared, pk_offset, pk_cap),
+            int_row_slice(pk_null_shared, pk_offset, pk_cap),
+            int_row_slice(pk_original_index_shared, pk_offset, pk_cap),
+            int_row_slice(fk_key_shared, fk_offset, fk_cap),
+            int_row_slice(fk_null_shared, fk_offset, fk_cap),
+            int_row_slice(fk_original_index_shared, fk_offset, fk_cap),
+            int_row_slice(fk_multiplicity_shared, fk_offset, fk_cap),
+            part_slot_category,
+            part_slot_count,
+            part_slot_valid,
+            int_row_slice(fk_overflow_shared, fk_offset, fk_cap),
+            pk_cap,
+            fk_cap,
+            enc,
+            eval,
+            runtime);
+        for (u64 row = 0; row < pk_cap; ++row) {
+            result.counts.mShares[0](pk_offset + row, 0) = part_result.counts.mShares[0](row, 0);
+            result.counts.mShares[1](pk_offset + row, 0) = part_result.counts.mShares[1](row, 0);
+            result.overflow.mShares[0](pk_offset + row, 0) = part_result.overflow.mShares[0](row, 0);
+            result.overflow.mShares[1](pk_offset + row, 0) = part_result.overflow.mShares[1](row, 0);
+            for (u64 slot = 0; slot < cap_l; ++slot) {
+                result.slot_category[static_cast<std::size_t>(slot)].mShares[0](pk_offset + row, 0) =
+                    part_result.slot_category[static_cast<std::size_t>(slot)].mShares[0](row, 0);
+                result.slot_category[static_cast<std::size_t>(slot)].mShares[1](pk_offset + row, 0) =
+                    part_result.slot_category[static_cast<std::size_t>(slot)].mShares[1](row, 0);
+                result.slot_count[static_cast<std::size_t>(slot)].mShares[0](pk_offset + row, 0) =
+                    part_result.slot_count[static_cast<std::size_t>(slot)].mShares[0](row, 0);
+                result.slot_count[static_cast<std::size_t>(slot)].mShares[1](pk_offset + row, 0) =
+                    part_result.slot_count[static_cast<std::size_t>(slot)].mShares[1](row, 0);
+                result.slot_valid[static_cast<std::size_t>(slot)].mShares[0](pk_offset + row, 0) =
+                    part_result.slot_valid[static_cast<std::size_t>(slot)].mShares[0](row, 0);
+                result.slot_valid[static_cast<std::size_t>(slot)].mShares[1](pk_offset + row, 0) =
+                    part_result.slot_valid[static_cast<std::size_t>(slot)].mShares[1](row, 0);
+            }
+        }
+        pk_offset += pk_cap;
+        fk_offset += fk_cap;
+    }
+    return result;
+}
+
+si64Matrix flatten_slot_columns_row_major(const std::vector<si64Matrix>& slots)
+{
+    if (slots.empty()) {
+        return si64Matrix(0, 1);
+    }
+    const u64 rows = slots.front().rows();
+    const u64 cap_l = static_cast<u64>(slots.size());
+    si64Matrix out(rows * cap_l, 1);
+    out.mShares[0].setZero();
+    out.mShares[1].setZero();
+    for (u64 row = 0; row < rows; ++row) {
+        for (u64 slot = 0; slot < cap_l; ++slot) {
+            const u64 dst = row * cap_l + slot;
+            out.mShares[0](dst, 0) = slots[static_cast<std::size_t>(slot)].mShares[0](row, 0);
+            out.mShares[1](dst, 0) = slots[static_cast<std::size_t>(slot)].mShares[1](row, 0);
+        }
+    }
+    return out;
+}
+
+void write_conditional_payload_role_files(
+    const MultiplierPreprocessConfig& config,
+    const ConditionalMergeResult& result,
+    const std::string& artifact_dir)
+{
+    const std::string sidecar_dir = artifact_dir + "/conditional_multiplier_fixed_payload_v1";
+    ensure_dir(sidecar_dir);
+    const std::string role_dir = sidecar_dir + "/role_" + std::to_string(config.role);
+    ensure_dir(role_dir);
+    write_share_pair_matrix(role_dir + "/slot_category.shares.bin", flatten_slot_columns_row_major(result.slot_category));
+    write_share_pair_matrix(role_dir + "/slot_count.shares.bin", flatten_slot_columns_row_major(result.slot_count));
+    write_share_pair_matrix(role_dir + "/slot_valid.shares.bin", flatten_slot_columns_row_major(result.slot_valid));
+    write_share_pair_matrix(role_dir + "/selected_overflow.shares.bin", result.overflow);
+}
+
+void write_conditional_payload_manifest(
+    const MultiplierPreprocessConfig& config,
+    const std::string& artifact_dir,
+    u64 sample_rows)
+{
+    const std::string sidecar_dir = artifact_dir + "/conditional_multiplier_fixed_payload_v1";
+    json doc;
+    doc["target"] = "M2_CONDITIONAL_MULTIPLIER_FIXED_PAYLOAD_V1";
+    doc["schema_version"] = "M2CMFIXED01";
+    doc["conditional_multiplier_mode"] = config.conditional_multiplier_mode;
+    doc["edge_id"] = config.conditional_edge_id;
+    doc["column_id"] = config.conditional_column_id;
+    doc["public_cap_L"] = config.conditional_public_cap_L;
+    doc["sample_rows"] = sample_rows;
+    doc["slot_count"] = config.conditional_public_cap_L;
+    doc["category_encoding"] = "int64_ascending_provider_local";
+    doc["fixed_point"] = {{"ring", "int64"}, {"fixed_decimal_bits", kMultiplierFixedDecimalBits}};
+    doc["share_kind"] = "ABY3_REPLICATED_PAIR_I64";
+    doc["baseline_scalar_artifact_dir"] = artifact_dir;
+    doc["payload_layout"] = "parent_order_row_major_slots_v1";
+    doc["artifact_state"] = "complete";
+    doc["completion_marker"] = "COMPLETE";
+    doc["role_paths"] = json::object();
+    for (int role = 0; role < 3; ++role) {
+        const std::string role_dir = sidecar_dir + "/role_" + std::to_string(role);
+        json paths;
+        for (const auto& name : {
+            "slot_category.shares.bin",
+            "slot_count.shares.bin",
+            "slot_valid.shares.bin",
+            "selected_overflow.shares.bin",
+        }) {
+            const std::string path = role_dir + "/" + name;
+            paths[name] = {
+                {"path", path},
+                {"bytes", file_size_bytes(path)},
+                {"sha256", sha256_file_external(path)},
+            };
+        }
+        doc["role_paths"][std::to_string(role)] = paths;
+    }
+    write_streaming_manifest_atomic(sidecar_dir + "/manifest.json", doc);
+    write_text_file(sidecar_dir + "/COMPLETE", "complete\n");
+}
+
+struct SampleMarkerPreparedInputs {
+    i64Matrix marker_valid;
+    i64Matrix marker_key;
+    i64Matrix marker_model_slot;
+    i64Matrix marker_overflow;
+    i64Matrix fk_valid;
+    i64Matrix fk_key;
+    i64Matrix fk_multiplicity;
+    i64Matrix fk_dictionary;
+    std::vector<i64Matrix> fk_slot_category;
+    std::vector<i64Matrix> fk_slot_count;
+    std::vector<i64Matrix> fk_slot_valid;
+    i64Matrix fk_overflow;
+};
+
+struct SampleMarkerRunStats {
+    u64 partition_count = 0;
+    u64 sample_rows = 0;
+    u64 marker_capacity_per_partition = 0;
+    u64 marker_capacity_total = 0;
+    u64 fk_capacity_total = 0;
+    u64 padded_combined_rows_total = 0;
+    u64 forward_secret_comparison_sort_count = 0;
+    u64 stored_swap_reverse_replay_count = 0;
+    u64 second_secret_comparison_sort_count = 0;
+    u64 sample_only_global_reorder_sort_count = 0;
+    u64 forward_comparators = 0;
+    u64 forward_layers = 0;
+    u64 reverse_swaps = 0;
+    u64 reverse_layers = 0;
+    u64 sample_only_global_reorder_rows = 0;
+    u64 sample_only_global_reorder_padded_rows = 0;
+    u64 sample_only_global_reorder_comparators = 0;
+    u64 sample_only_global_reorder_layers = 0;
+    double forward_seconds = 0.0;
+    double segmented_scan_seconds = 0.0;
+    double stored_reverse_seconds = 0.0;
+    double marker_select_seconds = 0.0;
+    double sample_only_global_reorder_seconds = 0.0;
+    double integrity_gate_seconds = 0.0;
+};
+
+std::vector<std::string> split_simple_csv_line(const std::string& line)
+{
+    std::vector<std::string> out;
+    std::stringstream stream(line);
+    std::string token;
+    while (std::getline(stream, token, ',')) {
+        token.erase(std::remove_if(token.begin(), token.end(), [](unsigned char ch) {
+            return std::isspace(ch) != 0;
+        }), token.end());
+        out.push_back(token);
+    }
+    if (!line.empty() && line.back() == ',') {
+        out.push_back("");
+    }
+    return out;
+}
+
+i64 parse_prepared_i64_cell(const std::vector<std::string>& fields, std::size_t idx, const std::string& path, u64 row)
+{
+    if (idx >= fields.size()) {
+        throw std::runtime_error("Prepared sample-marker CSV has too few columns at row " + std::to_string(row) + ": " + path);
+    }
+    if (fields[idx].empty()) {
+        return 0;
+    }
+    std::size_t parsed = 0;
+    i64 value = 0;
+    try {
+        value = std::stoll(fields[idx], &parsed, 10);
+    } catch (const std::exception&) {
+        throw std::runtime_error("Prepared sample-marker CSV has invalid integer at row " + std::to_string(row) + ": " + path);
+    }
+    if (parsed != fields[idx].size()) {
+        throw std::runtime_error("Prepared sample-marker CSV has invalid integer suffix at row " + std::to_string(row) + ": " + path);
+    }
+    return value;
+}
+
+SampleMarkerPreparedInputs load_sample_marker_prepared_inputs(
+    const MultiplierPreprocessConfig& config,
+    const std::vector<u64>& marker_capacities,
+    const std::vector<u64>& fk_capacities,
+    u64 sample_rows)
+{
+    const u64 partition_count = static_cast<u64>(marker_capacities.size());
+    const u64 marker_total = sum_u64(marker_capacities);
+    const u64 fk_total = sum_u64(fk_capacities);
+    const u64 cap_l = config.conditional_public_cap_L;
+    const bool dense_payload = fixed_dictionary_dense_counts_enabled();
+    SampleMarkerPreparedInputs inputs;
+    inputs.marker_valid.resize(marker_total, 1);
+    inputs.marker_key.resize(marker_total, 1);
+    inputs.marker_model_slot.resize(marker_total, 1);
+    inputs.marker_overflow.resize(marker_total, 1);
+    inputs.fk_valid.resize(fk_total, 1);
+    inputs.fk_key.resize(fk_total, 1);
+    inputs.fk_multiplicity.resize(fk_total, 1);
+    inputs.fk_overflow.resize(fk_total, 1);
+    inputs.marker_valid.setZero();
+    inputs.marker_key.setZero();
+    inputs.marker_model_slot.setZero();
+    inputs.marker_overflow.setZero();
+    inputs.fk_valid.setZero();
+    inputs.fk_key.setZero();
+    inputs.fk_multiplicity.setZero();
+    inputs.fk_overflow.setZero();
+    inputs.fk_dictionary.resize(cap_l, 1);
+    inputs.fk_dictionary.setZero();
+    inputs.fk_slot_category.assign(static_cast<std::size_t>(cap_l), i64Matrix(fk_total, 1));
+    inputs.fk_slot_count.assign(static_cast<std::size_t>(cap_l), i64Matrix(fk_total, 1));
+    inputs.fk_slot_valid.assign(static_cast<std::size_t>(cap_l), i64Matrix(fk_total, 1));
+    for (u64 slot = 0; slot < cap_l; ++slot) {
+        inputs.fk_slot_category[static_cast<std::size_t>(slot)].setZero();
+        inputs.fk_slot_count[static_cast<std::size_t>(slot)].setZero();
+        inputs.fk_slot_valid[static_cast<std::size_t>(slot)].setZero();
+    }
+
+    if (provider_pre_shared_inputs_enabled(config)) {
+        return inputs;
+    }
+
+    if (config.role == config.pk_input_party) {
+        std::ifstream marker_file(config.pk_csv_path);
+        if (!marker_file.is_open()) {
+            throw std::runtime_error("Failed to open sample marker CSV: " + config.pk_csv_path);
+        }
+        std::string line;
+        u64 row = 0;
+        if (config.pk_has_header) {
+            std::getline(marker_file, line);
+        }
+        while (std::getline(marker_file, line)) {
+            if (line.empty()) {
+                continue;
+            }
+            if (row >= marker_total) {
+                throw std::runtime_error("Sample marker CSV exceeds fixed public marker capacity.");
+            }
+            const auto fields = split_simple_csv_line(line);
+            const i64 part = parse_prepared_i64_cell(fields, 0, config.pk_csv_path, row);
+            const i64 valid = parse_prepared_i64_cell(fields, 1, config.pk_csv_path, row);
+            const i64 key = parse_prepared_i64_cell(fields, 2, config.pk_csv_path, row);
+            const i64 slot = parse_prepared_i64_cell(fields, 3, config.pk_csv_path, row);
+            const i64 marker_overflow = fields.size() > 4
+                ? parse_prepared_i64_cell(fields, 4, config.pk_csv_path, row)
+                : 0;
+            u64 expected_part = 0;
+            u64 local_row = row;
+            for (u64 part_idx = 0; part_idx < partition_count; ++part_idx) {
+                const u64 cap = marker_capacities[static_cast<std::size_t>(part_idx)];
+                if (local_row < cap) {
+                    expected_part = part_idx;
+                    break;
+                }
+                local_row -= cap;
+            }
+            if (part < 0 || static_cast<u64>(part) != expected_part) {
+                throw std::runtime_error("Sample marker CSV partition order does not match public fixed-cap contract.");
+            }
+            if (config.conditional_multiplier_mode == kConditionalSampleMarkerStoredReverseMode &&
+                local_row < sample_rows && slot != static_cast<i64>(local_row)) {
+                throw std::runtime_error("Sample marker CSV anonymous_model_sample_slot must equal fixed row slot.");
+            }
+            if (valid != 0 && valid != 1) {
+                throw std::runtime_error("Sample marker valid must be 0 or 1.");
+            }
+            inputs.marker_valid(row, 0) = valid;
+            inputs.marker_key(row, 0) = key;
+            inputs.marker_model_slot(row, 0) = slot;
+            inputs.marker_overflow(row, 0) = marker_overflow;
+            ++row;
+        }
+        if (row != marker_total) {
+            throw std::runtime_error("Sample marker CSV row count does not match public fixed capacity.");
+        }
+    }
+
+    const char* dictionary_share_path_env = std::getenv("BSPN_CONDITIONAL_FIXED_DICTIONARY_SHARE_PATH");
+    const bool dictionary_pre_shared =
+        dense_payload && dictionary_share_path_env != nullptr && *dictionary_share_path_env != '\0';
+    if (config.role == config.fk_input_party) {
+        if (dense_payload && !dictionary_pre_shared) {
+            std::vector<i64> dictionary;
+            const char* dictionary_path = std::getenv("BSPN_CONDITIONAL_FIXED_DICTIONARY_PATH");
+            if (dictionary_path != nullptr && *dictionary_path != '\0') {
+                dictionary = read_i64_lines_file(dictionary_path);
+            } else {
+                dictionary = parse_i64_csv_env("BSPN_CONDITIONAL_FIXED_DICTIONARY_VALUES");
+            }
+            if (dictionary.size() != static_cast<std::size_t>(cap_l)) {
+                throw std::runtime_error("Dense fixed dictionary size must equal conditional_public_cap_L.");
+            }
+            std::set<i64> seen_dictionary;
+            for (u64 slot = 0; slot < cap_l; ++slot) {
+                const i64 value = dictionary[static_cast<std::size_t>(slot)];
+                if (!seen_dictionary.insert(value).second) {
+                    throw std::runtime_error("Dense fixed dictionary contains duplicate values.");
+                }
+                inputs.fk_dictionary(slot, 0) = value;
+            }
+        }
+        std::ifstream fk_file(config.fk_csv_path);
+        if (!fk_file.is_open()) {
+            throw std::runtime_error("Failed to open grouped FK CSV: " + config.fk_csv_path);
+        }
+        std::string line;
+        u64 row = 0;
+        if (config.fk_has_header) {
+            std::getline(fk_file, line);
+        }
+        while (std::getline(fk_file, line)) {
+            if (line.empty()) {
+                continue;
+            }
+            if (row >= fk_total) {
+                throw std::runtime_error("Grouped FK CSV exceeds fixed public FK capacity.");
+            }
+            const auto fields = split_simple_csv_line(line);
+            const std::size_t expected_cols = dense_payload
+                ? 4 + static_cast<std::size_t>(cap_l) + 1
+                : 4 + static_cast<std::size_t>(cap_l) * 3 + 1;
+            if (fields.size() < expected_cols) {
+                throw std::runtime_error("Grouped FK CSV row is shorter than fixed conditional payload schema.");
+            }
+            const i64 part = parse_prepared_i64_cell(fields, 0, config.fk_csv_path, row);
+            const i64 valid = parse_prepared_i64_cell(fields, 1, config.fk_csv_path, row);
+            const i64 key = parse_prepared_i64_cell(fields, 2, config.fk_csv_path, row);
+            const i64 multiplicity = parse_prepared_i64_cell(fields, 3, config.fk_csv_path, row);
+            u64 expected_part = 0;
+            u64 local_row = row;
+            for (u64 part_idx = 0; part_idx < partition_count; ++part_idx) {
+                const u64 cap = fk_capacities[static_cast<std::size_t>(part_idx)];
+                if (local_row < cap) {
+                    expected_part = part_idx;
+                    break;
+                }
+                local_row -= cap;
+            }
+            (void)local_row;
+            if (part < 0 || static_cast<u64>(part) != expected_part) {
+                throw std::runtime_error("Grouped FK CSV partition order does not match public fixed-cap contract.");
+            }
+            if (valid != 0 && valid != 1) {
+                throw std::runtime_error("Grouped FK valid must be 0 or 1.");
+            }
+            inputs.fk_valid(row, 0) = valid;
+            inputs.fk_key(row, 0) = key;
+            inputs.fk_multiplicity(row, 0) = multiplicity;
+            std::size_t col = 4;
+            if (dense_payload) {
+                for (u64 slot = 0; slot < cap_l; ++slot) {
+                    inputs.fk_slot_count[static_cast<std::size_t>(slot)](row, 0) =
+                        parse_prepared_i64_cell(fields, col++, config.fk_csv_path, row);
+                }
+            } else {
+                for (u64 slot = 0; slot < cap_l; ++slot) {
+                    inputs.fk_slot_category[static_cast<std::size_t>(slot)](row, 0) =
+                        parse_prepared_i64_cell(fields, col++, config.fk_csv_path, row);
+                    inputs.fk_slot_count[static_cast<std::size_t>(slot)](row, 0) =
+                        parse_prepared_i64_cell(fields, col++, config.fk_csv_path, row);
+                    const i64 slot_valid = parse_prepared_i64_cell(fields, col++, config.fk_csv_path, row);
+                    if (slot_valid != 0 && slot_valid != 1) {
+                        throw std::runtime_error("Grouped FK slot valid must be 0 or 1.");
+                    }
+                    inputs.fk_slot_valid[static_cast<std::size_t>(slot)](row, 0) = slot_valid;
+                }
+            }
+            inputs.fk_overflow(row, 0) = parse_prepared_i64_cell(fields, col, config.fk_csv_path, row);
+            ++row;
+        }
+        if (row != fk_total) {
+            throw std::runtime_error("Grouped FK CSV row count does not match public fixed capacity.");
+        }
+    }
+    return inputs;
+}
+
+std::vector<si64Matrix> split_row_major_share_columns(
+    const si64Matrix& flat,
+    u64 rows,
+    u64 columns)
+{
+    if (flat.rows() != rows * columns) {
+        throw std::runtime_error("Provider pre-shared row-major matrix has an invalid size.");
+    }
+    std::vector<si64Matrix> out(static_cast<std::size_t>(columns));
+    for (u64 column = 0; column < columns; ++column) {
+        out[static_cast<std::size_t>(column)].resize(rows, 1);
+        for (u64 row = 0; row < rows; ++row) {
+            const u64 source = row * columns + column;
+            out[static_cast<std::size_t>(column)].mShares[0](row, 0) = flat.mShares[0](source, 0);
+            out[static_cast<std::size_t>(column)].mShares[1](row, 0) = flat.mShares[1](source, 0);
+        }
+    }
+    return out;
+}
+
+void write_sample_marker_conditional_payload_role_files(
+    const MultiplierPreprocessConfig& config,
+    const ConditionalMergeResult& result,
+    const std::string& artifact_dir)
+{
+    const bool dense_payload = fixed_dictionary_dense_counts_enabled();
+    const std::string sidecar_dir = artifact_dir + "/" + (
+        config.conditional_multiplier_mode == kConditionalSampleMarkerCapReorderMode
+            ? kConditionalSampleMarkerCapReorderSidecarName
+            : kConditionalSampleMarkerSidecarName);
+    ensure_dir(sidecar_dir);
+    const std::string role_dir = sidecar_dir + "/role_" + std::to_string(config.role);
+    ensure_dir(role_dir);
+    if (dense_payload) {
+        write_share_pair_matrix(role_dir + "/dictionary.shares.bin", result.dictionary);
+        write_share_pair_matrix(role_dir + "/dense_count.shares.bin", flatten_slot_columns_row_major(result.slot_count));
+    } else {
+        write_share_pair_matrix(role_dir + "/slot_category.shares.bin", flatten_slot_columns_row_major(result.slot_category));
+        write_share_pair_matrix(role_dir + "/slot_count.shares.bin", flatten_slot_columns_row_major(result.slot_count));
+        write_share_pair_matrix(role_dir + "/slot_valid.shares.bin", flatten_slot_columns_row_major(result.slot_valid));
+    }
+    write_share_pair_matrix(role_dir + "/selected_overflow.shares.bin", result.overflow);
+    if (config.conditional_multiplier_mode == kConditionalSampleMarkerCapReorderMode) {
+        write_share_pair_matrix(role_dir + "/sample_order_integrity.shares.bin", result.integrity_evidence);
+    }
+}
+
+void write_sample_marker_manifest(
+    const MultiplierPreprocessConfig& config,
+    const std::string& artifact_dir,
+    const SampleMarkerRunStats& stats)
+{
+    const bool cap_reorder = config.conditional_multiplier_mode == kConditionalSampleMarkerCapReorderMode;
+    const bool dense_payload = fixed_dictionary_dense_counts_enabled();
+    const std::string sidecar_dir = artifact_dir + "/" + (
+        cap_reorder ? kConditionalSampleMarkerCapReorderSidecarName : kConditionalSampleMarkerSidecarName);
+    json doc;
+    doc["target"] = cap_reorder
+        ? "M2_CONDITIONAL_MULTIPLIER_SAMPLE_MARKER_PARTITION_CAP_REORDER_V1"
+        : "M2_CONDITIONAL_MULTIPLIER_SAMPLE_MARKER_STORED_REVERSE_V1";
+    doc["schema_version"] = dense_payload
+        ? "M2CMSMALLREORDERDENSE01"
+        : (cap_reorder ? "M2CMSMALLREORDER01" : "M2CMSAMPLE01");
+    doc["privacy_profile"] = "query_private_public_anonymous_uniform_sample_v1";
+    doc["conditional_multiplier_mode"] = config.conditional_multiplier_mode;
+    doc["conditional_payload_mode"] = conditional_payload_mode();
+    doc["edge_id"] = config.conditional_edge_id;
+    doc["column_id"] = config.conditional_column_id;
+    doc["public_cap_L"] = config.conditional_public_cap_L;
+    doc["sample_rows"] = stats.sample_rows;
+    doc["slot_count"] = config.conditional_public_cap_L;
+    doc["contains_real_row_id"] = false;
+    doc["contains_join_key"] = false;
+    doc["contains_dense_offset"] = false;
+    doc["contains_sample_row_id_by_position"] = false;
+    doc["contains_plaintext_dictionary_values"] = false;
+    doc["dictionary_visible_to_compute_servers"] = false;
+    doc["payload_layout"] = dense_payload
+        ? "anonymous_model_sample_slot_row_major_dense_counts_v1"
+        : "anonymous_model_sample_slot_row_major_slots_v1";
+    doc["dictionary_encoding"] = dense_payload ? "secret_shared_global_fixed_dictionary_v1" : "row_local_sparse_category_slots_v1";
+    doc["sample_order"] = "anonymous_model_sample_slot";
+    doc["fixed_point"] = {{"ring", "int64"}, {"fixed_decimal_bits", kMultiplierFixedDecimalBits}};
+    doc["share_kind"] = "ABY3_REPLICATED_PAIR_I64";
+    doc["baseline_scalar_artifact_dir"] = artifact_dir;
+    doc["artifact_state"] = "complete";
+    doc["completion_marker"] = "COMPLETE";
+    doc["selected_overflow_authorized"] = false;
+    doc["downstream_authorized"] = false;
+    doc["overflow_policy"] = "client_reconstruct_fail_closed";
+    doc["sample_marker_contract"] = {
+        {"public_partition_count", stats.partition_count},
+        {"public_marker_capacity_per_partition", stats.marker_capacity_per_partition},
+        {"public_marker_capacity_total", stats.marker_capacity_total},
+        {"public_fk_capacity_total", stats.fk_capacity_total},
+        {"real_pk_marker_rows", stats.sample_rows},
+        {"public_slot_repeated_in_every_partition", !cap_reorder},
+        {"sample_only_reorder_used", cap_reorder},
+        {"sample_only_global_reorder_rows", stats.sample_only_global_reorder_rows},
+        {"sample_only_global_reorder_padded_rows", stats.sample_only_global_reorder_padded_rows}
+    };
+    doc["instrumentation"] = {
+        {"forward_secret_comparison_sort_count", stats.forward_secret_comparison_sort_count},
+        {"stored_swap_reverse_replay_count", stats.stored_swap_reverse_replay_count},
+        {"second_secret_comparison_sort_count", stats.second_secret_comparison_sort_count},
+        {"legacy_second_full_sort_count", stats.second_secret_comparison_sort_count},
+        {"sample_only_global_reorder_sort_count", stats.sample_only_global_reorder_sort_count},
+        {"forward_comparators", stats.forward_comparators},
+        {"forward_layers", stats.forward_layers},
+        {"reverse_swaps", stats.reverse_swaps},
+        {"reverse_layers", stats.reverse_layers},
+        {"padded_combined_rows_total", stats.padded_combined_rows_total},
+        {"sample_only_global_reorder_comparators", stats.sample_only_global_reorder_comparators},
+        {"sample_only_global_reorder_layers", stats.sample_only_global_reorder_layers}
+    };
+    if (cap_reorder) {
+        doc["integrity_gate"] = {
+            {"client_reconstruct_required", true},
+            {"evidence_file", "sample_order_integrity.shares.bin"},
+            {"checks", {
+                "valid_real_count_minus_S",
+                "first_slot_minus_zero",
+                "last_slot_minus_S_minus_1",
+                "overflow_sum",
+                "adjacent_slot_delta_minus_one"
+            }}
+        };
+    }
+    doc["role_paths"] = json::object();
+    for (int role = 0; role < 3; ++role) {
+        const std::string role_dir = sidecar_dir + "/role_" + std::to_string(role);
+        json paths;
+        std::vector<std::string> names;
+        if (dense_payload) {
+            names = {
+                "dictionary.shares.bin",
+                "dense_count.shares.bin",
+                "selected_overflow.shares.bin",
+            };
+        } else {
+            names = {
+                "slot_category.shares.bin",
+                "slot_count.shares.bin",
+                "slot_valid.shares.bin",
+                "selected_overflow.shares.bin",
+            };
+        }
+        for (const auto& name : names) {
+            const std::string path = role_dir + "/" + name;
+            paths[name] = {
+                {"path", path},
+                {"bytes", file_size_bytes(path)},
+                {"sha256", sha256_file_external(path)},
+            };
+        }
+        if (cap_reorder) {
+            const std::string path = role_dir + "/sample_order_integrity.shares.bin";
+            paths["sample_order_integrity.shares.bin"] = {
+                {"path", path},
+                {"bytes", file_size_bytes(path)},
+                {"sha256", sha256_file_external(path)},
+            };
+        }
+        doc["role_paths"][std::to_string(role)] = paths;
+    }
+    write_streaming_manifest_atomic(sidecar_dir + "/manifest.json", doc);
+    write_text_file(sidecar_dir + "/COMPLETE", "complete\n");
+}
+
+ConditionalMergeResult sample_marker_stored_reverse_merge(
+    const MultiplierPreprocessConfig& config,
+    const std::vector<u64>& marker_capacities,
+    const std::vector<u64>& fk_capacities,
+    u64 sample_rows,
+    const si64Matrix& marker_valid_shared,
+    const si64Matrix& marker_key_shared,
+    const si64Matrix& marker_model_slot_shared,
+    const si64Matrix& marker_overflow_shared,
+    const si64Matrix& fk_valid_shared,
+    const si64Matrix& fk_key_shared,
+    const si64Matrix& fk_multiplicity_shared,
+    const si64Matrix& fk_dictionary_shared,
+    const std::vector<si64Matrix>& fk_slot_category_shared,
+    const std::vector<si64Matrix>& fk_slot_count_shared,
+    const std::vector<si64Matrix>& fk_slot_valid_shared,
+    const si64Matrix& fk_overflow_shared,
+    Sh3Encryptor& enc,
+    Sh3Evaluator& eval,
+    Sh3Runtime& runtime,
+    SampleMarkerRunStats& stats)
+{
+    const u64 cap_l = config.conditional_public_cap_L;
+    const u64 partitions = static_cast<u64>(marker_capacities.size());
+    const bool cap_reorder = config.conditional_multiplier_mode == kConditionalSampleMarkerCapReorderMode;
+    const bool dense_payload = fixed_dictionary_dense_counts_enabled();
+    const u64 result_rows = cap_reorder ? sum_u64(marker_capacities) : sample_rows;
+    ConditionalMergeResult result;
+    result.counts = shared_zero_int_matrix(result_rows, 1);
+    result.dictionary = fk_dictionary_shared;
+    result.slot_category.assign(static_cast<std::size_t>(cap_l), shared_zero_int_matrix(result_rows, 1));
+    result.slot_count.assign(static_cast<std::size_t>(cap_l), shared_zero_int_matrix(result_rows, 1));
+    result.slot_valid.assign(static_cast<std::size_t>(cap_l), shared_zero_int_matrix(result_rows, 1));
+    result.overflow = shared_zero_int_matrix(result_rows, 1);
+    result.marker_valid = shared_zero_int_matrix(result_rows, 1);
+    result.model_slot = shared_zero_int_matrix(result_rows, 1);
+
+    u64 marker_offset = 0;
+    u64 fk_offset = 0;
+    for (u64 part = 0; part < partitions; ++part) {
+        const u64 marker_cap = marker_capacities[static_cast<std::size_t>(part)];
+        const u64 fk_cap = fk_capacities[static_cast<std::size_t>(part)];
+        const u64 real_rows = marker_cap + fk_cap;
+        const u64 padded_rows = roundUpToPowerOfTwo(std::max<u64>(1, real_rows));
+        const u64 pad_rows = padded_rows - real_rows;
+        stats.padded_combined_rows_total += padded_rows;
+
+        auto marker_valid = int_row_slice(marker_valid_shared, marker_offset, marker_cap);
+        auto marker_key = int_row_slice(marker_key_shared, marker_offset, marker_cap);
+        auto fk_valid = int_row_slice(fk_valid_shared, fk_offset, fk_cap);
+        auto fk_key = int_row_slice(fk_key_shared, fk_offset, fk_cap);
+        auto marker_invalid = public_i64_column(1, marker_cap, config.role) - marker_valid;
+        auto fk_invalid = public_i64_column(1, fk_cap, config.role) - fk_valid;
+        auto pad_invalid = public_i64_column(1, pad_rows, config.role);
+        auto pad_key = public_i64_column(0, pad_rows, config.role);
+        auto fk_origin = public_i64_column(0, fk_cap, config.role);
+        auto marker_origin = public_i64_column(1, marker_cap, config.role);
+        auto pad_origin = public_i64_column(2, pad_rows, config.role);
+        auto fk_tie = public_i64_row_ids(fk_cap, config.role);
+        auto marker_tie = public_i64_row_ids(marker_cap, config.role);
+        auto pad_tie = public_i64_row_ids(pad_rows, config.role);
+
+        enum SampleMarkerColumn : u64 {
+            kInvalidRank = 0,
+            kKey = 1,
+            kOrigin = 2,
+            kTie = 3,
+            kScalarCount = 4,
+            kOverflow = 5,
+            kFirstSlotColumn = 6,
+        };
+        std::vector<si64Matrix> columns;
+        columns.push_back(concat_shared_row_blocks({fk_invalid, marker_invalid, pad_invalid}));
+        columns.push_back(concat_shared_row_blocks({fk_key, marker_key, pad_key}));
+        columns.push_back(concat_shared_row_blocks({fk_origin, marker_origin, pad_origin}));
+        columns.push_back(concat_shared_row_blocks({fk_tie, marker_tie, pad_tie}));
+        columns.push_back(concat_shared_row_blocks({
+            int_row_slice(fk_multiplicity_shared, fk_offset, fk_cap),
+            shared_zero_int_matrix(marker_cap, 1),
+            shared_zero_int_matrix(pad_rows, 1),
+        }));
+        columns.push_back(concat_shared_row_blocks({
+            int_row_slice(fk_overflow_shared, fk_offset, fk_cap),
+            shared_zero_int_matrix(marker_cap, 1),
+            shared_zero_int_matrix(pad_rows, 1),
+        }));
+        for (u64 slot = 0; slot < cap_l; ++slot) {
+            if (!dense_payload) {
+                columns.push_back(concat_shared_row_blocks({
+                    int_row_slice(fk_slot_category_shared[static_cast<std::size_t>(slot)], fk_offset, fk_cap),
+                    shared_zero_int_matrix(marker_cap, 1),
+                    shared_zero_int_matrix(pad_rows, 1),
+                }));
+            }
+            columns.push_back(concat_shared_row_blocks({
+                int_row_slice(fk_slot_count_shared[static_cast<std::size_t>(slot)], fk_offset, fk_cap),
+                shared_zero_int_matrix(marker_cap, 1),
+                shared_zero_int_matrix(pad_rows, 1),
+            }));
+            if (!dense_payload) {
+                columns.push_back(concat_shared_row_blocks({
+                    int_row_slice(fk_slot_valid_shared[static_cast<std::size_t>(slot)], fk_offset, fk_cap),
+                    shared_zero_int_matrix(marker_cap, 1),
+                    shared_zero_int_matrix(pad_rows, 1),
+                }));
+            }
+        }
+
+        const auto forward_started = SteadyClock::now();
+        u64 layer_count = 0;
+        u64 comparator_count = 0;
+        auto stored_layers = reversible_bitonic_forward_sort_rows(
+            columns,
+            {kInvalidRank, kKey, kOrigin, kTie},
+            config.role,
+            enc,
+            eval,
+            runtime,
+            layer_count,
+            comparator_count);
+        stats.forward_seconds += elapsed_seconds_since(forward_started);
+        stats.forward_secret_comparison_sort_count += 1;
+        stats.forward_layers += layer_count;
+        stats.forward_comparators += comparator_count;
+
+        const auto scan_started = SteadyClock::now();
+        auto is_active = int_eq_public(columns[kInvalidRank], 0, config.role, eval, runtime);
+        auto is_fk = int_eq_public(columns[kOrigin], 0, config.role, eval, runtime);
+        auto is_marker = int_eq_public(columns[kOrigin], 1, config.role, eval, runtime);
+        is_fk = local_bool_and_matrix(is_fk, is_active, config.role, enc, eval, runtime);
+        is_marker = local_bool_and_matrix(is_marker, is_active, config.role, enc, eval, runtime);
+        auto previous_key = int_shift_down_one_zero(columns[kKey]);
+        auto previous_active = bool_shift_down_one_false(is_active, config.role);
+        auto same_previous = int_eq_matrix(columns[kKey], previous_key, config.role, eval, runtime);
+        same_previous = local_bool_and_matrix(same_previous, is_active, config.role, enc, eval, runtime);
+        same_previous = local_bool_and_matrix(same_previous, previous_active, config.role, enc, eval, runtime);
+        auto zero_records = shared_zero_int_matrix(padded_rows, 1);
+
+        auto source_scalar = select_si64_by_bool(
+            columns[kScalarCount],
+            zero_records,
+            is_fk,
+            config.role,
+            enc,
+            eval,
+            runtime);
+        auto running_scalar = segmented_prefix_sum(
+            source_scalar,
+            same_previous,
+            config.role,
+            enc,
+            eval,
+            runtime);
+        auto fetched_scalar = select_si64_by_bool(
+            running_scalar,
+            zero_records,
+            is_marker,
+            config.role,
+            enc,
+            eval,
+            runtime);
+
+        auto source_overflow = select_si64_by_bool(
+            columns[kOverflow],
+            zero_records,
+            is_fk,
+            config.role,
+            enc,
+            eval,
+            runtime);
+        auto running_overflow = segmented_prefix_sum(
+            source_overflow,
+            same_previous,
+            config.role,
+            enc,
+            eval,
+            runtime);
+        auto fetched_overflow = select_si64_by_bool(
+            running_overflow,
+            zero_records,
+            is_marker,
+            config.role,
+            enc,
+            eval,
+            runtime);
+
+        std::vector<si64Matrix> fetched_slot_category;
+        std::vector<si64Matrix> fetched_slot_count;
+        std::vector<si64Matrix> fetched_slot_valid;
+        fetched_slot_category.reserve(static_cast<std::size_t>(cap_l));
+        fetched_slot_count.reserve(static_cast<std::size_t>(cap_l));
+        fetched_slot_valid.reserve(static_cast<std::size_t>(cap_l));
+        for (u64 slot = 0; slot < cap_l; ++slot) {
+            const u64 base = kFirstSlotColumn + slot * (dense_payload ? 1 : 3);
+            const u64 field_count = dense_payload ? 1 : 3;
+            for (u64 field = 0; field < field_count; ++field) {
+                const u64 src_col = base + field;
+                auto source_payload = select_si64_by_bool(
+                    columns[src_col],
+                    zero_records,
+                    is_fk,
+                    config.role,
+                    enc,
+                    eval,
+                    runtime);
+                auto running_payload = segmented_prefix_sum(
+                    source_payload,
+                    same_previous,
+                    config.role,
+                    enc,
+                    eval,
+                    runtime);
+                auto fetched = select_si64_by_bool(
+                    running_payload,
+                    zero_records,
+                    is_marker,
+                    config.role,
+                    enc,
+                    eval,
+                    runtime);
+                if (dense_payload || field == 1) {
+                    fetched_slot_count.push_back(std::move(fetched));
+                } else if (field == 0) {
+                    fetched_slot_category.push_back(std::move(fetched));
+                } else {
+                    fetched_slot_valid.push_back(std::move(fetched));
+                }
+            }
+        }
+        stats.segmented_scan_seconds += elapsed_seconds_since(scan_started);
+
+        const auto reverse_started = SteadyClock::now();
+        std::vector<si64Matrix> reverse_columns;
+        reverse_columns.reserve(static_cast<std::size_t>(3 + cap_l * (dense_payload ? 1 : 3)));
+        reverse_columns.push_back(columns[kInvalidRank]);
+        reverse_columns.push_back(std::move(fetched_scalar));
+        reverse_columns.push_back(std::move(fetched_overflow));
+        for (u64 slot = 0; slot < cap_l; ++slot) {
+            if (!dense_payload) {
+                reverse_columns.push_back(std::move(fetched_slot_category[static_cast<std::size_t>(slot)]));
+            }
+            reverse_columns.push_back(std::move(fetched_slot_count[static_cast<std::size_t>(slot)]));
+            if (!dense_payload) {
+                reverse_columns.push_back(std::move(fetched_slot_valid[static_cast<std::size_t>(slot)]));
+            }
+        }
+        reversible_bitonic_reverse_rows(reverse_columns, stored_layers, config.role, enc, eval, runtime);
+        stats.stored_reverse_seconds += elapsed_seconds_since(reverse_started);
+        stats.stored_swap_reverse_replay_count += 1;
+        stats.reverse_layers += layer_count;
+        stats.reverse_swaps += comparator_count;
+        stored_layers.clear();
+
+        const auto select_started = SteadyClock::now();
+        auto marker_slice_invalid = int_row_slice(reverse_columns[0], fk_cap, marker_cap);
+        auto marker_slice_valid = int_eq_public(marker_slice_invalid, 0, config.role, eval, runtime);
+        const u64 output_rows = cap_reorder ? marker_cap : std::min(sample_rows, marker_cap);
+        auto marker_zero = shared_zero_int_matrix(marker_cap, 1);
+        auto selected_count = select_si64_by_bool(
+            int_row_slice(reverse_columns[1], fk_cap, marker_cap),
+            marker_zero,
+            marker_slice_valid,
+            config.role,
+            enc,
+            eval,
+            runtime);
+        auto selected_overflow = select_si64_by_bool(
+            int_row_slice(reverse_columns[2], fk_cap, marker_cap),
+            marker_zero,
+            marker_slice_valid,
+            config.role,
+            enc,
+            eval,
+            runtime);
+        auto selected_marker_overflow = select_si64_by_bool(
+            int_row_slice(marker_overflow_shared, marker_offset, marker_cap),
+            marker_zero,
+            marker_slice_valid,
+            config.role,
+            enc,
+            eval,
+            runtime);
+        selected_overflow.mShares[0] += selected_marker_overflow.mShares[0];
+        selected_overflow.mShares[1] += selected_marker_overflow.mShares[1];
+        auto selected_marker_valid = bool_to_si64(marker_slice_valid, config.role, enc, eval, runtime);
+        auto selected_model_slot = select_si64_by_bool(
+            int_row_slice(marker_model_slot_shared, marker_offset, marker_cap),
+            marker_zero,
+            marker_slice_valid,
+            config.role,
+            enc,
+            eval,
+            runtime);
+        for (u64 row = 0; row < output_rows; ++row) {
+            const u64 dst = cap_reorder ? (marker_offset + row) : row;
+            if (cap_reorder) {
+                result.counts.mShares[0](dst, 0) = selected_count.mShares[0](row, 0);
+                result.counts.mShares[1](dst, 0) = selected_count.mShares[1](row, 0);
+                result.overflow.mShares[0](dst, 0) = selected_overflow.mShares[0](row, 0);
+                result.overflow.mShares[1](dst, 0) = selected_overflow.mShares[1](row, 0);
+                result.marker_valid.mShares[0](dst, 0) = selected_marker_valid.mShares[0](row, 0);
+                result.marker_valid.mShares[1](dst, 0) = selected_marker_valid.mShares[1](row, 0);
+                result.model_slot.mShares[0](dst, 0) = selected_model_slot.mShares[0](row, 0);
+                result.model_slot.mShares[1](dst, 0) = selected_model_slot.mShares[1](row, 0);
+            } else {
+                result.counts.mShares[0](dst, 0) += selected_count.mShares[0](row, 0);
+                result.counts.mShares[1](dst, 0) += selected_count.mShares[1](row, 0);
+                result.overflow.mShares[0](dst, 0) += selected_overflow.mShares[0](row, 0);
+                result.overflow.mShares[1](dst, 0) += selected_overflow.mShares[1](row, 0);
+            }
+        }
+        for (u64 slot = 0; slot < cap_l; ++slot) {
+            const u64 base = 3 + slot * (dense_payload ? 1 : 3);
+            const auto selected_slot_count = select_si64_by_bool(
+                int_row_slice(reverse_columns[base + (dense_payload ? 0 : 1)], fk_cap, marker_cap),
+                marker_zero,
+                marker_slice_valid,
+                config.role,
+                enc,
+                eval,
+                runtime);
+            si64Matrix selected_category;
+            si64Matrix selected_slot_valid;
+            if (!dense_payload) {
+                selected_category = select_si64_by_bool(
+                    int_row_slice(reverse_columns[base], fk_cap, marker_cap),
+                    marker_zero,
+                    marker_slice_valid,
+                    config.role,
+                    enc,
+                    eval,
+                    runtime);
+                selected_slot_valid = select_si64_by_bool(
+                    int_row_slice(reverse_columns[base + 2], fk_cap, marker_cap),
+                    marker_zero,
+                    marker_slice_valid,
+                    config.role,
+                    enc,
+                    eval,
+                    runtime);
+            }
+            for (u64 row = 0; row < output_rows; ++row) {
+                const u64 dst = cap_reorder ? (marker_offset + row) : row;
+                auto& category = result.slot_category[static_cast<std::size_t>(slot)];
+                auto& count = result.slot_count[static_cast<std::size_t>(slot)];
+                auto& valid = result.slot_valid[static_cast<std::size_t>(slot)];
+                if (cap_reorder) {
+                    if (!dense_payload) {
+                        category.mShares[0](dst, 0) = selected_category.mShares[0](row, 0);
+                        category.mShares[1](dst, 0) = selected_category.mShares[1](row, 0);
+                        valid.mShares[0](dst, 0) = selected_slot_valid.mShares[0](row, 0);
+                        valid.mShares[1](dst, 0) = selected_slot_valid.mShares[1](row, 0);
+                    }
+                    count.mShares[0](dst, 0) = selected_slot_count.mShares[0](row, 0);
+                    count.mShares[1](dst, 0) = selected_slot_count.mShares[1](row, 0);
+                } else {
+                    if (!dense_payload) {
+                        category.mShares[0](dst, 0) += selected_category.mShares[0](row, 0);
+                        category.mShares[1](dst, 0) += selected_category.mShares[1](row, 0);
+                        valid.mShares[0](dst, 0) += selected_slot_valid.mShares[0](row, 0);
+                        valid.mShares[1](dst, 0) += selected_slot_valid.mShares[1](row, 0);
+                    }
+                    count.mShares[0](dst, 0) += selected_slot_count.mShares[0](row, 0);
+                    count.mShares[1](dst, 0) += selected_slot_count.mShares[1](row, 0);
+                }
+            }
+        }
+        stats.marker_select_seconds += elapsed_seconds_since(select_started);
+
+        if (secure_multiplier_public_profile_enabled() && config.role == 0) {
+            std::cerr << "bspn_multiplier_profile: event=sample_marker_stored_reverse_partition"
+                      << " partition=" << part
+                      << " sample_rows=" << sample_rows
+                      << " marker_capacity=" << marker_cap
+                      << " fk_group_capacity=" << fk_cap
+                      << " padded_rows=" << padded_rows
+                      << " payload_columns=" << columns.size()
+                      << " forward_secret_comparison_sort_count=1"
+                      << " stored_swap_reverse_replay_count=1"
+                      << " second_secret_comparison_sort_count=0"
+                      << " forward_layers=" << layer_count
+                      << " forward_comparators=" << comparator_count
+                      << " reverse_swaps=" << comparator_count
+                      << std::endl;
+        }
+
+        marker_offset += marker_cap;
+        fk_offset += fk_cap;
+    }
+    return result;
+}
+
+std::pair<u64, u64> bitonic_network_layers_and_comparators(u64 rows)
+{
+    u64 layers = 0;
+    u64 comparators = 0;
+    if (rows == 0) {
+        return {0, 0};
+    }
+    if ((rows & (rows - 1)) != 0) {
+        throw std::runtime_error("Bitonic network accounting requires public power-of-two rows.");
+    }
+    for (u64 k = 2; k <= rows; k <<= 1) {
+        for (u64 j = k >> 1; j > 0; j >>= 1) {
+            ++layers;
+            comparators += rows / 2;
+        }
+    }
+    return {layers, comparators};
+}
+
+ConditionalMergeResult sample_marker_global_reorder(
+    const MultiplierPreprocessConfig& config,
+    const ConditionalMergeResult& partitioned,
+    u64 sample_rows,
+    Sh3Encryptor& enc,
+    Sh3Evaluator& eval,
+    Sh3Runtime& runtime,
+    SampleMarkerRunStats& stats)
+{
+    const auto reorder_started = SteadyClock::now();
+    const u64 cap_l = config.conditional_public_cap_L;
+    const bool dense_payload = fixed_dictionary_dense_counts_enabled();
+    const u64 input_rows = partitioned.counts.rows();
+    if (sample_rows == 0 || sample_rows > input_rows) {
+        throw std::runtime_error("sample_marker_partition_cap_reorder_v1 requires 0 < S <= P*K.");
+    }
+    const u64 padded_rows = roundUpToPowerOfTwo(std::max<u64>(1, input_rows));
+    const u64 pad_rows = padded_rows - input_rows;
+    stats.sample_only_global_reorder_rows = input_rows;
+    stats.sample_only_global_reorder_padded_rows = padded_rows;
+
+    auto invalid_rank = public_i64_column(1, input_rows, config.role) - partitioned.marker_valid;
+    auto pad_invalid = public_i64_column(1, pad_rows, config.role);
+    auto pad_model_slot = public_i64_column(0, pad_rows, config.role);
+    auto pad_tie = public_i64_row_ids(pad_rows, config.role);
+    auto pad_zero = shared_zero_int_matrix(pad_rows, 1);
+
+    enum SampleOnlyReorderColumn : u64 {
+        kInvalidRank = 0,
+        kModelSlot = 1,
+        kTie = 2,
+        kMarkerValid = 3,
+        kCount = 4,
+        kOverflow = 5,
+        kFirstSlotColumn = 6,
+    };
+    std::vector<si64Matrix> columns;
+    columns.push_back(concat_shared_row_blocks({invalid_rank, pad_invalid}));
+    columns.push_back(concat_shared_row_blocks({partitioned.model_slot, pad_model_slot}));
+    columns.push_back(concat_shared_row_blocks({public_i64_row_ids(input_rows, config.role), pad_tie}));
+    columns.push_back(concat_shared_row_blocks({partitioned.marker_valid, pad_zero}));
+    columns.push_back(concat_shared_row_blocks({partitioned.counts, pad_zero}));
+    columns.push_back(concat_shared_row_blocks({partitioned.overflow, pad_zero}));
+    for (u64 slot = 0; slot < cap_l; ++slot) {
+        if (!dense_payload) {
+            columns.push_back(concat_shared_row_blocks({
+                partitioned.slot_category[static_cast<std::size_t>(slot)],
+                pad_zero,
+            }));
+        }
+        columns.push_back(concat_shared_row_blocks({
+            partitioned.slot_count[static_cast<std::size_t>(slot)],
+            pad_zero,
+        }));
+        if (!dense_payload) {
+            columns.push_back(concat_shared_row_blocks({
+                partitioned.slot_valid[static_cast<std::size_t>(slot)],
+                pad_zero,
+            }));
+        }
+    }
+
+    oblivious_bitonic_sort_rows(
+        columns,
+        {kInvalidRank, kModelSlot, kTie},
+        config.role,
+        enc,
+        eval,
+        runtime);
+    const auto [layers, comparators] = bitonic_network_layers_and_comparators(padded_rows);
+    stats.sample_only_global_reorder_sort_count += 1;
+    stats.sample_only_global_reorder_layers += layers;
+    stats.sample_only_global_reorder_comparators += comparators;
+    stats.sample_only_global_reorder_seconds += elapsed_seconds_since(reorder_started);
+
+    ConditionalMergeResult result;
+    result.counts = int_row_slice(columns[kCount], 0, sample_rows);
+    result.overflow = int_row_slice(columns[kOverflow], 0, sample_rows);
+    result.marker_valid = int_row_slice(columns[kMarkerValid], 0, sample_rows);
+    result.model_slot = int_row_slice(columns[kModelSlot], 0, sample_rows);
+    result.dictionary = partitioned.dictionary;
+    result.slot_category.assign(static_cast<std::size_t>(cap_l), shared_zero_int_matrix(sample_rows, 1));
+    result.slot_count.assign(static_cast<std::size_t>(cap_l), shared_zero_int_matrix(sample_rows, 1));
+    result.slot_valid.assign(static_cast<std::size_t>(cap_l), shared_zero_int_matrix(sample_rows, 1));
+    for (u64 slot = 0; slot < cap_l; ++slot) {
+        const u64 base = kFirstSlotColumn + slot * (dense_payload ? 1 : 3);
+        if (dense_payload) {
+            result.slot_count[static_cast<std::size_t>(slot)] = int_row_slice(columns[base], 0, sample_rows);
+        } else {
+            result.slot_category[static_cast<std::size_t>(slot)] = int_row_slice(columns[base], 0, sample_rows);
+            result.slot_count[static_cast<std::size_t>(slot)] = int_row_slice(columns[base + 1], 0, sample_rows);
+            result.slot_valid[static_cast<std::size_t>(slot)] = int_row_slice(columns[base + 2], 0, sample_rows);
+        }
+    }
+
+    const auto gate_started = SteadyClock::now();
+    const u64 adjacent_rows = sample_rows > 0 ? sample_rows - 1 : 0;
+    result.integrity_evidence = shared_zero_int_matrix(4 + adjacent_rows, 1);
+    si64Matrix valid_count = shared_zero_int_matrix(1, 1);
+    si64Matrix overflow_sum = shared_zero_int_matrix(1, 1);
+    for (u64 row = 0; row < sample_rows; ++row) {
+        valid_count.mShares[0](0, 0) += result.marker_valid.mShares[0](row, 0);
+        valid_count.mShares[1](0, 0) += result.marker_valid.mShares[1](row, 0);
+        overflow_sum.mShares[0](0, 0) += result.overflow.mShares[0](row, 0);
+        overflow_sum.mShares[1](0, 0) += result.overflow.mShares[1](row, 0);
+    }
+    auto expected_s = public_i64_column(static_cast<i64>(sample_rows), 1, config.role);
+    auto first_expected = public_i64_column(0, 1, config.role);
+    auto last_expected = public_i64_column(static_cast<i64>(sample_rows - 1), 1, config.role);
+    auto valid_delta = valid_count - expected_s;
+    auto first_delta = int_row_slice(result.model_slot, 0, 1) - first_expected;
+    auto last_delta = int_row_slice(result.model_slot, sample_rows - 1, 1) - last_expected;
+    result.integrity_evidence.mShares[0](0, 0) = valid_delta.mShares[0](0, 0);
+    result.integrity_evidence.mShares[1](0, 0) = valid_delta.mShares[1](0, 0);
+    result.integrity_evidence.mShares[0](1, 0) = first_delta.mShares[0](0, 0);
+    result.integrity_evidence.mShares[1](1, 0) = first_delta.mShares[1](0, 0);
+    result.integrity_evidence.mShares[0](2, 0) = last_delta.mShares[0](0, 0);
+    result.integrity_evidence.mShares[1](2, 0) = last_delta.mShares[1](0, 0);
+    result.integrity_evidence.mShares[0](3, 0) = overflow_sum.mShares[0](0, 0);
+    result.integrity_evidence.mShares[1](3, 0) = overflow_sum.mShares[1](0, 0);
+    for (u64 row = 0; row < adjacent_rows; ++row) {
+        auto lhs = int_row_slice(result.model_slot, row + 1, 1);
+        auto rhs = int_row_slice(result.model_slot, row, 1);
+        auto one = public_i64_column(1, 1, config.role);
+        auto delta = lhs - rhs - one;
+        const u64 dst = 4 + row;
+        result.integrity_evidence.mShares[0](dst, 0) = delta.mShares[0](0, 0);
+        result.integrity_evidence.mShares[1](dst, 0) = delta.mShares[1](0, 0);
+    }
+    stats.integrity_gate_seconds += elapsed_seconds_since(gate_started);
+
+    if (secure_multiplier_public_profile_enabled() && config.role == 0) {
+        std::cerr << "bspn_multiplier_profile: event=sample_only_global_reorder"
+                  << " input_rows=" << input_rows
+                  << " output_rows=" << sample_rows
+                  << " padded_rows=" << padded_rows
+                  << " payload_columns=" << columns.size()
+                  << " sample_only_global_reorder_sort_count=1"
+                  << " legacy_second_full_sort_count=0"
+                  << " layers=" << layers
+                  << " comparators=" << comparators
+                  << " reorder_seconds=" << stats.sample_only_global_reorder_seconds
+                  << " integrity_gate_seconds=" << stats.integrity_gate_seconds
+                  << std::endl;
+    }
+    return result;
+}
+
+void run_secure_multiplier_sample_marker_stored_reverse(const MultiplierPreprocessConfig& config)
+{
+    const auto started = SteadyClock::now();
+    const std::string process_start_utc = utc_now_iso8601();
+    if (config.role < 0 || config.role > 2) {
+        throw std::runtime_error("sample_marker_stored_reverse_v1 requires --role in {0,1,2}.");
+    }
+    if (config.pk_input_party < 0 || config.pk_input_party > 2 ||
+        config.fk_input_party < 0 || config.fk_input_party > 2 ||
+        config.pk_input_party == config.fk_input_party) {
+        throw std::runtime_error("sample_marker_stored_reverse_v1 requires distinct valid PK/FK input parties.");
+    }
+    if (config.fk_sample_rate <= 0.0) {
+        throw std::runtime_error("FK sample rate must be positive.");
+    }
+    const auto marker_capacities = parse_u64_csv_env("BSPN_MULTIPLIER_PARTITION_MARKER_CAPACITIES");
+    const auto fk_capacities = parse_u64_csv_env("BSPN_MULTIPLIER_PARTITION_FK_CAPACITIES");
+    if (marker_capacities.empty() || marker_capacities.size() != fk_capacities.size()) {
+        throw std::runtime_error("sample_marker_stored_reverse_v1 requires BSPN_MULTIPLIER_PARTITION_MARKER_CAPACITIES and BSPN_MULTIPLIER_PARTITION_FK_CAPACITIES with matching lengths.");
+    }
+    const u64 marker_cap = marker_capacities.front();
+    for (const auto cap : marker_capacities) {
+        if (cap != marker_cap || cap == 0) {
+            throw std::runtime_error("sample_marker_stored_reverse_v1 requires the same positive marker capacity in every public partition.");
+        }
+    }
+    for (const auto cap : fk_capacities) {
+        if (cap == 0) {
+            throw std::runtime_error("sample_marker_stored_reverse_v1 requires positive FK group capacities.");
+        }
+    }
+    const auto sample_rows_values = parse_u64_csv_env("BSPN_SAMPLE_MARKER_SAMPLE_ROWS");
+    const u64 sample_rows = sample_rows_values.empty() ? marker_cap : sample_rows_values.front();
+    const bool cap_reorder = config.conditional_multiplier_mode == kConditionalSampleMarkerCapReorderMode;
+    const u64 marker_total = sum_u64(marker_capacities);
+    const u64 fk_total = sum_u64(fk_capacities);
+    if (sample_rows == 0 || (!cap_reorder && sample_rows > marker_cap) || (cap_reorder && sample_rows > marker_total)) {
+        throw std::runtime_error("BSPN_SAMPLE_MARKER_SAMPLE_ROWS must be positive and fit the public marker capacity.");
+    }
+
+    IOService ios(config.comm_threads);
+    Sh3Encryptor enc;
+    Sh3Evaluator eval;
+    Sh3Runtime runtime;
+    basic_setup(static_cast<u64>(config.role), ios, enc, eval, runtime);
+    const auto protocol_started = SteadyClock::now();
+    const std::string protocol_start_utc = utc_now_iso8601();
+
+    const auto load_started = SteadyClock::now();
+    auto plain = load_sample_marker_prepared_inputs(config, marker_capacities, fk_capacities, sample_rows);
+    const double input_load_seconds = elapsed_seconds_since(load_started);
+
+    const auto share_started = SteadyClock::now();
+    const bool provider_pre_shared = provider_pre_shared_inputs_enabled(config);
+    const char* dictionary_share_path_env = std::getenv("BSPN_CONDITIONAL_FIXED_DICTIONARY_SHARE_PATH");
+    const bool dictionary_pre_shared =
+        fixed_dictionary_dense_counts_enabled()
+        && dictionary_share_path_env != nullptr
+        && *dictionary_share_path_env != '\0';
+    si64Matrix marker_valid_shared;
+    si64Matrix marker_key_shared;
+    si64Matrix marker_model_slot_shared;
+    si64Matrix marker_overflow_shared;
+    si64Matrix fk_valid_shared;
+    si64Matrix fk_key_shared;
+    si64Matrix fk_multiplicity_shared;
+    si64Matrix fk_dictionary_shared;
+    std::vector<si64Matrix> fk_slot_category_shared;
+    std::vector<si64Matrix> fk_slot_count_shared;
+    std::vector<si64Matrix> fk_slot_valid_shared;
+    si64Matrix fk_overflow_shared;
+    if (provider_pre_shared) {
+        const std::string sample_role_root = config.provider_sample_share_root + "/role_" + std::to_string(config.role);
+        marker_valid_shared = read_share_pair_matrix(sample_role_root + "/marker_valid.shares.bin", marker_total);
+        marker_key_shared = read_share_pair_matrix(sample_role_root + "/marker_key.shares.bin", marker_total);
+        marker_model_slot_shared = read_share_pair_matrix(sample_role_root + "/marker_model_slot.shares.bin", marker_total);
+        marker_overflow_shared = read_share_pair_matrix(sample_role_root + "/marker_overflow.shares.bin", marker_total);
+    } else {
+        secure_share_i64_column(config.role, config.pk_input_party, plain.marker_valid, marker_valid_shared, enc, runtime);
+        secure_share_i64_column(config.role, config.pk_input_party, plain.marker_key, marker_key_shared, enc, runtime);
+        secure_share_i64_column(config.role, config.pk_input_party, plain.marker_model_slot, marker_model_slot_shared, enc, runtime);
+        secure_share_i64_column(config.role, config.pk_input_party, plain.marker_overflow, marker_overflow_shared, enc, runtime);
+    }
+    const bool reorder_only = cap_reorder && sample_marker_reorder_only_enabled();
+    const bool dense_payload = fixed_dictionary_dense_counts_enabled();
+    if (provider_pre_shared) {
+        const std::string fk_role_root = config.provider_fk_share_root + "/role_" + std::to_string(config.role);
+        fk_dictionary_shared = read_share_pair_matrix(
+            fk_role_root + "/dictionary.shares.bin",
+            config.conditional_public_cap_L);
+    } else if (dense_payload && dictionary_pre_shared) {
+        const std::string dictionary_share_path = role_format_path(dictionary_share_path_env, config.role);
+        fk_dictionary_shared = read_share_pair_matrix(dictionary_share_path, config.conditional_public_cap_L);
+    } else if (dense_payload) {
+        secure_share_i64_column(config.role, config.fk_input_party, plain.fk_dictionary, fk_dictionary_shared, enc, runtime);
+    } else {
+        fk_dictionary_shared = shared_zero_int_matrix(config.conditional_public_cap_L, 1);
+    }
+    if (!reorder_only) {
+        if (provider_pre_shared) {
+            const std::string fk_role_root = config.provider_fk_share_root + "/role_" + std::to_string(config.role);
+            fk_valid_shared = read_share_pair_matrix(fk_role_root + "/fk_valid.shares.bin", fk_total);
+            fk_key_shared = read_share_pair_matrix(fk_role_root + "/fk_key.shares.bin", fk_total);
+            fk_multiplicity_shared = read_share_pair_matrix(fk_role_root + "/fk_multiplicity.shares.bin", fk_total);
+            fk_overflow_shared = read_share_pair_matrix(fk_role_root + "/fk_overflow.shares.bin", fk_total);
+            if (!dense_payload) {
+                throw std::runtime_error("Provider pre-shared inputs currently require fixed dictionary dense counts.");
+            }
+            const auto flat_counts = read_share_pair_matrix(
+                fk_role_root + "/fk_dense_count_row_major.shares.bin",
+                fk_total * config.conditional_public_cap_L);
+            fk_slot_count_shared = split_row_major_share_columns(
+                flat_counts,
+                fk_total,
+                config.conditional_public_cap_L);
+            fk_slot_category_shared.resize(static_cast<std::size_t>(config.conditional_public_cap_L));
+            fk_slot_valid_shared.resize(static_cast<std::size_t>(config.conditional_public_cap_L));
+        } else {
+            secure_share_i64_column(config.role, config.fk_input_party, plain.fk_valid, fk_valid_shared, enc, runtime);
+            secure_share_i64_column(config.role, config.fk_input_party, plain.fk_key, fk_key_shared, enc, runtime);
+            secure_share_i64_column(config.role, config.fk_input_party, plain.fk_multiplicity, fk_multiplicity_shared, enc, runtime);
+            for (u64 slot = 0; slot < config.conditional_public_cap_L; ++slot) {
+                si64Matrix category;
+                si64Matrix count;
+                si64Matrix valid;
+                if (!dense_payload) {
+                    secure_share_i64_column(config.role, config.fk_input_party, plain.fk_slot_category[static_cast<std::size_t>(slot)], category, enc, runtime);
+                }
+                secure_share_i64_column(config.role, config.fk_input_party, plain.fk_slot_count[static_cast<std::size_t>(slot)], count, enc, runtime);
+                if (!dense_payload) {
+                    secure_share_i64_column(config.role, config.fk_input_party, plain.fk_slot_valid[static_cast<std::size_t>(slot)], valid, enc, runtime);
+                }
+                fk_slot_category_shared.push_back(std::move(category));
+                fk_slot_count_shared.push_back(std::move(count));
+                fk_slot_valid_shared.push_back(std::move(valid));
+            }
+            secure_share_i64_column(config.role, config.fk_input_party, plain.fk_overflow, fk_overflow_shared, enc, runtime);
+        }
+    }
+    const double input_share_seconds = elapsed_seconds_since(share_started);
+
+    SampleMarkerRunStats stats;
+    stats.partition_count = static_cast<u64>(marker_capacities.size());
+    stats.sample_rows = sample_rows;
+    stats.marker_capacity_per_partition = marker_cap;
+    stats.marker_capacity_total = sum_u64(marker_capacities);
+    stats.fk_capacity_total = sum_u64(fk_capacities);
+    ConditionalMergeResult conditional_result;
+    if (reorder_only) {
+        conditional_result.counts = shared_zero_int_matrix(marker_total, 1);
+        conditional_result.overflow = marker_overflow_shared;
+        conditional_result.marker_valid = marker_valid_shared;
+        conditional_result.model_slot = marker_model_slot_shared;
+        conditional_result.dictionary = fk_dictionary_shared;
+        conditional_result.slot_category.assign(
+            static_cast<std::size_t>(config.conditional_public_cap_L),
+            shared_zero_int_matrix(marker_total, 1));
+        conditional_result.slot_count.assign(
+            static_cast<std::size_t>(config.conditional_public_cap_L),
+            shared_zero_int_matrix(marker_total, 1));
+        conditional_result.slot_valid.assign(
+            static_cast<std::size_t>(config.conditional_public_cap_L),
+            shared_zero_int_matrix(marker_total, 1));
+    } else {
+        conditional_result = sample_marker_stored_reverse_merge(
+            config,
+            marker_capacities,
+            fk_capacities,
+            sample_rows,
+            marker_valid_shared,
+            marker_key_shared,
+            marker_model_slot_shared,
+            marker_overflow_shared,
+            fk_valid_shared,
+            fk_key_shared,
+            fk_multiplicity_shared,
+            fk_dictionary_shared,
+            fk_slot_category_shared,
+            fk_slot_count_shared,
+            fk_slot_valid_shared,
+            fk_overflow_shared,
+            enc,
+            eval,
+            runtime,
+            stats);
+    }
+    if (cap_reorder) {
+        conditional_result = sample_marker_global_reorder(
+            config,
+            conditional_result,
+            sample_rows,
+            enc,
+            eval,
+            runtime,
+            stats);
+    }
+
+    const auto serialize_started = SteadyClock::now();
+    const i64 fixed_scale = static_cast<i64>(std::llround(
+        static_cast<double>(kMultiplierFixedOne) / config.fk_sample_rate));
+    si64Matrix mu_fixed(sample_rows, 1);
+    mu_fixed.mShares[0].setZero();
+    mu_fixed.mShares[1].setZero();
+    for (u64 row = 0; row < sample_rows; ++row) {
+        mu_fixed.mShares[0](row, 0) = conditional_result.counts.mShares[0](row, 0) * fixed_scale;
+        mu_fixed.mShares[1](row, 0) = conditional_result.counts.mShares[1](row, 0) * fixed_scale;
+    }
+    auto zero_counts = shared_zero_int_matrix(sample_rows, 1);
+    sbMatrix is_zero_count;
+    cipher_eq(config.role, conditional_result.counts, zero_counts, is_zero_count, eval, runtime);
+    const auto one_scalar = share_int_scalar(kMultiplierFixedOne, 0, enc, runtime, config.role);
+    const auto one_rows = repeat_int_scalar_rows(one_scalar, sample_rows);
+    si64Matrix mu_nn_fixed = select_si64_by_bool(
+        one_rows,
+        mu_fixed,
+        is_zero_count,
+        config.role,
+        enc,
+        eval,
+        runtime);
+
+    ensure_dir(config.output_prefix);
+    const std::string role_dir = config.output_prefix + "/role_" + std::to_string(config.role);
+    ensure_dir(role_dir);
+    write_share_pair_matrix(role_dir + "/mu.shares.bin", mu_fixed);
+    write_share_pair_matrix(role_dir + "/mu_nn.shares.bin", mu_nn_fixed);
+    write_sample_marker_conditional_payload_role_files(config, conditional_result, config.output_prefix);
+    const double serialize_seconds = elapsed_seconds_since(serialize_started);
+    multiplier_public_barrier(config.role, runtime);
+    if (config.role == 0 && !secure_multiplier_defer_global_manifest_enabled()) {
+        write_secure_shared_values_manifest(
+            config,
+            static_cast<std::size_t>(sample_rows),
+            static_cast<std::size_t>(stats.fk_capacity_total),
+            config.output_prefix);
+        write_sample_marker_manifest(config, config.output_prefix, stats);
+    }
+    multiplier_public_barrier(config.role, runtime);
+
+    const auto next_sent = runtime.mComm.mNext.getTotalDataSent();
+    const auto prev_sent = runtime.mComm.mPrev.getTotalDataSent();
+    const auto next_recv = runtime.mComm.mNext.getTotalDataRecv();
+    const auto prev_recv = runtime.mComm.mPrev.getTotalDataRecv();
+    const auto protocol_ended = SteadyClock::now();
+    const std::string protocol_end_utc = utc_now_iso8601();
+    const std::string process_end_utc = protocol_end_utc;
+    std::cout
+        << "{"
+        << "\"mode\":\"bspn_multiplier_preprocess\","
+        << "\"multiplier_mode\":\"secure_shared_values\","
+        << "\"conditional_multiplier_mode\":\"" << json_escape(config.conditional_multiplier_mode) << "\","
+        << "\"conditional_payload_mode\":\"" << json_escape(conditional_payload_mode()) << "\","
+        << "\"privacy_profile\":\"query_private_public_anonymous_uniform_sample_v1\","
+        << "\"process_start_utc\":\"" << json_escape(process_start_utc) << "\","
+        << "\"process_end_utc\":\"" << json_escape(process_end_utc) << "\","
+        << "\"protocol_start_utc\":\"" << json_escape(protocol_start_utc) << "\","
+        << "\"protocol_end_utc\":\"" << json_escape(protocol_end_utc) << "\","
+        << "\"role\":" << config.role << ","
+        << "\"provider_pre_shared_input\":" << (provider_pre_shared ? "true" : "false") << ","
+        << "\"sample_marker_reorder_only\":" << (reorder_only ? "true" : "false") << ","
+        << "\"sample_rows\":" << sample_rows << ","
+        << "\"real_pk_marker_rows\":" << sample_rows << ","
+        << "\"partition_count\":" << stats.partition_count << ","
+        << "\"marker_capacity_per_partition\":" << stats.marker_capacity_per_partition << ","
+        << "\"marker_capacity_total\":" << stats.marker_capacity_total << ","
+        << "\"fk_capacity_total\":" << stats.fk_capacity_total << ","
+        << "\"padded_combined_rows_total\":" << stats.padded_combined_rows_total << ","
+        << "\"forward_secret_comparison_sort_count\":" << stats.forward_secret_comparison_sort_count << ","
+        << "\"stored_swap_reverse_replay_count\":" << stats.stored_swap_reverse_replay_count << ","
+        << "\"second_secret_comparison_sort_count\":" << stats.second_secret_comparison_sort_count << ","
+        << "\"legacy_second_full_sort_count\":" << stats.second_secret_comparison_sort_count << ","
+        << "\"sample_only_global_reorder_sort_count\":" << stats.sample_only_global_reorder_sort_count << ","
+        << "\"forward_comparators\":" << stats.forward_comparators << ","
+        << "\"forward_layers\":" << stats.forward_layers << ","
+        << "\"reverse_swaps\":" << stats.reverse_swaps << ","
+        << "\"reverse_layers\":" << stats.reverse_layers << ","
+        << "\"sample_only_global_reorder_rows\":" << stats.sample_only_global_reorder_rows << ","
+        << "\"sample_only_global_reorder_padded_rows\":" << stats.sample_only_global_reorder_padded_rows << ","
+        << "\"sample_only_global_reorder_comparators\":" << stats.sample_only_global_reorder_comparators << ","
+        << "\"sample_only_global_reorder_layers\":" << stats.sample_only_global_reorder_layers << ","
+        << "\"phase_input_load_seconds\":" << input_load_seconds << ","
+        << "\"phase_input_share_seconds\":" << input_share_seconds << ","
+        << "\"phase_forward_sort_seconds\":" << stats.forward_seconds << ","
+        << "\"phase_segmented_scan_seconds\":" << stats.segmented_scan_seconds << ","
+        << "\"phase_marker_select_seconds\":" << stats.marker_select_seconds << ","
+        << "\"phase_stored_reverse_seconds\":" << stats.stored_reverse_seconds << ","
+        << "\"phase_sample_only_global_reorder_seconds\":" << stats.sample_only_global_reorder_seconds << ","
+        << "\"phase_integrity_gate_seconds\":" << stats.integrity_gate_seconds << ","
+        << "\"phase_serialize_seconds\":" << serialize_seconds << ","
+        << "\"counter_source\":\"cryptoTools::Channel\","
+        << "\"bytes_sent_next\":" << next_sent << ","
+        << "\"bytes_sent_prev\":" << prev_sent << ","
+        << "\"bytes_sent_total\":" << (next_sent + prev_sent) << ","
+        << "\"bytes_received_next\":" << next_recv << ","
+        << "\"bytes_received_prev\":" << prev_recv << ","
+        << "\"bytes_received_total\":" << (next_recv + prev_recv) << ","
+        << "\"peak_rss_bytes\":" << multiplier_peak_rss_bytes() << ","
+        << "\"protocol_wall_seconds\":" << std::setprecision(17) << std::chrono::duration<double>(protocol_ended - protocol_started).count() << ","
+        << "\"startup_connect_wall_seconds\":" << std::setprecision(17) << std::chrono::duration<double>(protocol_started - started).count() << ","
+        << "\"wall_seconds\":" << std::setprecision(17) << elapsed_seconds_since(started) << ","
+        << "\"plaintext_fallback_used\":false,"
+        << "\"reveal_count\":0,"
+        << "\"open_count\":0"
+        << "}" << std::endl;
 }
 
 si64Matrix provider_separated_partitioned_oblivious_merge_counts(
@@ -3241,6 +5484,10 @@ si64Matrix provider_separated_sorted_counts(
 
 void run_secure_multiplier_shared_values_fast(const MultiplierPreprocessConfig& config)
 {
+    if (conditional_multiplier_fixed_payload_enabled(config)) {
+        throw std::runtime_error(
+            "fixed_parent_payload_v1 requires MPC provider-separated partitioned provider-local FK group/count preprocessing.");
+    }
     if (config.role < 0 || config.role > 2) {
         throw std::runtime_error("secure_shared_values mode requires --role in {0,1,2}.");
     }
@@ -3257,6 +5504,11 @@ void run_secure_multiplier_shared_values_fast(const MultiplierPreprocessConfig& 
     const bool provider_local_fk_group_count = secure_multiplier_provider_local_fk_group_count_enabled();
     if (provider_local_fk_group_count && !partitioned) {
         throw std::runtime_error("Provider-local FK group/count requires partitioned provider-separated preprocessing.");
+    }
+    const bool conditional_payload = conditional_multiplier_fixed_payload_enabled(config);
+    if (conditional_payload && (!partitioned || !provider_local_fk_group_count)) {
+        throw std::runtime_error(
+            "fixed_parent_payload_v1 requires partitioned provider-local FK group/count preprocessing.");
     }
 
     const auto pk_keys = load_key_column_csv(config.pk_csv_path, config.pk_key_column, config.pk_has_header);
@@ -3304,6 +5556,10 @@ void run_secure_multiplier_shared_values_fast(const MultiplierPreprocessConfig& 
 
 void run_secure_multiplier_shared_values_provider_separated_streaming(const MultiplierPreprocessConfig& config)
 {
+    if (conditional_multiplier_fixed_payload_enabled(config)) {
+        throw std::runtime_error(
+            "fixed_parent_payload_v1 streaming writer is not enabled in this small-edge vertical slice.");
+    }
     if (config.role < 0 || config.role > 2) {
         throw std::runtime_error("secure_shared_values mode requires --role in {0,1,2}.");
     }
@@ -3321,7 +5577,7 @@ void run_secure_multiplier_shared_values_provider_separated_streaming(const Mult
         throw std::runtime_error("FK sample rate must be positive.");
     }
 
-    IOService ios;
+    IOService ios(config.comm_threads);
     Sh3Encryptor enc;
     Sh3Evaluator eval;
     Sh3Runtime runtime;
@@ -3529,7 +5785,7 @@ void run_secure_multiplier_shared_values_provider_separated_streaming(const Mult
     maybe_fail_streaming_writer("after_role_publish");
     multiplier_public_barrier(config.role, runtime);
 
-    if (config.role == 0) {
+    if (config.role == 0 && !secure_multiplier_defer_global_manifest_enabled()) {
         std::vector<StreamingPartitionMeta> metas;
         metas.reserve(static_cast<std::size_t>(partitions));
         for (u64 part = 0; part < partitions; ++part) {
@@ -3561,12 +5817,17 @@ void run_secure_multiplier_shared_values_provider_separated_streaming(const Mult
         if (std::remove(incomplete_path.c_str()) != 0) {
             throw std::runtime_error("Failed to remove INCOMPLETE marker: " + std::string(std::strerror(errno)));
         }
+    } else if (config.role == 0) {
+        if (std::remove(incomplete_path.c_str()) != 0 && errno != ENOENT) {
+            throw std::runtime_error("Failed to remove INCOMPLETE marker: " + std::string(std::strerror(errno)));
+        }
     }
     multiplier_public_barrier(config.role, runtime);
 }
 
 void run_secure_multiplier_shared_values_provider_separated(const MultiplierPreprocessConfig& config)
 {
+    const auto started = SteadyClock::now();
     if (config.role < 0 || config.role > 2) {
         throw std::runtime_error("secure_shared_values mode requires --role in {0,1,2}.");
     }
@@ -3588,8 +5849,13 @@ void run_secure_multiplier_shared_values_provider_separated(const MultiplierPrep
     if (provider_local_fk_group_count && !partitioned) {
         throw std::runtime_error("Provider-local FK group/count requires partitioned provider-separated preprocessing.");
     }
+    const bool conditional_payload = conditional_multiplier_fixed_payload_enabled(config);
+    if (conditional_payload && (!partitioned || !provider_local_fk_group_count)) {
+        throw std::runtime_error(
+            "fixed_parent_payload_v1 requires partitioned provider-local FK group/count preprocessing.");
+    }
 
-    IOService ios;
+    IOService ios(config.comm_threads);
     Sh3Encryptor enc;
     Sh3Evaluator eval;
     Sh3Runtime runtime;
@@ -3597,6 +5863,7 @@ void run_secure_multiplier_shared_values_provider_separated(const MultiplierPrep
 
     std::vector<NormalizedKey> pk_keys;
     std::vector<NormalizedKey> fk_keys;
+    std::vector<NormalizedKey> fk_conditional_values;
     u64 n_pk = 0;
     u64 n_fk = 0;
 
@@ -3606,6 +5873,13 @@ void run_secure_multiplier_shared_values_provider_separated(const MultiplierPrep
     }
     if (config.role == config.fk_input_party) {
         fk_keys = load_key_column_csv(config.fk_csv_path, config.fk_key_column, config.fk_has_header);
+        if (conditional_payload) {
+            fk_conditional_values = load_value_column_csv(
+                config.fk_csv_path,
+                config.fk_key_column,
+                config.conditional_value_column,
+                config.fk_has_header);
+        }
         n_fk = static_cast<u64>(fk_keys.size());
     }
 
@@ -3625,6 +5899,10 @@ void run_secure_multiplier_shared_values_provider_separated(const MultiplierPrep
     i64Matrix plain_fk_is_null(fk_share_rows, 1);
     i64Matrix plain_fk_original_index(fk_share_rows, 1);
     i64Matrix plain_fk_multiplicity(fk_share_rows, 1);
+    std::vector<i64Matrix> plain_fk_slot_category;
+    std::vector<i64Matrix> plain_fk_slot_count;
+    std::vector<i64Matrix> plain_fk_slot_valid;
+    i64Matrix plain_fk_conditional_overflow(fk_share_rows, 1);
     plain_pk_key.setZero();
     plain_pk_is_null.setConstant(1);
     plain_pk_original_index.setZero();
@@ -3632,6 +5910,23 @@ void run_secure_multiplier_shared_values_provider_separated(const MultiplierPrep
     plain_fk_is_null.setConstant(1);
     plain_fk_original_index.setZero();
     plain_fk_multiplicity.setConstant(1);
+    plain_fk_conditional_overflow.setZero();
+    if (conditional_payload) {
+        plain_fk_slot_category.assign(
+            static_cast<std::size_t>(config.conditional_public_cap_L),
+            i64Matrix(fk_share_rows, 1));
+        plain_fk_slot_count.assign(
+            static_cast<std::size_t>(config.conditional_public_cap_L),
+            i64Matrix(fk_share_rows, 1));
+        plain_fk_slot_valid.assign(
+            static_cast<std::size_t>(config.conditional_public_cap_L),
+            i64Matrix(fk_share_rows, 1));
+        for (u64 slot = 0; slot < config.conditional_public_cap_L; ++slot) {
+            plain_fk_slot_category[static_cast<std::size_t>(slot)].setZero();
+            plain_fk_slot_count[static_cast<std::size_t>(slot)].setZero();
+            plain_fk_slot_valid[static_cast<std::size_t>(slot)].setZero();
+        }
+    }
 
     if (config.role == config.pk_input_party) {
         if (static_cast<u64>(pk_keys.size()) != n_pk) {
@@ -3666,11 +5961,19 @@ void run_secure_multiplier_shared_values_provider_separated(const MultiplierPrep
         bool overflow = false;
         const auto rows = partitioned
             ? (provider_local_fk_group_count
-                ? provider_local_partitioned_fk_group_rows(
-                    fk_keys,
-                    partition_contract,
-                    partition_contract.fk_capacities,
-                    overflow)
+                ? (conditional_payload
+                    ? provider_local_partitioned_fk_conditional_group_rows(
+                        fk_keys,
+                        fk_conditional_values,
+                        partition_contract,
+                        partition_contract.fk_capacities,
+                        config.conditional_public_cap_L,
+                        overflow)
+                    : provider_local_partitioned_fk_group_rows(
+                        fk_keys,
+                        partition_contract,
+                        partition_contract.fk_capacities,
+                        overflow))
                 : provider_local_partitioned_rows(
                     fk_keys,
                     partition_contract,
@@ -3689,6 +5992,15 @@ void run_secure_multiplier_shared_values_provider_separated(const MultiplierPrep
             plain_fk_original_index(row, 0) = static_cast<i64>(local_row.original_index);
             plain_fk_multiplicity(row, 0) = local_row.multiplicity;
         }
+        if (conditional_payload) {
+            populate_plain_conditional_rows(
+                rows,
+                config.conditional_public_cap_L,
+                plain_fk_slot_category,
+                plain_fk_slot_count,
+                plain_fk_slot_valid,
+                plain_fk_conditional_overflow);
+        }
     }
 
     if (partitioned) {
@@ -3706,6 +6018,10 @@ void run_secure_multiplier_shared_values_provider_separated(const MultiplierPrep
     si64Matrix fk_null_shared;
     si64Matrix fk_original_index_shared;
     si64Matrix fk_multiplicity_shared;
+    std::vector<si64Matrix> fk_slot_category_shared;
+    std::vector<si64Matrix> fk_slot_count_shared;
+    std::vector<si64Matrix> fk_slot_valid_shared;
+    si64Matrix fk_conditional_overflow_shared;
     secure_share_i64_column(config.role, config.pk_input_party, plain_pk_key, pk_key_shared, enc, runtime);
     secure_share_i64_column(config.role, config.pk_input_party, plain_pk_is_null, pk_null_shared, enc, runtime);
     secure_share_i64_column(config.role, config.pk_input_party, plain_pk_original_index, pk_original_index_shared, enc, runtime);
@@ -3713,12 +6029,72 @@ void run_secure_multiplier_shared_values_provider_separated(const MultiplierPrep
     secure_share_i64_column(config.role, config.fk_input_party, plain_fk_is_null, fk_null_shared, enc, runtime);
     secure_share_i64_column(config.role, config.fk_input_party, plain_fk_original_index, fk_original_index_shared, enc, runtime);
     secure_share_i64_column(config.role, config.fk_input_party, plain_fk_multiplicity, fk_multiplicity_shared, enc, runtime);
+    if (conditional_payload) {
+        for (u64 slot = 0; slot < config.conditional_public_cap_L; ++slot) {
+            si64Matrix category_shared;
+            si64Matrix count_shared;
+            si64Matrix valid_shared;
+            secure_share_i64_column(
+                config.role,
+                config.fk_input_party,
+                plain_fk_slot_category[static_cast<std::size_t>(slot)],
+                category_shared,
+                enc,
+                runtime);
+            secure_share_i64_column(
+                config.role,
+                config.fk_input_party,
+                plain_fk_slot_count[static_cast<std::size_t>(slot)],
+                count_shared,
+                enc,
+                runtime);
+            secure_share_i64_column(
+                config.role,
+                config.fk_input_party,
+                plain_fk_slot_valid[static_cast<std::size_t>(slot)],
+                valid_shared,
+                enc,
+                runtime);
+            fk_slot_category_shared.push_back(std::move(category_shared));
+            fk_slot_count_shared.push_back(std::move(count_shared));
+            fk_slot_valid_shared.push_back(std::move(valid_shared));
+        }
+        secure_share_i64_column(
+            config.role,
+            config.fk_input_party,
+            plain_fk_conditional_overflow,
+            fk_conditional_overflow_shared,
+            enc,
+            runtime);
+    }
 
     si64Matrix counts(n_pk, 1);
     counts.mShares[0].setZero();
     counts.mShares[1].setZero();
+    ConditionalMergeResult conditional_result;
 
-    if (partitioned) {
+    if (partitioned && conditional_payload) {
+        conditional_result = provider_separated_partitioned_oblivious_merge_counts_with_conditional(
+            config,
+            partition_contract,
+            pk_key_shared,
+            pk_null_shared,
+            pk_original_index_shared,
+            fk_key_shared,
+            fk_null_shared,
+            fk_original_index_shared,
+            fk_multiplicity_shared,
+            fk_slot_category_shared,
+            fk_slot_count_shared,
+            fk_slot_valid_shared,
+            fk_conditional_overflow_shared,
+            enc,
+            eval,
+            runtime);
+        counts = conditional_result.counts;
+        n_pk = pk_share_rows;
+        n_fk = fk_share_rows;
+    } else if (partitioned) {
         counts = provider_separated_partitioned_oblivious_merge_counts(
             config,
             partition_contract,
@@ -3779,46 +6155,90 @@ void run_secure_multiplier_shared_values_provider_separated(const MultiplierPrep
         }
     }
 
-    const i64 fixed_scale = static_cast<i64>(std::llround(
-        static_cast<double>(kMultiplierFixedOne) / config.fk_sample_rate));
-    si64Matrix mu_fixed(n_pk, 1);
-    mu_fixed.mShares[0].setZero();
-    mu_fixed.mShares[1].setZero();
-    for (u64 row = 0; row < n_pk; ++row) {
-        mu_fixed.mShares[0](row, 0) = counts.mShares[0](row, 0) * fixed_scale;
-        mu_fixed.mShares[1](row, 0) = counts.mShares[1](row, 0) * fixed_scale;
-    }
-
-    auto zero_counts = shared_zero_int_matrix(n_pk, 1);
-    sbMatrix is_zero_count;
-    cipher_eq(config.role, counts, zero_counts, is_zero_count, eval, runtime);
-    const auto one_scalar = share_int_scalar(kMultiplierFixedOne, 0, enc, runtime, config.role);
-    const auto one_rows = repeat_int_scalar_rows(one_scalar, n_pk);
-    si64Matrix mu_nn_fixed = select_si64_by_bool(
-        one_rows,
-        mu_fixed,
-        is_zero_count,
-        config.role,
-        enc,
-        eval,
-        runtime);
-
     ensure_dir(config.output_prefix);
-    const std::string role_dir = config.output_prefix + "/role_" + std::to_string(config.role);
-    ensure_dir(role_dir);
-    write_share_pair_matrix(role_dir + "/mu.shares.bin", mu_fixed);
-    write_share_pair_matrix(role_dir + "/mu_nn.shares.bin", mu_nn_fixed);
-    if (config.role == 0) {
+    if (!config.conditional_sidecar_only) {
+        const i64 fixed_scale = static_cast<i64>(std::llround(
+            static_cast<double>(kMultiplierFixedOne) / config.fk_sample_rate));
+        si64Matrix mu_fixed(n_pk, 1);
+        mu_fixed.mShares[0].setZero();
+        mu_fixed.mShares[1].setZero();
+        for (u64 row = 0; row < n_pk; ++row) {
+            mu_fixed.mShares[0](row, 0) = counts.mShares[0](row, 0) * fixed_scale;
+            mu_fixed.mShares[1](row, 0) = counts.mShares[1](row, 0) * fixed_scale;
+        }
+
+        auto zero_counts = shared_zero_int_matrix(n_pk, 1);
+        sbMatrix is_zero_count;
+        cipher_eq(config.role, counts, zero_counts, is_zero_count, eval, runtime);
+        const auto one_scalar = share_int_scalar(kMultiplierFixedOne, 0, enc, runtime, config.role);
+        const auto one_rows = repeat_int_scalar_rows(one_scalar, n_pk);
+        si64Matrix mu_nn_fixed = select_si64_by_bool(
+            one_rows,
+            mu_fixed,
+            is_zero_count,
+            config.role,
+            enc,
+            eval,
+            runtime);
+
+        const std::string role_dir = config.output_prefix + "/role_" + std::to_string(config.role);
+        ensure_dir(role_dir);
+        write_share_pair_matrix(role_dir + "/mu.shares.bin", mu_fixed);
+        write_share_pair_matrix(role_dir + "/mu_nn.shares.bin", mu_nn_fixed);
+    }
+    if (conditional_payload) {
+        write_conditional_payload_role_files(config, conditional_result, config.output_prefix);
+        multiplier_public_barrier(config.role, runtime);
+        if (config.role == 0 && !secure_multiplier_defer_global_manifest_enabled()) {
+            write_conditional_payload_manifest(config, config.output_prefix, n_pk);
+        }
+        multiplier_public_barrier(config.role, runtime);
+    }
+    if (config.role == 0 && !config.conditional_sidecar_only) {
         write_secure_shared_values_manifest(
             config,
             static_cast<std::size_t>(n_pk),
             static_cast<std::size_t>(n_fk),
             config.output_prefix);
     }
+    const auto next_sent = runtime.mComm.mNext.getTotalDataSent();
+    const auto prev_sent = runtime.mComm.mPrev.getTotalDataSent();
+    const auto next_recv = runtime.mComm.mNext.getTotalDataRecv();
+    const auto prev_recv = runtime.mComm.mPrev.getTotalDataRecv();
+    std::cout
+        << "{"
+        << "\"mode\":\"bspn_multiplier_preprocess\","
+        << "\"multiplier_mode\":\"secure_shared_values\","
+        << "\"conditional_multiplier_mode\":\"" << json_escape(config.conditional_multiplier_mode) << "\","
+        << "\"conditional_sidecar_only\":" << (config.conditional_sidecar_only ? "true" : "false") << ","
+        << "\"role\":" << config.role << ","
+        << "\"counter_source\":\"cryptoTools::Channel\","
+        << "\"bytes_sent_next\":" << next_sent << ","
+        << "\"bytes_sent_prev\":" << prev_sent << ","
+        << "\"bytes_sent_total\":" << (next_sent + prev_sent) << ","
+        << "\"bytes_received_next\":" << next_recv << ","
+        << "\"bytes_received_prev\":" << prev_recv << ","
+        << "\"bytes_received_total\":" << (next_recv + prev_recv) << ","
+        << "\"wall_seconds\":" << std::setprecision(17) << elapsed_seconds_since(started) << ","
+        << "\"plaintext_fallback_used\":false,"
+        << "\"reveal_count\":0,"
+        << "\"open_count\":0"
+        << "}" << std::endl;
 }
 
 void run_secure_multiplier_shared_values(const MultiplierPreprocessConfig& config)
 {
+    if (conditional_multiplier_sample_marker_stored_reverse_enabled(config)) {
+        run_secure_multiplier_sample_marker_stored_reverse(config);
+        return;
+    }
+    if (config.conditional_sidecar_only &&
+        (secure_multiplier_fast_preprocess_enabled() ||
+         !secure_multiplier_provider_separated_enabled() ||
+         secure_multiplier_streaming_artifact_enabled())) {
+        throw std::runtime_error(
+            "--conditional_sidecar_only requires the non-streaming provider-separated secure multiplier path.");
+    }
     if (secure_multiplier_fast_preprocess_enabled()) {
         run_secure_multiplier_shared_values_fast(config);
         return;
@@ -3845,7 +6265,7 @@ void run_secure_multiplier_shared_values(const MultiplierPreprocessConfig& confi
         throw std::runtime_error("FK sample rate must be positive.");
     }
 
-    IOService ios;
+    IOService ios(config.comm_threads);
     Sh3Encryptor enc;
     Sh3Evaluator eval;
     Sh3Runtime runtime;
@@ -5159,7 +7579,7 @@ void run_secure_leaf_materialize(const MultiplierPreprocessConfig& config)
     if (config.role < 0 || config.role > 2) {
         throw std::runtime_error("secure_leaf_materialize mode requires --role in {0,1,2}.");
     }
-    IOService ios;
+    IOService ios(config.comm_threads);
     Sh3Encryptor enc;
     Sh3Evaluator eval;
     Sh3Runtime runtime;

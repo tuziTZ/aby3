@@ -7,6 +7,7 @@
 #include "aby3-BSPN/MultiplierPreprocessing.h"
 #include "m2_fixed_block_eval.h"
 #include "m2_fixed_block_materialize.h"
+#include "m2_conditional_multiplier_eval.h"
 
 using namespace oc;
 using namespace aby3;
@@ -24,12 +25,21 @@ int main(int argc, char** argv) {
     return 0;
   }
 
+  if(cmd.isSet("bspn_mask_selftest")){
+    BSPN_mask_selftest(cmd);
+    return 0;
+  }
+
   if(cmd.isSet("m2_fixed_block_eval")){
     return M2_fixed_block_eval(cmd);
   }
 
   if(cmd.isSet("m2_fixed_block_materialize")){
     return M2_fixed_block_materialize(cmd);
+  }
+
+  if(cmd.isSet("m2_conditional_multiplier_eval")){
+    return M2_conditional_multiplier_eval(cmd);
   }
 
   if(cmd.isSet("privGraph")){

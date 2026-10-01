@@ -33,6 +33,10 @@ constexpr const char kShareMagic[16] = {
 constexpr std::uint32_t kSchemaVersion = 1;
 constexpr std::uint32_t kShareSchemaVersion = 2;
 constexpr std::uint32_t kAnchorPredicateEdge = std::numeric_limits<std::uint32_t>::max();
+constexpr i64 kFixedOneD16 = static_cast<i64>(1) << 16;
+constexpr const char* kConditionalDenseMode = "sample_marker_partition_cap_reorder_v1";
+constexpr const char* kConditionalDensePayloadMode = "fixed_dictionary_dense_counts_v1";
+constexpr const char* kConditionalSidecarName = "conditional_multiplier_sample_marker_partition_cap_reorder_v1";
 
 struct Header {
     char magic[16];
@@ -88,11 +92,25 @@ struct SecurePredicate {
     std::int64_t basis_share1;
 };
 
+struct ConditionalEdge {
+    std::uint32_t edge_index;
+    std::string edge_id;
+    std::string column_id;
+    std::uint32_t public_cap_l;
+    std::string scalar_artifact_dir;
+    std::string conditional_manifest_json;
+    std::int64_t literal_share0;
+    std::int64_t literal_share1;
+    std::int64_t use_cm_share0;
+    std::int64_t use_cm_share1;
+};
+
 struct SecureQuery {
     std::string query_id;
     std::vector<std::uint32_t> required_edges;
     std::vector<SecurePredicate> predicates;
     std::vector<SecurePredicate> anchor_predicates;
+    std::vector<ConditionalEdge> conditional_edges;
     std::string anchor_mask_share_bin;
 };
 
@@ -137,6 +155,29 @@ json read_json_file(const std::string& path) {
     json value;
     in >> value;
     return value;
+}
+
+bool path_exists(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    return static_cast<bool>(in);
+}
+
+std::string dirname_of(const std::string& path) {
+    const auto pos = path.find_last_of("/\\");
+    if (pos == std::string::npos) {
+        return ".";
+    }
+    return path.substr(0, pos);
+}
+
+std::string join_path(const std::string& left, const std::string& right) {
+    if (left.empty() || left == ".") {
+        return right;
+    }
+    if (left.back() == '/') {
+        return left + right;
+    }
+    return left + "/" + right;
 }
 
 std::vector<unsigned char> read_binary(const std::string& path) {
@@ -415,6 +456,25 @@ SecureQuery load_secure_query_from_json(const json& q, std::uint32_t edge_count)
             query.anchor_predicates.push_back(pred);
         }
     }
+    if (q.contains("conditional_edges")) {
+        for (const auto& item : q.at("conditional_edges")) {
+            ConditionalEdge edge;
+            edge.edge_index = item.at("edge_index").get<std::uint32_t>();
+            require_bool(edge.edge_index < edge_count, "conditional edge references unknown edge");
+            edge.edge_id = item.at("edge_id").get<std::string>();
+            edge.column_id = item.at("column_id").get<std::string>();
+            edge.public_cap_l = item.at("public_cap_L").get<std::uint32_t>();
+            edge.scalar_artifact_dir = item.at("scalar_artifact_dir").get<std::string>();
+            edge.conditional_manifest_json = item.at("conditional_manifest_json").get<std::string>();
+            edge.literal_share0 = item.at("literal_share0").get<std::int64_t>();
+            edge.literal_share1 = item.at("literal_share1").get<std::int64_t>();
+            edge.use_cm_share0 = item.at("use_cm_share0").get<std::int64_t>();
+            edge.use_cm_share1 = item.at("use_cm_share1").get<std::int64_t>();
+            require_bool(!edge.scalar_artifact_dir.empty(), "conditional scalar artifact dir is empty");
+            require_bool(!edge.conditional_manifest_json.empty(), "conditional manifest path is empty");
+            query.conditional_edges.push_back(edge);
+        }
+    }
     require_bool(!query.anchor_mask_share_bin.empty() || !q.contains("anchor_mask_required"), "missing secure anchor mask share file");
     require_bool(q.value("anchor_mask_public", false) == false, "secure query must not expose anchor mask values");
     require_bool(q.value("legacy_evaluator_allowed", false) == false, "legacy evaluator must not be allowed");
@@ -484,12 +544,171 @@ si64Matrix load_share_pair_vector(const std::string& path, std::size_t rows) {
     return out;
 }
 
+std::size_t share_pair_rows(const std::string& path) {
+    const auto bytes = read_binary(path);
+    require_bool(bytes.size() % (sizeof(i64) * 2) == 0, "bad share-pair vector size: " + path);
+    return bytes.size() / (sizeof(i64) * 2);
+}
+
 si64Matrix bool_to_arith(sbMatrix value, int role, Sh3Encryptor& enc, Sh3Evaluator& eval, Sh3Runtime& runtime) {
     si64Matrix out(value.rows(), 1);
     out.mShares[0].setZero();
     out.mShares[1].setZero();
     bool2arith(role, value, out, enc, eval, runtime);
     return out;
+}
+
+si64Matrix repeat_secret_i64_pair(std::int64_t share0, std::int64_t share1, std::size_t rows) {
+    si64Matrix out(rows, 1);
+    for (std::size_t row = 0; row < rows; ++row) {
+        out.mShares[0](static_cast<u64>(row), 0) = share0;
+        out.mShares[1](static_cast<u64>(row), 0) = share1;
+    }
+    return out;
+}
+
+si64Matrix multiply_i64(
+    const si64Matrix& lhs,
+    const si64Matrix& rhs,
+    int role,
+    Sh3Encryptor& enc,
+    Sh3Evaluator& eval,
+    Sh3Runtime& runtime) {
+    require_bool(lhs.rows() == rhs.rows(), "i64 multiply row mismatch");
+    si64Matrix out(lhs.rows(), 1);
+    out.mShares[0].setZero();
+    out.mShares[1].setZero();
+    cipher_mul(role, lhs, rhs, out, eval, enc, runtime);
+    return out;
+}
+
+si64Matrix multiply_fixed_d16(const si64Matrix& lhs, const si64Matrix& rhs, Sh3Evaluator& eval, Sh3Runtime& runtime) {
+    require_bool(lhs.rows() == rhs.rows(), "D16 multiply row mismatch");
+    sf64Matrix<D16> left(lhs.rows(), 1);
+    sf64Matrix<D16> right(lhs.rows(), 1);
+    sf64Matrix<D16> product(lhs.rows(), 1);
+    left.i64Cast().mShares[0] = lhs.mShares[0];
+    left.i64Cast().mShares[1] = lhs.mShares[1];
+    right.i64Cast().mShares[0] = rhs.mShares[0];
+    right.i64Cast().mShares[1] = rhs.mShares[1];
+    eval.asyncMul(runtime, left, right, product).get();
+    si64Matrix out(lhs.rows(), 1);
+    out.mShares[0] = product.i64Cast().mShares[0];
+    out.mShares[1] = product.i64Cast().mShares[1];
+    return out;
+}
+
+void require_conditional_manifest(
+    const json& manifest,
+    const ConditionalEdge& edge,
+    std::size_t anchor_slots,
+    std::uint32_t fixed_decimal_bits) {
+    require_bool(manifest.value("target", std::string()) == "M2_CONDITIONAL_MULTIPLIER_SAMPLE_MARKER_PARTITION_CAP_REORDER_V1", "bad conditional target");
+    require_bool(manifest.value("schema_version", std::string()) == "M2CMSMALLREORDERDENSE01", "bad conditional schema");
+    require_bool(manifest.value("conditional_multiplier_mode", std::string()) == kConditionalDenseMode, "bad conditional mode");
+    require_bool(manifest.value("conditional_payload_mode", std::string()) == kConditionalDensePayloadMode, "bad conditional payload mode");
+    require_bool(manifest.value("edge_id", std::string()) == edge.edge_id, "conditional edge id mismatch");
+    require_bool(manifest.value("column_id", std::string()) == edge.column_id, "conditional column id mismatch");
+    require_bool(manifest.value("public_cap_L", std::uint32_t(0)) == edge.public_cap_l, "conditional L mismatch");
+    require_bool(manifest.value("sample_rows", std::uint64_t(0)) == static_cast<std::uint64_t>(anchor_slots), "conditional sample_rows mismatch");
+    require_bool(manifest.value("artifact_state", std::string()) == "complete", "conditional artifact is not complete");
+    require_bool(manifest.value("selected_overflow_authorized", false), "conditional overflow authorization missing");
+    require_bool(!manifest.value("contains_real_row_id", true), "conditional artifact exposes real row id");
+    require_bool(!manifest.value("contains_join_key", true), "conditional artifact exposes join key");
+    require_bool(!manifest.value("contains_dense_offset", true), "conditional artifact exposes dense offset");
+    require_bool(!manifest.value("contains_sample_row_id_by_position", true), "conditional artifact exposes sample row id by position");
+    if (manifest.contains("fixed_point")) {
+        const auto fp = manifest.at("fixed_point");
+        require_bool(fp.value("fixed_decimal_bits", static_cast<int>(fixed_decimal_bits)) == static_cast<int>(fixed_decimal_bits), "conditional fixed-point mismatch");
+    }
+}
+
+si64Matrix select_conditional_factor(
+    const ConditionalEdge& edge,
+    std::size_t anchor_slots,
+    std::uint32_t fixed_decimal_bits,
+    int role,
+    Sh3Encryptor& enc,
+    Sh3Evaluator& eval,
+    Sh3Runtime& runtime,
+    std::uint64_t& equality_count,
+    std::uint64_t& mux_count,
+    std::uint64_t& multiply_count,
+    std::uint64_t& conversion_count,
+    std::uint64_t& conditional_edge_count) {
+    require_bool(fixed_decimal_bits == 16, "conditional dense bridge currently requires D16 fixed point");
+    const auto manifest = read_json_file(edge.conditional_manifest_json);
+    require_conditional_manifest(manifest, edge, anchor_slots, fixed_decimal_bits);
+    const std::string sidecar_dir = dirname_of(edge.conditional_manifest_json);
+    require_bool(path_exists(join_path(sidecar_dir, "COMPLETE")), "conditional artifact missing COMPLETE marker");
+    const std::string role_dir = join_path(edge.scalar_artifact_dir, "role_" + std::to_string(role));
+    const std::string sidecar_role_dir = join_path(sidecar_dir, "role_" + std::to_string(role));
+    auto baseline_factor = load_share_pair_vector(join_path(role_dir, "mu.shares.bin"), anchor_slots);
+    auto dictionary = load_share_pair_vector(join_path(sidecar_role_dir, "dictionary.shares.bin"), edge.public_cap_l);
+    const std::size_t flat_rows = share_pair_rows(join_path(sidecar_role_dir, "dense_count.shares.bin"));
+    require_bool(flat_rows == anchor_slots * static_cast<std::size_t>(edge.public_cap_l), "conditional dense row count mismatch");
+    const auto dense_count = load_share_pair_vector(join_path(sidecar_role_dir, "dense_count.shares.bin"), flat_rows);
+    (void)load_share_pair_vector(join_path(sidecar_role_dir, "selected_overflow.shares.bin"), anchor_slots);
+    (void)load_share_pair_vector(join_path(sidecar_role_dir, "sample_order_integrity.shares.bin"), anchor_slots + 3);
+
+    auto literal_dict_vec = repeat_secret_i64_pair(edge.literal_share0, edge.literal_share1, edge.public_cap_l);
+    sbMatrix dict_eq;
+    cipher_eq(role, dictionary, literal_dict_vec, dict_eq, eval, runtime);
+    auto dict_match = bool_to_arith(dict_eq, role, enc, eval, runtime);
+    equality_count += edge.public_cap_l;
+    conversion_count += edge.public_cap_l;
+
+    si64Matrix conditional_count(anchor_slots, 1);
+    conditional_count.mShares[0].setZero();
+    conditional_count.mShares[1].setZero();
+    si64Matrix matched_any_scalar(1, 1);
+    matched_any_scalar.mShares[0].setZero();
+    matched_any_scalar.mShares[1].setZero();
+    for (std::uint32_t slot = 0; slot < edge.public_cap_l; ++slot) {
+        matched_any_scalar.mShares[0](0, 0) += dict_match.mShares[0](slot, 0);
+        matched_any_scalar.mShares[1](0, 0) += dict_match.mShares[1](slot, 0);
+        auto match_vec = repeat_secret_i64_pair(dict_match.mShares[0](slot, 0), dict_match.mShares[1](slot, 0), anchor_slots);
+        si64Matrix count(anchor_slots, 1);
+        for (std::size_t row = 0; row < anchor_slots; ++row) {
+            const auto src = static_cast<u64>(row * edge.public_cap_l + slot);
+            count.mShares[0](static_cast<u64>(row), 0) = dense_count.mShares[0](src, 0);
+            count.mShares[1](static_cast<u64>(row), 0) = dense_count.mShares[1](src, 0);
+        }
+        auto selected = multiply_i64(count, match_vec, role, enc, eval, runtime);
+        conditional_count.mShares[0] += selected.mShares[0];
+        conditional_count.mShares[1] += selected.mShares[1];
+        multiply_count += anchor_slots;
+    }
+    auto matched_any = repeat_secret_i64_pair(matched_any_scalar.mShares[0](0, 0), matched_any_scalar.mShares[1](0, 0), anchor_slots);
+    auto use_cm = repeat_secret_i64_pair(edge.use_cm_share0, edge.use_cm_share1, anchor_slots);
+    auto cm_selector = multiply_i64(use_cm, matched_any, role, enc, eval, runtime);
+    multiply_count += anchor_slots;
+
+    si64Matrix conditional_factor(anchor_slots, 1);
+    conditional_factor.mShares[0] = conditional_count.mShares[0] * kFixedOneD16;
+    conditional_factor.mShares[1] = conditional_count.mShares[1] * kFixedOneD16;
+    auto one_vec = share_public_i64_column(std::vector<i64>(anchor_slots, 1), role, enc, runtime);
+    si64Matrix not_use_cm(anchor_slots, 1);
+    not_use_cm.mShares[0] = one_vec.mShares[0] - cm_selector.mShares[0];
+    not_use_cm.mShares[1] = one_vec.mShares[1] - cm_selector.mShares[1];
+    auto cm_part = multiply_i64(conditional_factor, cm_selector, role, enc, eval, runtime);
+    auto base_part = multiply_i64(baseline_factor, not_use_cm, role, enc, eval, runtime);
+    si64Matrix out(anchor_slots, 1);
+    out.mShares[0] = cm_part.mShares[0] + base_part.mShares[0];
+    out.mShares[1] = cm_part.mShares[1] + base_part.mShares[1];
+    multiply_count += anchor_slots * 2;
+    mux_count += anchor_slots;
+    conditional_edge_count += 1;
+    return out;
+}
+
+const ConditionalEdge* find_conditional_edge(const SecureQuery& query, std::uint32_t edge_index) {
+    for (const auto& edge : query.conditional_edges) {
+        if (edge.edge_index == edge_index) {
+            return &edge;
+        }
+    }
+    return nullptr;
 }
 
 void add_row_to_anchor(si64Matrix& anchors, std::uint32_t anchor, const si64Matrix& row_values, std::size_t row) {
@@ -525,6 +744,7 @@ json evaluate_secure(
     std::uint64_t multiply_count = 0;
     std::uint64_t conversion_count = 0;
     std::uint64_t secure_gate_count = 0;
+    std::uint64_t conditional_edge_count = 0;
 
     std::vector<si64Matrix> selected_by_edge;
     selected_by_edge.reserve(query.required_edges.size());
@@ -582,6 +802,26 @@ json evaluate_secure(
 
     for (std::size_t edge_pos = 0; edge_pos < query.required_edges.size(); ++edge_pos) {
         const auto edge = query.required_edges[edge_pos];
+        if (const auto* conditional = find_conditional_edge(query, edge)) {
+            selected_by_edge.push_back(select_conditional_factor(
+                *conditional,
+                payload.anchor_slots,
+                payload.fixed_decimal_bits,
+                role,
+                enc,
+                eval,
+                runtime,
+                equality_count,
+                mux_count,
+                multiply_count,
+                conversion_count,
+                conditional_edge_count));
+            if (edge_pos == 0) {
+                const i64 unit_weight = payload.fixed_decimal_bits == 16 ? kFixedOneD16 : 1;
+                anchor_weight = share_public_i64_column(std::vector<i64>(payload.anchor_slots, unit_weight), role, enc, runtime);
+            }
+            continue;
+        }
         auto pred_it = std::find_if(query.predicates.begin(), query.predicates.end(), [&](const SecurePredicate& pred) {
             return pred.edge_index == edge;
         });
@@ -712,6 +952,11 @@ json evaluate_secure(
         {"reveal_count", 0},
         {"open_count", 0},
         {"secure_gate_count", secure_gate_count},
+        {"conditional_edge_count", conditional_edge_count},
+        {"conditional_bridge_mode", conditional_edge_count > 0 ? "inline_dense_sidecar_v1" : "off"},
+        {"online_producer_invocation_count", 0},
+        {"online_secret_sort_count", 0},
+        {"online_stored_reverse_count", 0},
         {"record_count", payload.record_count},
         {"anchor_slots", payload.anchor_slots},
         {"edge_count", payload.edge_count},
