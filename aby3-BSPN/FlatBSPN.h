@@ -113,6 +113,9 @@ struct FlatBSPNManifest {
     std::string secret_payload_encoding;
     std::string model_secret_share_payload_dir = "secret_shares/model";
     std::string model_secret_share_payload_layout = "pair_matrix_v1";
+    std::string leaf_bucket_membership_invariant;
+    bool leaf_bucket_membership_attested = false;
+    std::string leaf_bitmap_source_sha256;
     bool secure_multiplier_materialized = false;
     std::string secure_share_payload_dir = "secret_shares";
     std::string secure_share_payload_layout = "consolidated_v1";
@@ -234,6 +237,8 @@ struct FlatBSPNSecretSharedPayload {
     si64Matrix leaf_bitmaps;
     std::vector<sbMatrix> dense_bucket_bitmaps;
     bool dense_bucket_bitmaps_loaded = false;
+    std::vector<sbMatrix> packed_bucket_bitmaps;
+    bool packed_bucket_bitmaps_loaded = false;
     bool loaded = false;
 };
 

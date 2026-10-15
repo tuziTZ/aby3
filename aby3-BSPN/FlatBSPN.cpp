@@ -109,6 +109,48 @@ std::uint64_t bspn_bitmap_share_rows_per_chunk() {
     return parse_bspn_u64_env("BSPN_BITMAP_SHARE_ROWS_PER_CHUNK", std::uint64_t(1) << 20);
 }
 
+bool bspn_env_flag_enabled(const char* name);
+
+enum class BSPNBitmapEvalMode {
+    LegacyOr,
+    DisjointXorV1,
+    PackedDisjointV1,
+};
+
+BSPNBitmapEvalMode bspn_bitmap_eval_mode() {
+    const char* value = std::getenv("BSPN_BITMAP_EVAL_MODE");
+    const std::string mode = value == nullptr || *value == '\0'
+        ? "legacy_or"
+        : std::string(value);
+    if (mode == "legacy_or") {
+        return BSPNBitmapEvalMode::LegacyOr;
+    }
+    if (mode == "disjoint_xor_v1") {
+        return BSPNBitmapEvalMode::DisjointXorV1;
+    }
+    if (mode == "packed_disjoint_v1") {
+        return BSPNBitmapEvalMode::PackedDisjointV1;
+    }
+    throw std::runtime_error("Unsupported BSPN_BITMAP_EVAL_MODE: " + mode);
+}
+
+std::string bspn_bitmap_eval_mode_name() {
+    switch (bspn_bitmap_eval_mode()) {
+        case BSPNBitmapEvalMode::LegacyOr:
+            return "legacy_or";
+        case BSPNBitmapEvalMode::DisjointXorV1:
+            return "disjoint_xor_v1";
+        case BSPNBitmapEvalMode::PackedDisjointV1:
+            return "packed_disjoint_v1";
+    }
+    return "legacy_or";
+}
+
+bool bspn_bitmap_partition_attestation_required() {
+    return bspn_bitmap_eval_mode() != BSPNBitmapEvalMode::LegacyOr ||
+        bspn_env_flag_enabled("BSPN_REQUIRE_BITMAP_PARTITION_ATTESTATION");
+}
+
 bool bspn_env_flag_enabled(const char* name) {
     const char* value = std::getenv(name);
     if (value == nullptr || *value == '\0') {
@@ -538,6 +580,96 @@ sbMatrix read_bool_share_pair_column_bitpacked(
     return out;
 }
 
+std::vector<sbMatrix> read_bool_share_pair_bucket_words_bitpacked(
+    const std::string& path,
+    std::size_t bucket_count,
+    std::uint64_t logical_rows) {
+    const auto raw = read_binary_bytes(path);
+    const std::uint64_t total_bits =
+        static_cast<std::uint64_t>(bucket_count) * logical_rows;
+    const std::size_t bytes_per_share = static_cast<std::size_t>((total_bits + 7) / 8);
+    if (raw.size() != bytes_per_share * 2) {
+        throw std::runtime_error("Bit-packed boolean share file shape mismatch: " + path);
+    }
+    const std::uint64_t word_count = (logical_rows + 63) / 64;
+    const std::uint64_t tail_mask = logical_rows == 0 || logical_rows % 64 == 0
+        ? std::numeric_limits<std::uint64_t>::max()
+        : (std::uint64_t(1) << (logical_rows % 64)) - 1;
+    std::vector<sbMatrix> out;
+    out.reserve(bucket_count);
+    for (std::size_t bucket_idx = 0; bucket_idx < bucket_count; ++bucket_idx) {
+        sbMatrix packed(word_count, 64);
+        packed.mShares[0].setZero();
+        packed.mShares[1].setZero();
+        for (std::uint64_t row = 0; row < logical_rows; ++row) {
+            const std::uint64_t bit_idx =
+                static_cast<std::uint64_t>(bucket_idx) * logical_rows + row;
+            const std::size_t byte_idx = static_cast<std::size_t>(bit_idx / 8);
+            const std::uint8_t bit_mask = static_cast<std::uint8_t>(1u << (bit_idx % 8));
+            const std::uint64_t lane_mask = std::uint64_t(1) << (row % 64);
+            const std::uint64_t word_idx = row / 64;
+            if ((raw[byte_idx] & bit_mask) != 0) {
+                packed.mShares[0](word_idx, 0) = static_cast<i64>(
+                    static_cast<std::uint64_t>(packed.mShares[0](word_idx, 0)) | lane_mask);
+            }
+            if ((raw[bytes_per_share + byte_idx] & bit_mask) != 0) {
+                packed.mShares[1](word_idx, 0) = static_cast<i64>(
+                    static_cast<std::uint64_t>(packed.mShares[1](word_idx, 0)) | lane_mask);
+            }
+        }
+        if (word_count != 0) {
+            packed.mShares[0](word_count - 1, 0) = static_cast<i64>(
+                static_cast<std::uint64_t>(packed.mShares[0](word_count - 1, 0)) & tail_mask);
+            packed.mShares[1](word_count - 1, 0) = static_cast<i64>(
+                static_cast<std::uint64_t>(packed.mShares[1](word_count - 1, 0)) & tail_mask);
+        }
+        out.push_back(std::move(packed));
+    }
+    return out;
+}
+
+sbMatrix pack_dense_boolean_rows(const sbMatrix& dense, std::uint64_t logical_rows) {
+    if (dense.rows() != logical_rows) {
+        throw std::runtime_error("Dense boolean mask row count does not match packed logical rows.");
+    }
+    const std::uint64_t word_count = (logical_rows + 63) / 64;
+    sbMatrix packed(word_count, 64);
+    packed.mShares[0].setZero();
+    packed.mShares[1].setZero();
+    for (std::uint64_t row = 0; row < logical_rows; ++row) {
+        const std::uint64_t word_idx = row / 64;
+        const std::uint64_t lane_mask = std::uint64_t(1) << (row % 64);
+        if ((static_cast<std::uint64_t>(dense.mShares[0](row, 0)) & 1) != 0) {
+            packed.mShares[0](word_idx, 0) = static_cast<i64>(
+                static_cast<std::uint64_t>(packed.mShares[0](word_idx, 0)) | lane_mask);
+        }
+        if ((static_cast<std::uint64_t>(dense.mShares[1](row, 0)) & 1) != 0) {
+            packed.mShares[1](word_idx, 0) = static_cast<i64>(
+                static_cast<std::uint64_t>(packed.mShares[1](word_idx, 0)) | lane_mask);
+        }
+    }
+    return packed;
+}
+
+sbMatrix unpack_packed_boolean_words(const sbMatrix& packed, std::uint64_t logical_rows) {
+    const std::uint64_t expected_words = (logical_rows + 63) / 64;
+    if (packed.rows() != expected_words || packed.bitCount() != 64) {
+        throw std::runtime_error("Packed boolean mask shape mismatch during final unpack.");
+    }
+    sbMatrix dense(logical_rows, 64);
+    dense.mShares[0].setZero();
+    dense.mShares[1].setZero();
+    for (std::uint64_t row = 0; row < logical_rows; ++row) {
+        const std::uint64_t word_idx = row / 64;
+        const std::uint64_t shift = row % 64;
+        dense.mShares[0](row, 0) = static_cast<i64>(
+            (static_cast<std::uint64_t>(packed.mShares[0](word_idx, 0)) >> shift) & 1);
+        dense.mShares[1](row, 0) = static_cast<i64>(
+            (static_cast<std::uint64_t>(packed.mShares[1](word_idx, 0)) >> shift) & 1);
+    }
+    return dense;
+}
+
 i64Matrix unpack_bitmap_to_dense_rows(
     const std::vector<std::uint8_t>& bytes,
     std::uint64_t total_rows) {
@@ -758,6 +890,12 @@ struct SecureIndicatorEvalStats {
     std::uint64_t leaf_product_nodes = 0;
     std::uint64_t evidence_scan_cache_hits = 0;
     std::uint64_t evidence_scan_cache_misses = 0;
+    std::uint64_t secure_bitmap_and_calls = 0;
+    std::uint64_t secure_bitmap_or_calls = 0;
+    std::uint64_t local_xor_reductions = 0;
+    std::uint64_t packed_word_count = 0;
+    std::uint64_t final_dense_unpack_count = 0;
+    std::uint64_t packed_and_calls = 0;
     double sum_node_ms = 0.0;
     double product_sum_ms = 0.0;
     double phase1_match_ms = 0.0;
@@ -785,6 +923,14 @@ json secure_indicator_stats_json(const SecureIndicatorEvalStats& stats) {
         {"leaf_product_nodes", stats.leaf_product_nodes},
         {"evidence_scan_cache_hits", stats.evidence_scan_cache_hits},
         {"evidence_scan_cache_misses", stats.evidence_scan_cache_misses},
+        {"bitmap_eval_mode", bspn_bitmap_eval_mode_name()},
+        {"secure_bitmap_and_calls", stats.secure_bitmap_and_calls},
+        {"secure_bitmap_or_calls", stats.secure_bitmap_or_calls},
+        {"local_xor_reductions", stats.local_xor_reductions},
+        {"packed_word_count", stats.packed_word_count},
+        {"effective_bits_per_word", bspn_bitmap_eval_mode() == BSPNBitmapEvalMode::PackedDisjointV1 ? 64 : 1},
+        {"final_dense_unpack_count", stats.final_dense_unpack_count},
+        {"packed_and_calls", stats.packed_and_calls},
         {"max_stacked_bitmap_rows", bspn_max_stacked_bitmap_rows()},
         {"bitmap_share_rows_per_chunk", bspn_bitmap_share_rows_per_chunk()},
         {"timing_ms", {
@@ -1365,9 +1511,12 @@ SecureRationalShare select_rational_by_bool(
     const SecureRationalShare& false_value,
     const sbMatrix& flag,
     const FlatBSPNSecureContext& context) {
-    const double target_numerator_scale = std::max(
+    const double maximum_numerator_scale = std::max(
         true_value.numerator_scale,
         false_value.numerator_scale);
+    const double target_numerator_scale = maximum_numerator_scale <= 1.0
+        ? std::min(true_value.numerator_scale, false_value.numerator_scale)
+        : maximum_numerator_scale;
     const double target_denominator_scale = std::max(
         true_value.denominator_scale,
         false_value.denominator_scale);
@@ -2487,6 +2636,22 @@ SecureRationalShare multiply_secure_rational(
     out.numerator = secure_mul_fixed(lhs_numerator, rhs.numerator, context);
     out.numerator_scale =
         (lhs.numerator_scale * rhs.numerator_scale) / cancelled_numerator_scale;
+    if (lhs.numerator_scale > 0.0 && lhs.numerator_scale < 1.0 &&
+        rhs.numerator_scale > 0.0 && rhs.numerator_scale < 1.0) {
+        // Probability factors may use the same public sub-unit payload scale
+        // to retain rare-count precision. Without renormalization, each
+        // product squares that scale and rapidly inflates the encoded payload.
+        // Restore one public sub-unit after every multiplication; this is
+        // independent of the secret relevance flags used by the caller.
+        const double target_probability_scale = std::min(
+            lhs.numerator_scale,
+            rhs.numerator_scale);
+        out.numerator = secure_mul_public_fixed(
+            out.numerator,
+            out.numerator_scale / target_probability_scale,
+            context);
+        out.numerator_scale = target_probability_scale;
+    }
     const auto lhs_zero = rational_zero_numerator_flag(lhs, context);
     const auto rhs_zero = rational_zero_numerator_flag(rhs, context);
     const auto product_zero = bool_or_scalar(lhs_zero, rhs_zero, context);
@@ -3759,7 +3924,7 @@ std::vector<sbMatrix> compute_leaf_local_ids_batched(
     const std::vector<const FlatBSPNNodeRecord*>& leaf_children,
     const std::vector<sbMatrix>& match_masks,
     const FlatBSPNSecureContext& context,
-    std::uint64_t* phase1_batch_counter = nullptr) {
+    SecureIndicatorEvalStats* eval_stats = nullptr) {
     if (leaf_children.size() != match_masks.size()) {
         throw std::runtime_error("Leaf child and match mask counts do not match.");
     }
@@ -3801,6 +3966,23 @@ std::vector<sbMatrix> compute_leaf_local_ids_batched(
     const u64 block_len = shape_bitmap->rows();
     const u64 bit_count = shape_bitmap->bitCount();
     const u64 share_cols = shape_bitmap->mShares[0].cols();
+    std::vector<bool> secure_or_child(leaf_children.size(), false);
+    if (!model.manifest().secure_multiplier_bucket_indices.empty()) {
+        std::vector<bool> secure_bucket(
+            model.secret_shared_payload().dense_bucket_bitmaps.size(),
+            false);
+        for (const auto bucket_index : model.manifest().secure_multiplier_bucket_indices) {
+            if (bucket_index >= secure_bucket.size()) {
+                throw std::runtime_error("Secure multiplier bucket index exceeds dense bitmap payload.");
+            }
+            secure_bucket[bucket_index] = true;
+        }
+        for (const auto& bucket_ref : bucket_refs) {
+            if (secure_bucket[bucket_ref.bucket_index]) {
+                secure_or_child[bucket_ref.child_idx] = true;
+            }
+        }
+    }
 
     for (std::size_t child_idx = 0; child_idx < leaf_children.size(); ++child_idx) {
         sbMatrix child_local_ids(block_len, bit_count);
@@ -3871,34 +4053,228 @@ std::vector<sbMatrix> compute_leaf_local_ids_batched(
             *(context.enc),
             *(context.eval),
             *(context.runtime));
-        if (phase1_batch_counter != nullptr) {
-            ++(*phase1_batch_counter);
+        if (eval_stats != nullptr) {
+            ++eval_stats->phase1_batch_dot_calls;
+            ++eval_stats->secure_bitmap_and_calls;
         }
 
         for (std::size_t ref_idx = 0; ref_idx < chunk_bucket_count; ++ref_idx) {
             const auto& bucket_ref = bucket_refs[chunk_begin + ref_idx];
             auto& child_local_ids = local_ids[bucket_ref.child_idx];
             const u64 row_begin = static_cast<u64>(ref_idx) * block_len;
-            sbMatrix selected_bucket_rows(block_len, bit_count);
-            for (u64 row = 0; row < block_len; ++row) {
-                for (u64 col = 0; col < share_cols; ++col) {
-                    selected_bucket_rows.mShares[0](row, col) = stacked_products.mShares[0](row_begin + row, col);
-                    selected_bucket_rows.mShares[1](row, col) = stacked_products.mShares[1](row_begin + row, col);
+            if (bspn_bitmap_eval_mode() == BSPNBitmapEvalMode::DisjointXorV1 &&
+                !secure_or_child[bucket_ref.child_idx]) {
+                for (u64 row = 0; row < block_len; ++row) {
+                    for (u64 col = 0; col < share_cols; ++col) {
+                        child_local_ids.mShares[0](row, col) ^=
+                            stacked_products.mShares[0](row_begin + row, col);
+                        child_local_ids.mShares[1](row, col) ^=
+                            stacked_products.mShares[1](row_begin + row, col);
+                    }
+                }
+                if (eval_stats != nullptr) {
+                    ++eval_stats->local_xor_reductions;
+                }
+            } else {
+                sbMatrix selected_bucket_rows(block_len, bit_count);
+                for (u64 row = 0; row < block_len; ++row) {
+                    for (u64 col = 0; col < share_cols; ++col) {
+                        selected_bucket_rows.mShares[0](row, col) =
+                            stacked_products.mShares[0](row_begin + row, col);
+                        selected_bucket_rows.mShares[1](row, col) =
+                            stacked_products.mShares[1](row_begin + row, col);
+                    }
+                }
+                sbMatrix updated_child_local_ids(block_len, bit_count);
+                bool_cipher_or(
+                    context.role,
+                    child_local_ids,
+                    selected_bucket_rows,
+                    updated_child_local_ids,
+                    *(context.enc),
+                    *(context.eval),
+                    *(context.runtime));
+                child_local_ids = std::move(updated_child_local_ids);
+                if (eval_stats != nullptr) {
+                    ++eval_stats->secure_bitmap_or_calls;
                 }
             }
-            sbMatrix updated_child_local_ids(block_len, bit_count);
-            bool_cipher_or(
-                context.role,
-                child_local_ids,
-                selected_bucket_rows,
-                updated_child_local_ids,
-                *(context.enc),
-                *(context.eval),
-                *(context.runtime));
-            child_local_ids = std::move(updated_child_local_ids);
         }
     }
 
+    return local_ids;
+}
+
+void mask_packed_bitmap_tail(sbMatrix& packed, std::uint64_t logical_rows) {
+    if (packed.rows() == 0 || logical_rows == 0 || logical_rows % 64 == 0) {
+        return;
+    }
+    const std::uint64_t tail_mask = (std::uint64_t(1) << (logical_rows % 64)) - 1;
+    const u64 last = packed.rows() - 1;
+    packed.mShares[0](last, 0) = static_cast<i64>(
+        static_cast<std::uint64_t>(packed.mShares[0](last, 0)) & tail_mask);
+    packed.mShares[1](last, 0) = static_cast<i64>(
+        static_cast<std::uint64_t>(packed.mShares[1](last, 0)) & tail_mask);
+}
+
+std::vector<sbMatrix> compute_leaf_local_ids_packed(
+    const FlatBSPNModel& model,
+    const std::vector<const FlatBSPNNodeRecord*>& leaf_children,
+    const std::vector<sbMatrix>& match_masks,
+    const FlatBSPNSecureContext& context,
+    SecureIndicatorEvalStats* eval_stats = nullptr) {
+    if (leaf_children.size() != match_masks.size()) {
+        throw std::runtime_error("Packed leaf child and match mask counts do not match.");
+    }
+    if (!model.secret_shared_payload().packed_bucket_bitmaps_loaded) {
+        throw std::runtime_error("Packed bitmap evaluation requested without packed model bitmaps.");
+    }
+    struct BucketRef {
+        std::size_t child_idx = 0;
+        std::uint32_t bucket_offset = 0;
+        std::uint32_t bucket_index = 0;
+    };
+    std::vector<BucketRef> bucket_refs;
+    const sbMatrix* shape_bitmap = nullptr;
+    for (std::size_t child_idx = 0; child_idx < leaf_children.size(); ++child_idx) {
+        const auto& child = *leaf_children[child_idx];
+        if (match_masks[child_idx].rows() != child.bucket_count) {
+            throw std::runtime_error("Packed match mask row count does not match leaf bucket count.");
+        }
+        for (std::uint32_t bucket_offset = 0; bucket_offset < child.bucket_count; ++bucket_offset) {
+            bucket_refs.push_back({child_idx, bucket_offset, child.bucket_begin + bucket_offset});
+        }
+        if (shape_bitmap == nullptr && child.bucket_count != 0) {
+            shape_bitmap = &model.secret_shared_payload().packed_bucket_bitmaps[child.bucket_begin];
+        }
+    }
+    std::vector<sbMatrix> local_ids;
+    local_ids.reserve(leaf_children.size());
+    const std::uint64_t logical_rows = model.manifest().total_rows;
+    const u64 word_count = shape_bitmap == nullptr ? (logical_rows + 63) / 64 : shape_bitmap->rows();
+    for (std::size_t child_idx = 0; child_idx < leaf_children.size(); ++child_idx) {
+        sbMatrix child_local_ids(word_count, 64);
+        bool_init_false(context.role, child_local_ids);
+        local_ids.push_back(std::move(child_local_ids));
+    }
+    if (shape_bitmap == nullptr || bucket_refs.empty()) {
+        return local_ids;
+    }
+    if (shape_bitmap->bitCount() != 64) {
+        throw std::runtime_error("Packed model bitmap must have 64 bit lanes per word.");
+    }
+    if (eval_stats != nullptr) {
+        eval_stats->packed_word_count += word_count * static_cast<u64>(bucket_refs.size());
+    }
+    std::vector<bool> secure_or_child(leaf_children.size(), false);
+    if (!model.manifest().secure_multiplier_bucket_indices.empty()) {
+        std::vector<bool> secure_bucket(
+            model.secret_shared_payload().packed_bucket_bitmaps.size(),
+            false);
+        for (const auto bucket_index : model.manifest().secure_multiplier_bucket_indices) {
+            if (bucket_index >= secure_bucket.size()) {
+                throw std::runtime_error("Secure multiplier bucket index exceeds packed bitmap payload.");
+            }
+            secure_bucket[bucket_index] = true;
+        }
+        for (const auto& bucket_ref : bucket_refs) {
+            if (secure_bucket[bucket_ref.bucket_index]) {
+                secure_or_child[bucket_ref.child_idx] = true;
+            }
+        }
+    }
+    const std::size_t buckets_per_chunk = static_cast<std::size_t>(std::max<u64>(
+        1,
+        bspn_max_stacked_bitmap_rows() / std::max<u64>(1, logical_rows)));
+    for (std::size_t chunk_begin = 0; chunk_begin < bucket_refs.size(); chunk_begin += buckets_per_chunk) {
+        const std::size_t chunk_end = std::min<std::size_t>(
+            bucket_refs.size(),
+            chunk_begin + buckets_per_chunk);
+        const std::size_t chunk_bucket_count = chunk_end - chunk_begin;
+        const u64 stacked_rows = static_cast<u64>(chunk_bucket_count) * word_count;
+        sbMatrix stacked_bitmaps(stacked_rows, 64);
+        sbMatrix stacked_match(stacked_rows, 64);
+        #pragma omp parallel for schedule(static)
+        for (std::int64_t ref_idx_signed = 0;
+             ref_idx_signed < static_cast<std::int64_t>(chunk_bucket_count);
+             ++ref_idx_signed) {
+            const auto ref_idx = static_cast<std::size_t>(ref_idx_signed);
+            const auto& bucket_ref = bucket_refs[chunk_begin + ref_idx];
+            const auto& bucket_bitmap =
+                model.secret_shared_payload().packed_bucket_bitmaps[bucket_ref.bucket_index];
+            const auto& match_mask = match_masks[bucket_ref.child_idx];
+            if (bucket_bitmap.rows() != word_count || bucket_bitmap.bitCount() != 64) {
+                throw std::runtime_error("Packed bucket bitmap shape mismatch.");
+            }
+            const std::uint64_t match_share0 = static_cast<std::uint64_t>(
+                match_mask.mShares[0](bucket_ref.bucket_offset, 0)) & 1;
+            const std::uint64_t match_share1 = static_cast<std::uint64_t>(
+                match_mask.mShares[1](bucket_ref.bucket_offset, 0)) & 1;
+            const i64 repeated_share0 = static_cast<i64>(std::uint64_t(0) - match_share0);
+            const i64 repeated_share1 = static_cast<i64>(std::uint64_t(0) - match_share1);
+            const u64 row_begin = static_cast<u64>(ref_idx) * word_count;
+            for (u64 word_idx = 0; word_idx < word_count; ++word_idx) {
+                stacked_bitmaps.mShares[0](row_begin + word_idx, 0) =
+                    bucket_bitmap.mShares[0](word_idx, 0);
+                stacked_bitmaps.mShares[1](row_begin + word_idx, 0) =
+                    bucket_bitmap.mShares[1](word_idx, 0);
+                stacked_match.mShares[0](row_begin + word_idx, 0) = repeated_share0;
+                stacked_match.mShares[1](row_begin + word_idx, 0) = repeated_share1;
+            }
+        }
+        sbMatrix stacked_products(stacked_rows, 64);
+        bool_cipher_and(
+            context.role,
+            stacked_bitmaps,
+            stacked_match,
+            stacked_products,
+            *(context.enc),
+            *(context.eval),
+            *(context.runtime));
+        if (eval_stats != nullptr) {
+            ++eval_stats->phase1_batch_dot_calls;
+            ++eval_stats->secure_bitmap_and_calls;
+            ++eval_stats->packed_and_calls;
+        }
+        for (std::size_t ref_idx = 0; ref_idx < chunk_bucket_count; ++ref_idx) {
+            const auto& bucket_ref = bucket_refs[chunk_begin + ref_idx];
+            auto& child_local_ids = local_ids[bucket_ref.child_idx];
+            const u64 row_begin = static_cast<u64>(ref_idx) * word_count;
+            if (!secure_or_child[bucket_ref.child_idx]) {
+                for (u64 word_idx = 0; word_idx < word_count; ++word_idx) {
+                    child_local_ids.mShares[0](word_idx, 0) ^=
+                        stacked_products.mShares[0](row_begin + word_idx, 0);
+                    child_local_ids.mShares[1](word_idx, 0) ^=
+                        stacked_products.mShares[1](row_begin + word_idx, 0);
+                }
+                if (eval_stats != nullptr) {
+                    ++eval_stats->local_xor_reductions;
+                }
+            } else {
+                sbMatrix selected_bucket_words(word_count, 64);
+                for (u64 word_idx = 0; word_idx < word_count; ++word_idx) {
+                    selected_bucket_words.mShares[0](word_idx, 0) =
+                        stacked_products.mShares[0](row_begin + word_idx, 0);
+                    selected_bucket_words.mShares[1](word_idx, 0) =
+                        stacked_products.mShares[1](row_begin + word_idx, 0);
+                }
+                sbMatrix updated_child_local_ids(word_count, 64);
+                bool_cipher_or(
+                    context.role,
+                    child_local_ids,
+                    selected_bucket_words,
+                    updated_child_local_ids,
+                    *(context.enc),
+                    *(context.eval),
+                    *(context.runtime));
+                child_local_ids = std::move(updated_child_local_ids);
+                if (eval_stats != nullptr) {
+                    ++eval_stats->secure_bitmap_or_calls;
+                }
+            }
+            mask_packed_bitmap_tail(child_local_ids, logical_rows);
+        }
+    }
     return local_ids;
 }
 
@@ -4152,7 +4528,7 @@ SecureRationalShare evaluate_conditional_direct_count_secure(
         throw std::runtime_error("baseline_cm_a_v3 requires conditional_direct_count_plan.");
     }
     const auto& direct_plan = public_plan_doc["conditional_direct_count_plan"];
-    if (direct_plan.value("schema_version", std::string()) != "PBSPN_CONDITIONAL_DIRECT_COUNT_PUBLIC_V1") {
+    if (direct_plan.value("schema_version", std::string()) != "PBSPN_CONDITIONAL_DIRECT_COUNT_PUBLIC_V2") {
         throw std::runtime_error("Unsupported conditional direct count plan schema.");
     }
     if (direct_plan.value("aggregation", std::string()) != "COUNT") {
@@ -4186,8 +4562,9 @@ SecureRationalShare evaluate_conditional_direct_count_secure(
     if (!model.secret_shared_payload().leaf_row_values_loaded) {
         throw std::runtime_error("Conditional direct count requires loaded leaf row values.");
     }
-    if (!model.secret_shared_payload().dense_bucket_bitmaps_loaded) {
-        throw std::runtime_error("Conditional direct count requires dense bucket bitmaps.");
+    if (!model.secret_shared_payload().dense_bucket_bitmaps_loaded &&
+        !model.secret_shared_payload().packed_bucket_bitmaps_loaded) {
+        throw std::runtime_error("Conditional direct count requires loaded bucket bitmaps.");
     }
     const u64 total_rows = static_cast<u64>(manifest.total_rows);
     if (total_rows == 0) {
@@ -4216,13 +4593,18 @@ SecureRationalShare evaluate_conditional_direct_count_secure(
         static_cast<std::size_t>(shared_query_payload.feature_scope_shared.cols());
     const std::size_t max_interval_count =
         static_cast<std::size_t>(shared_query_payload.lower_bounds_shared.cols());
-    std::vector<std::size_t> title_evidence_columns;
-    if (direct_plan.contains("title_evidence_column_indices") &&
-        direct_plan["title_evidence_column_indices"].is_array()) {
-        for (const auto& col_doc : direct_plan["title_evidence_column_indices"]) {
-            title_evidence_columns.push_back(static_cast<std::size_t>(col_doc.get<std::uint64_t>()));
+    auto direct_mask_capability_columns = [](const FlatBSPNManifest& model_manifest) {
+        std::vector<std::size_t> columns;
+        columns.reserve(model_manifest.direct_mask_column_value_share_paths.size());
+        for (std::size_t col_idx = 0; col_idx < model_manifest.column_names.size(); ++col_idx) {
+            if (model_manifest.direct_mask_column_value_share_paths.count(
+                    model_manifest.column_names[col_idx]) != 0) {
+                columns.push_back(col_idx);
+            }
         }
-    }
+        return columns;
+    };
+    const auto title_evidence_columns = direct_mask_capability_columns(manifest);
     for (const std::size_t col_idx : title_evidence_columns) {
         if (col_idx >= manifest.column_names.size()) {
             throw std::runtime_error("Conditional direct title evidence column is out of bounds.");
@@ -4365,12 +4747,26 @@ SecureRationalShare evaluate_conditional_direct_count_secure(
             bool_init_false(context.role, leaf_cover);
             for (std::uint32_t bucket_offset = 0; bucket_offset < leaf.bucket_count; ++bucket_offset) {
                 const auto bucket_idx = leaf.bucket_begin + bucket_offset;
-                if (bucket_idx >= model.secret_shared_payload().dense_bucket_bitmaps.size()) {
-                    throw std::runtime_error("Conditional direct title leaf bitmap is out of bounds.");
+                sbMatrix bucket_bitmap;
+                if (model.secret_shared_payload().dense_bucket_bitmaps_loaded) {
+                    if (bucket_idx >= model.secret_shared_payload().dense_bucket_bitmaps.size()) {
+                        throw std::runtime_error("Conditional direct title leaf bitmap is out of bounds.");
+                    }
+                    bucket_bitmap = model.secret_shared_payload().dense_bucket_bitmaps[bucket_idx];
+                } else {
+                    if (bucket_idx >= model.secret_shared_payload().packed_bucket_bitmaps.size()) {
+                        throw std::runtime_error("Conditional direct packed title leaf bitmap is out of bounds.");
+                    }
+                    // Direct mask value shares normally avoid this compatibility
+                    // fallback.  Legacy bundles without those shares unpack only
+                    // the current leaf coverage bitmap, never the full model.
+                    bucket_bitmap = unpack_packed_boolean_words(
+                        model.secret_shared_payload().packed_bucket_bitmaps[bucket_idx],
+                        total_rows);
                 }
                 leaf_cover = bool_or_matrix_same_shape(
                     leaf_cover,
-                    model.secret_shared_payload().dense_bucket_bitmaps[bucket_idx],
+                    bucket_bitmap,
                     context);
             }
 
@@ -4466,9 +4862,9 @@ SecureRationalShare evaluate_conditional_direct_count_secure(
         sbMatrix mask = repeat_bool_scalar_rows(
             shared_true_bool_scalar(context),
             static_cast<std::uint32_t>(sel_rows));
+        sbMatrix any_evidence = shared_zero_bool_scalar(context);
         const std::uint32_t sel_factor_row = static_cast<std::uint32_t>(sel_factor_it->second);
-        for (const auto& col_doc : selectivity_doc.value("evidence_column_indices", json::array())) {
-            const std::size_t col_idx = static_cast<std::size_t>(col_doc.get<std::uint64_t>());
+        for (const std::size_t col_idx : direct_mask_capability_columns(sel_manifest)) {
             if (col_idx >= sel_manifest.column_names.size() || col_idx >= max_query_columns) {
                 continue;
             }
@@ -4499,6 +4895,7 @@ SecureRationalShare evaluate_conditional_direct_count_secure(
                     static_cast<std::uint32_t>(evidence_row),
                     0),
                 context);
+            any_evidence = bool_or_scalar(any_evidence, column_has_evidence, context);
             sbMatrix column_match(sel_rows, mask.bitCount());
             bool_init_false(context.role, column_match);
             for (std::size_t interval_idx = 0; interval_idx < max_interval_count; ++interval_idx) {
@@ -4583,12 +4980,51 @@ SecureRationalShare evaluate_conditional_direct_count_secure(
         si64Matrix count(1, 1);
         count.mShares[0](0, 0) = mask_int.mShares[0].block(0, 0, sel_rows, 1).sum();
         count.mShares[1](0, 0) = mask_int.mShares[1].block(0, 0, sel_rows, 1).sum();
-        return std::pair<si64Matrix, u64>(count, sel_rows);
+        return std::tuple<si64Matrix, u64, sbMatrix>(count, sel_rows, any_evidence);
     };
 
-    auto product_rows = share_int_scalar(1, 0, context);
-    product_rows = repeat_int_scalar_rows(product_rows, static_cast<std::uint32_t>(total_rows));
-    double public_denominator = 1.0;
+    auto product_rows = repeat_int_scalar_rows(
+        share_int_scalar(1, 0, context),
+        static_cast<std::uint32_t>(total_rows));
+    // Child-table fallback selectivities can be much smaller than one. D16 is
+    // not accurate enough for values such as 15/5000 under a 0.1% numerical
+    // gate, so keep this isolated product in D28 and convert it to D16 only
+    // after multiplying the exact integer row aggregate.
+    constexpr std::uint64_t kSelectivityFractionBits = 28;
+    auto selectivity_one = [&]() {
+        return si64_to_sf64(
+            share_int_scalar(i64(1) << kSelectivityFractionBits, 0, context),
+            0);
+    };
+    auto multiply_selectivity = [&](const sf64Matrix<kFlatBSPNDecimal>& lhs,
+                                    const sf64Matrix<kFlatBSPNDecimal>& rhs) {
+        si64Matrix lhs_int(lhs.rows(), lhs.cols());
+        lhs_int.mShares[0] = lhs[0];
+        lhs_int.mShares[1] = lhs[1];
+        si64Matrix rhs_int(rhs.rows(), rhs.cols());
+        rhs_int.mShares[0] = rhs[0];
+        rhs_int.mShares[1] = rhs[1];
+        si64Matrix raw_product(lhs.rows(), lhs.cols());
+        raw_product.mShares[0].setZero();
+        raw_product.mShares[1].setZero();
+        cipher_mul(
+            context.role,
+            lhs_int,
+            rhs_int,
+            raw_product,
+            *(context.eval),
+            *(context.enc),
+            *(context.runtime));
+        sf64Matrix<kFlatBSPNDecimal> raw_fixed(lhs.rows(), lhs.cols());
+        raw_fixed[0] = raw_product.mShares[0];
+        raw_fixed[1] = raw_product.mShares[1];
+        return secure_arithmetic_right_shift_same_shape(
+            raw_fixed,
+            kSelectivityFractionBits,
+            context);
+    };
+    auto selectivity_product = selectivity_one();
+    auto selectivity_product_positive = shared_true_bool_scalar(context);
     std::uint64_t edge_vectors_used = 0;
     std::vector<std::string> missing_relationships;
     for (const auto& edge_doc : direct_plan.value("edges", json::array())) {
@@ -4600,32 +5036,52 @@ SecureRationalShare evaluate_conditional_direct_count_secure(
         if (wanted_rel.empty()) {
             continue;
         }
-        auto edge_rows = load_direct_scalar_counts(relationship_id);
+        auto edge_rows_int = load_direct_scalar_counts(relationship_id);
+        auto fallback_selectivity = selectivity_one();
+        auto fallback_selectivity_positive = shared_true_bool_scalar(context);
         bool has_selectivity = edge_doc.contains("fallback_selectivity") &&
             edge_doc["fallback_selectivity"].is_object();
-        si64Matrix selectivity_count;
-        u64 selectivity_denominator = 1;
         if (has_selectivity) {
             auto selectivity = compute_fallback_selectivity_count(edge_doc["fallback_selectivity"]);
-            selectivity_count = std::move(selectivity.first);
-            selectivity_denominator = selectivity.second;
-            public_denominator *= static_cast<double>(selectivity_denominator);
-            auto selectivity_rows = repeat_int_scalar_rows(
-                selectivity_count,
-                static_cast<std::uint32_t>(total_rows));
-            si64Matrix scaled_edge_rows(total_rows, 1);
-            scaled_edge_rows.mShares[0].setZero();
-            scaled_edge_rows.mShares[1].setZero();
-            cipher_mul(
+            auto selectivity_count = std::move(std::get<0>(selectivity));
+            const u64 selectivity_denominator = std::get<1>(selectivity);
+            const auto any_evidence = std::get<2>(selectivity);
+            // Encode count/N directly in D28. The count is integral, so this is
+            // a local public-constant multiplication of shares and needs no
+            // truncation protocol here.
+            const auto reciprocal_raw = static_cast<std::uint64_t>(std::llround(
+                std::ldexp(
+                    1.0 / static_cast<double>(selectivity_denominator),
+                    static_cast<int>(kSelectivityFractionBits))));
+            auto selectivity_fixed = mul_fixed_shares_by_public_integer_raw(
+                si64_to_sf64(selectivity_count, 0),
+                reciprocal_raw);
+            si64Matrix zero_count(1, 1);
+            zero_count.mShares[0].setZero();
+            zero_count.mShares[1].setZero();
+            sbMatrix count_positive;
+            cipher_gt(
                 context.role,
-                edge_rows,
-                selectivity_rows,
-                scaled_edge_rows,
+                selectivity_count,
+                zero_count,
+                count_positive,
                 *(context.eval),
-                *(context.enc),
                 *(context.runtime));
-            edge_rows = std::move(scaled_edge_rows);
+            selectivity_fixed = fixed_mul_bool_same_shape(
+                selectivity_fixed,
+                count_positive,
+                context);
+            fallback_selectivity_positive = bool_or_scalar(
+                bool_not_scalar(any_evidence, context),
+                count_positive,
+                context);
+            fallback_selectivity = select_fixed_by_bool(
+                selectivity_fixed,
+                fallback_selectivity,
+                any_evidence,
+                context);
         }
+        sbMatrix conditional_active = shared_zero_bool_scalar(context);
         const std::string edge_id = edge_doc.value("edge_id", std::string());
         const auto sidecar_it = sidecar_by_edge_id.find(edge_id);
         const auto edge_index_it = conditional_edge_index_by_edge_id.find(edge_id);
@@ -4723,31 +5179,44 @@ SecureRationalShare evaluate_conditional_direct_count_secure(
                 use_cm_bool,
                 *(context.eval),
                 *(context.runtime));
-            const auto active_bool = bool_and_scalar(use_cm_bool, matched_any, context);
-            if (has_selectivity && selectivity_denominator != 1) {
-                auto conditional_scaled = conditional_int;
-                conditional_scaled.mShares[0] *= static_cast<i64>(selectivity_denominator);
-                conditional_scaled.mShares[1] *= static_cast<i64>(selectivity_denominator);
-                edge_rows = select_int_by_bool_same_shape(
-                    conditional_scaled,
-                    edge_rows,
-                    repeat_bool_scalar_rows(active_bool, static_cast<std::uint32_t>(total_rows)),
-                    context);
-            } else {
-                edge_rows = select_int_by_bool_same_shape(
-                    conditional_int,
-                    edge_rows,
-                    repeat_bool_scalar_rows(active_bool, static_cast<std::uint32_t>(total_rows)),
-                    context);
-            }
+            conditional_active = bool_and_scalar(use_cm_bool, matched_any, context);
+            edge_rows_int = select_int_by_bool_same_shape(
+                conditional_int,
+                edge_rows_int,
+                repeat_bool_scalar_rows(conditional_active, static_cast<std::uint32_t>(total_rows)),
+                context);
         }
+        const auto effective_selectivity = select_fixed_by_bool(
+            selectivity_one(),
+            fallback_selectivity,
+            conditional_active,
+            context);
+        const auto effective_selectivity_positive = bool_or_scalar(
+            conditional_active,
+            fallback_selectivity_positive,
+            context);
+        selectivity_product_positive = bool_and_scalar(
+            selectivity_product_positive,
+            effective_selectivity_positive,
+            context);
+        selectivity_product = multiply_selectivity(
+            selectivity_product,
+            effective_selectivity);
+        // Fixed-point truncation can contribute a one-unit randomized error
+        // even when one logical operand is exactly zero. Keep the all-positive
+        // predicate secret, but use it to totalize the product back to an exact
+        // zero before the public sample scale can amplify that error.
+        selectivity_product = fixed_mul_bool_same_shape(
+            selectivity_product,
+            selectivity_product_positive,
+            context);
         si64Matrix multiplied(total_rows, 1);
         multiplied.mShares[0].setZero();
         multiplied.mShares[1].setZero();
         cipher_mul(
             context.role,
             product_rows,
-            edge_rows,
+            edge_rows_int,
             multiplied,
             *(context.eval),
             *(context.enc),
@@ -4778,11 +5247,47 @@ SecureRationalShare evaluate_conditional_direct_count_secure(
     si64Matrix sum_rows_int(1, 1);
     sum_rows_int.mShares[0](0, 0) = masked_product_rows.mShares[0].block(0, 0, total_rows, 1).sum();
     sum_rows_int.mShares[1](0, 0) = masked_product_rows.mShares[1].block(0, 0, total_rows, 1).sum();
-    // Keep the direct COUNT integer aggregate in the si64 range.  The default
-    // si64_to_sf64 conversion left-shifts by D16, which limits exact positive
-    // aggregates to roughly 2^47 before final reveal.  Multi-edge JOB-light
-    // queries can exceed that while still staying well below int64.
-    const auto sum_rows = si64_to_sf64(sum_rows_int, 0);
+    // `sum_rows_int` is exact and selectivity_product is D28. Their raw product
+    // is D28; shift only the twelve guard bits needed to obtain the evaluator's
+    // D16 result. A secret nonzero mask totalizes exact-zero aggregates because
+    // randomized truncation itself may otherwise contribute one raw unit.
+    si64Matrix selectivity_product_int(1, 1);
+    selectivity_product_int.mShares[0] = selectivity_product[0];
+    selectivity_product_int.mShares[1] = selectivity_product[1];
+    si64Matrix scaled_sum_int(1, 1);
+    scaled_sum_int.mShares[0].setZero();
+    scaled_sum_int.mShares[1].setZero();
+    cipher_mul(
+        context.role,
+        sum_rows_int,
+        selectivity_product_int,
+        scaled_sum_int,
+        *(context.eval),
+        *(context.enc),
+        *(context.runtime));
+    sf64Matrix<kFlatBSPNDecimal> scaled_sum_d28(1, 1);
+    scaled_sum_d28[0] = scaled_sum_int.mShares[0];
+    scaled_sum_d28[1] = scaled_sum_int.mShares[1];
+    auto sum_rows = secure_arithmetic_right_shift_same_shape(
+        scaled_sum_d28,
+        kSelectivityFractionBits - kFlatBSPNDecimal,
+        context);
+    si64Matrix zero_sum(1, 1);
+    zero_sum.mShares[0].setZero();
+    zero_sum.mShares[1].setZero();
+    sbMatrix sum_rows_positive;
+    cipher_gt(
+        context.role,
+        sum_rows_int,
+        zero_sum,
+        sum_rows_positive,
+        *(context.eval),
+        *(context.runtime));
+    const auto final_result_positive = bool_and_scalar(
+        sum_rows_positive,
+        selectivity_product_positive,
+        context);
+    sum_rows = fixed_mul_bool_same_shape(sum_rows, final_result_positive, context);
     if (direct_stats != nullptr) {
         double debug_title_mask_count = 0.0;
         double debug_unscaled_sum = 0.0;
@@ -4804,7 +5309,8 @@ SecureRationalShare evaluate_conditional_direct_count_secure(
             {"title_leaf_count", static_cast<std::uint64_t>(leaf_children.size())},
             {"title_evidence_columns_scanned", title_evidence_column_scans},
             {"direct_count_integer_product", true},
-            {"public_denominator", public_denominator},
+            {"direct_count_fixed_selectivity_product", true},
+            {"public_denominator", 1.0},
             {"debug_title_mask_count", context.debug_internal_reveal ? json(debug_title_mask_count) : json(nullptr)},
             {"debug_unscaled_sum", context.debug_internal_reveal ? json(debug_unscaled_sum) : json(nullptr)},
             {"debug_scaled_sum", context.debug_internal_reveal ? json(debug_scaled_sum) : json(nullptr)},
@@ -4822,8 +5328,7 @@ SecureRationalShare evaluate_conditional_direct_count_secure(
     SecureRationalShare out{
         sum_rows,
         share_fixed_scalar<kFlatBSPNDecimal>(1.0, 0, context),
-        (manifest.sample_scale * static_cast<double>(std::uint64_t{1} << static_cast<std::uint64_t>(kFlatBSPNDecimal))) /
-            public_denominator,
+        manifest.sample_scale,
         1.0,
         true,
     };
@@ -4864,7 +5369,9 @@ SecureRationalShare weighted_sum_secure_rational(
         [](const SecureRationalShare& value) { return value.denominator_is_one; });
     if (all_unit_denominators) {
         const double kWeightedSumTermUpscale = public_term_upscale;
-        double numerator_scale = 1.0;
+        double numerator_scale = values.front().numerator_scale;
+        double minimum_numerator_scale = values.front().numerator_scale;
+        double maximum_numerator_scale = values.front().numerator_scale;
         std::vector<sf64Matrix<kFlatBSPNDecimal>> terms(values.size());
         std::vector<double> term_scales(values.size(), 1.0);
         sbMatrix all_zero = shared_true_bool_scalar(context);
@@ -4903,8 +5410,21 @@ SecureRationalShare weighted_sum_secure_rational(
             }
             all_zero = bool_and_scalar(all_zero, value_zero, context);
             term_scales[idx] = values[idx].numerator_scale;
-            numerator_scale = std::max(numerator_scale, term_scales[idx]);
+            minimum_numerator_scale = std::min(
+                minimum_numerator_scale,
+                term_scales[idx]);
+            maximum_numerator_scale = std::max(
+                maximum_numerator_scale,
+                term_scales[idx]);
         }
+        // Probability payloads may deliberately use a public sub-unit scale
+        // to preserve rare-count precision. Public padding zero children use
+        // the ordinary unit scale; choosing max(1, sub-unit) would erase that
+        // precision. Magnitude-bearing SUM/SUM-target paths retain the prior
+        // largest-scale policy to keep their payloads bounded.
+        numerator_scale = maximum_numerator_scale <= 1.0
+            ? minimum_numerator_scale
+            : maximum_numerator_scale;
         auto numerator_sum = share_fixed_scalar<kFlatBSPNDecimal>(0.0, 0, context);
         for (std::size_t idx = 0; idx < terms.size(); ++idx) {
             numerator_sum += secure_mul_public_fixed(
@@ -4947,7 +5467,9 @@ SecureRationalShare weighted_sum_secure_rational(
 	    constexpr double kWeightedSumStorageUnit = 1.0;
 	    sbMatrix any_non_unit = shared_zero_bool_scalar(context);
 	    sbMatrix all_zero = shared_true_bool_scalar(context);
-	    double scalar_numerator_scale = 1.0;
+	    double scalar_numerator_scale = values.front().numerator_scale;
+	    double minimum_scalar_numerator_scale = values.front().numerator_scale;
+	    double maximum_scalar_numerator_scale = values.front().numerator_scale;
 	    std::vector<sf64Matrix<kFlatBSPNDecimal>> scalar_terms(values.size());
 	    std::vector<double> scalar_term_scales(values.size(), 1.0);
 	    for (std::size_t idx = 0; idx < values.size(); ++idx) {
@@ -4985,8 +5507,16 @@ SecureRationalShare weighted_sum_secure_rational(
 	        }
 	        all_zero = bool_and_scalar(all_zero, value_zero, context);
 	        scalar_term_scales[idx] = values[idx].numerator_scale;
-	        scalar_numerator_scale = std::max(scalar_numerator_scale, scalar_term_scales[idx]);
+	        minimum_scalar_numerator_scale = std::min(
+	            minimum_scalar_numerator_scale,
+	            scalar_term_scales[idx]);
+	        maximum_scalar_numerator_scale = std::max(
+	            maximum_scalar_numerator_scale,
+	            scalar_term_scales[idx]);
 	    }
+	    scalar_numerator_scale = maximum_scalar_numerator_scale <= 1.0
+	        ? minimum_scalar_numerator_scale
+	        : maximum_scalar_numerator_scale;
 	    auto scalar_numerator_sum = share_fixed_scalar<kFlatBSPNDecimal>(0.0, 0, context);
 	    for (std::size_t idx = 0; idx < scalar_terms.size(); ++idx) {
 	        scalar_numerator_sum += secure_mul_public_fixed(
@@ -5827,24 +6357,53 @@ std::vector<SecureRationalShare> evaluate_leaf_product_batch_values(
         } else {
             phase_start = SteadyClock::now();
             auto phase_channel_start = bspn_channel_snapshot(context);
-            auto local_ids = compute_leaf_local_ids_batched(
-                model,
-                leaf_children,
-                match_masks,
-                context,
-                eval_stats != nullptr ? &eval_stats->phase1_batch_dot_calls : nullptr);
+            const bool packed_bitmap_mode =
+                bspn_bitmap_eval_mode() == BSPNBitmapEvalMode::PackedDisjointV1;
+            std::vector<sbMatrix> local_ids;
+            std::vector<sbMatrix> packed_local_ids;
+            if (packed_bitmap_mode) {
+                packed_local_ids = compute_leaf_local_ids_packed(
+                    model,
+                    leaf_children,
+                    match_masks,
+                    context,
+                    eval_stats);
+            } else {
+                local_ids = compute_leaf_local_ids_batched(
+                    model,
+                    leaf_children,
+                    match_masks,
+                    context,
+                    eval_stats);
+            }
             if (!bspn_multiplier_product_local_overlay_rows() &&
                 model.manifest().secure_multiplier_row_value_overlay_only &&
                 !model.manifest().secure_multiplier_leaf_row_value_node_ids.empty()) {
                 const auto& overlay_leaf_ids = model.manifest().secure_multiplier_leaf_row_value_node_ids;
+                const auto packed_global_rows = packed_bitmap_mode
+                    ? pack_dense_boolean_rows(global_rows_shared, model.manifest().total_rows)
+                    : sbMatrix();
                 for (std::size_t child_idx = 0; child_idx < leaf_children.size(); ++child_idx) {
                     const auto node_id = leaf_children[child_idx]->node_id;
                     if (std::find(overlay_leaf_ids.begin(), overlay_leaf_ids.end(), node_id) != overlay_leaf_ids.end()) {
-                        local_ids[child_idx] = global_rows_shared;
+                        if (packed_bitmap_mode) {
+                            packed_local_ids[child_idx] = packed_global_rows;
+                        } else {
+                            local_ids[child_idx] = global_rows_shared;
+                        }
                     }
                 }
             }
             if (context.debug_internal_reveal && std::getenv("BSPN_DEBUG_LEAF_EVIDENCE_FLAGS") != nullptr) {
+                if (packed_bitmap_mode) {
+                    local_ids.clear();
+                    local_ids.reserve(packed_local_ids.size());
+                    for (const auto& packed_local_id : packed_local_ids) {
+                        local_ids.push_back(unpack_packed_boolean_words(
+                            packed_local_id,
+                            model.manifest().total_rows));
+                    }
+                }
                 if (context.role == 0) {
                     std::cerr << "bspn_debug_leaf_local_id_counts:"
                               << " factor_index=" << factor.factor.factor_index
@@ -5881,21 +6440,54 @@ std::vector<SecureRationalShare> evaluate_leaf_product_batch_values(
 
             phase_start = SteadyClock::now();
             phase_channel_start = bspn_channel_snapshot(context);
-            for (const auto& item : product_items) {
-                sbMatrix final_ids = item.leaf_count == 0 ? global_rows_shared : local_ids[item.leaf_begin];
-                for (std::size_t idx = 1; idx < item.leaf_count; ++idx) {
-                    sbMatrix next(final_ids.rows(), final_ids.bitCount());
-                    bool_cipher_and(
-                        context.role,
-                        final_ids,
-                        local_ids[item.leaf_begin + idx],
-                        next,
-                        *(context.enc),
-                        *(context.eval),
-                        *(context.runtime));
-                    final_ids = std::move(next);
+            if (packed_bitmap_mode) {
+                const auto packed_global_rows =
+                    pack_dense_boolean_rows(global_rows_shared, model.manifest().total_rows);
+                for (const auto& item : product_items) {
+                    sbMatrix packed_final_ids = item.leaf_count == 0
+                        ? packed_global_rows
+                        : packed_local_ids[item.leaf_begin];
+                    for (std::size_t idx = 1; idx < item.leaf_count; ++idx) {
+                        sbMatrix next(packed_final_ids.rows(), 64);
+                        bool_cipher_and(
+                            context.role,
+                            packed_final_ids,
+                            packed_local_ids[item.leaf_begin + idx],
+                            next,
+                            *(context.enc),
+                            *(context.eval),
+                            *(context.runtime));
+                        mask_packed_bitmap_tail(next, model.manifest().total_rows);
+                        packed_final_ids = std::move(next);
+                        if (eval_stats != nullptr) {
+                            ++eval_stats->packed_and_calls;
+                            ++eval_stats->secure_bitmap_and_calls;
+                        }
+                    }
+                    final_ids_by_product.push_back(unpack_packed_boolean_words(
+                        packed_final_ids,
+                        model.manifest().total_rows));
+                    if (eval_stats != nullptr) {
+                        ++eval_stats->final_dense_unpack_count;
+                    }
                 }
-                final_ids_by_product.push_back(std::move(final_ids));
+            } else {
+                for (const auto& item : product_items) {
+                    sbMatrix final_ids = item.leaf_count == 0 ? global_rows_shared : local_ids[item.leaf_begin];
+                    for (std::size_t idx = 1; idx < item.leaf_count; ++idx) {
+                        sbMatrix next(final_ids.rows(), final_ids.bitCount());
+                        bool_cipher_and(
+                            context.role,
+                            final_ids,
+                            local_ids[item.leaf_begin + idx],
+                            next,
+                            *(context.enc),
+                            *(context.eval),
+                            *(context.runtime));
+                        final_ids = std::move(next);
+                    }
+                    final_ids_by_product.push_back(std::move(final_ids));
+                }
             }
             if (eval_stats != nullptr) {
                 eval_stats->phase2_intersection_ms += elapsed_ms_since(phase_start);
@@ -6487,14 +7079,74 @@ std::vector<SecureRationalShare> evaluate_leaf_product_batch_values(
             }
             return;
         }
-        constexpr double kCountSelectivityPayloadScale =
-            static_cast<double>(std::uint64_t(1) << kFlatBSPNDecimal);
-        const std::uint64_t public_sample_rows =
-            factor.factor.total_rows != 0 ? factor.factor.total_rows : model.manifest().total_rows;
-        if (public_sample_rows < static_cast<std::uint64_t>(40000)) {
-            push_fixed_rows_as_rationals(selectivity_num_nonzero_rows, destination);
+        if (product_count > 1) {
+            // Python sums the scalar selectivity of each public product child.
+            // Preserve that semantic while carrying small probabilities in a
+            // finer internal unit.  Computing the ratio after the exact public
+            // integer upscale avoids losing rare counts (for example 47/25000)
+            // to the ordinary D16 grid before the parent SUM is evaluated.
+            // The fixed scale and this branch depend only on public model shape.
+            constexpr std::uint64_t kMultiProductSelectivityPayloadUpscale = 4096;
+            const auto scaled_count_rows = mul_fixed_shares_by_public_integer_raw(
+                denominator_cnt_rows,
+                kMultiProductSelectivityPayloadUpscale);
+            const auto scaled_selectivity_raw_rows =
+                secure_ratio_power2_normalized_same_shape(
+                    scaled_count_rows,
+                    safe_node_cardinality_rows,
+                    public_node_cardinality_upper_bound,
+                    context);
+            if (eval_stats != nullptr) {
+                ++eval_stats->internal_reciprocal_calls;
+            }
+            const auto scaled_one_rows = repeat_fixed_scalar_matrix(
+                share_fixed_scalar<kFlatBSPNDecimal>(
+                    static_cast<double>(kMultiProductSelectivityPayloadUpscale),
+                    0,
+                    context),
+                product_count,
+                1);
+            auto precision_selectivity_rows = select_fixed_by_bool_same_shape(
+                scaled_one_rows,
+                scaled_selectivity_raw_rows,
+                denominator_is_cardinality_rows,
+                context);
+            precision_selectivity_rows = fixed_mul_bool_same_shape(
+                precision_selectivity_rows,
+                has_nonempty_node_rows,
+                context);
+            auto precision_selectivity_for_zero_cmp = precision_selectivity_rows;
+            auto zero_for_scaled_selectivity_cmp = zero_product_rows;
+            sbMatrix scaled_selectivity_zero_rows;
+            cipher_eq(
+                context.role,
+                precision_selectivity_for_zero_cmp,
+                zero_for_scaled_selectivity_cmp,
+                scaled_selectivity_zero_rows,
+                *(context.eval),
+                *(context.runtime));
+            for (u64 product_idx = 0; product_idx < product_count; ++product_idx) {
+                SecureRationalShare value{
+                    fixed_row_slice(
+                        precision_selectivity_rows,
+                        static_cast<std::uint32_t>(product_idx),
+                        1),
+                    one_fixed,
+                    1.0 / static_cast<double>(kMultiProductSelectivityPayloadUpscale),
+                    1.0,
+                    true,
+                };
+                value.has_secret_zero_numerator = true;
+                value.secret_zero_numerator = bool_row_slice(
+                    scaled_selectivity_zero_rows,
+                    static_cast<std::uint32_t>(product_idx),
+                    1);
+                destination.push_back(std::move(value));
+            }
             return;
         }
+        constexpr double kCountSelectivityPayloadScale =
+            static_cast<double>(std::uint64_t(1) << kFlatBSPNDecimal);
         constexpr double kInvCountSelectivityPayloadScale =
             1.0 / kCountSelectivityPayloadScale;
         for (u64 product_idx = 0; product_idx < product_count; ++product_idx) {
@@ -6607,7 +7259,12 @@ std::vector<SecureRationalShare> evaluate_leaf_product_batch_values(
                 use_guard,
                 static_cast<std::uint32_t>(guarded_num_rows.rows())),
             context);
-        if (private_target_precision_upscaled_out != nullptr) {
+        // Cardinality factors deliberately retain their original row-value
+        // precision.  Their magnitude guard therefore selects between two
+        // identically scaled payloads and must not request the final x2048
+        // restoration used by scaled SUM/AVG targets.
+        if (private_target_precision_upscaled_out != nullptr &&
+            !preserve_cardinality_target_precision) {
             *private_target_precision_upscaled_out = bool_or_scalar(
                 *private_target_precision_upscaled_out,
                 use_guard,
@@ -6963,9 +7620,28 @@ SecureRationalShare evaluate_indicator_oblivious_secure(
     // scope-missing guard would incorrectly zero every decomposed child.
     const bool use_legacy_internal_scope_missing_guard =
         !bspn_has_public_uniform_model_structure(manifest.public_structure_mode);
-    const auto& secret_payload = model.secret_shared_payload().dense_bucket_bitmaps_loaded
+    // Global-leaf padding can make a SUM node contain many more zero-valued
+    // padded children than the corresponding leaf-product layout.  The
+    // padding does not change the logical sum, but evaluating every secret
+    // weight at the ordinary D20 unit accumulates enough randomized
+    // truncation noise to make otherwise identical padded evaluations vary at
+    // the numerical-fidelity boundary.  Use one fixed public guard for every
+    // private-target SUM in this padding mode.  weighted_sum_secure_rational()
+    // restores the scale after the sum, so this changes neither semantics nor
+    // query-dependent control flow.
+    constexpr double kGlobalLeafPrivateTargetTermUpscale = 4.0;
+    const double effective_private_target_weighted_sum_upscale =
+        manifest.bucket_padding_scope == "global_leaf"
+            ? std::max(
+                  private_target_weighted_sum_upscale,
+                  kGlobalLeafPrivateTargetTermUpscale)
+            : private_target_weighted_sum_upscale;
+    const bool bitmap_payload_loaded =
+        model.secret_shared_payload().dense_bucket_bitmaps_loaded ||
+        model.secret_shared_payload().packed_bucket_bitmaps_loaded;
+    const auto& secret_payload = bitmap_payload_loaded
         ? model.secret_shared_payload()
-        : throw std::runtime_error("secure shared payload not loaded");
+        : throw std::runtime_error("secure shared bitmap payload not loaded");
     (void)secret_payload;
     const auto& node_records = model.nodes();
     const auto& child_ids = model.children();
@@ -7188,7 +7864,7 @@ SecureRationalShare evaluate_indicator_oblivious_secure(
                     ? &sum_child_node_ids
                     : nullptr,
                 public_factor_feature_count >= 1
-                    ? private_target_weighted_sum_upscale
+                    ? effective_private_target_weighted_sum_upscale
                     : 256.0);
             if (evidence_root_out != nullptr) {
                 std::vector<SecureRationalShare> evidence_child_values;
@@ -7583,8 +8259,9 @@ SecureBundleExecutionResult evaluate_secure_bundle_impl_secure(
 	        std::uint64_t previous_factor_total_rows = 0;
 	        bool previous_factor_weighted_count_direct = false;
 	        bool previous_factor_requires_model_eval = false;
-	        bool previous_factor_inverse = false;
-	        bool has_previous_factor = false;
+		        bool previous_factor_inverse = false;
+		        bool has_previous_factor = false;
+		        std::uint64_t multiplied_non_unit_factor_count = 0;
         auto factor_is_public_unit = [](const SecureBoundFactor& bound) {
             if (bound.factor.factor_kind == "CONSTANT") {
                 return std::abs(bound.factor.public_constant_value - 1.0) <= 1e-12;
@@ -7607,11 +8284,37 @@ SecureBundleExecutionResult evaluate_secure_bundle_impl_secure(
 	                has_previous_factor = false;
 	                return;
 	            }
-	            const auto product_before_current_factor = product;
-	            if (product_is_initial_unit) {
-                product = factor_value;
-            } else {
-                const bool cancels_public_cardinality_denominator =
+		            const auto product_before_current_factor = product;
+		            if (product_is_initial_unit) {
+	                product = factor_value;
+	            } else {
+	                const bool needs_probability_prefix_checkpoint =
+	                    profile_section == "cardinality" &&
+	                    multiplied_non_unit_factor_count >= 4 &&
+	                    product.denominator_is_one &&
+	                    factor_value.denominator_is_one &&
+	                    product.numerator_scale > 1.0 &&
+	                    factor_value.numerator_scale > 0.0 &&
+	                    factor_value.numerator_scale < 1.0;
+	                if (needs_probability_prefix_checkpoint) {
+	                    // A large cardinality prefix can still have a moderately
+	                    // large encoded payload even though its public semantic
+	                    // scale is already greater than one. Multiplying that
+	                    // payload by a precision-boosted probability payload can
+	                    // overflow the signed 64-bit D16 product before the
+	                    // tracked scales restore the semantic value. Apply one
+	                    // fixed public checkpoint for this public scale shape.
+	                    // The decision uses no query value or intermediate
+	                    // plaintext and therefore preserves fixed control flow.
+	                    constexpr double kProbabilityPrefixPayloadScale = 1.0 / 4096.0;
+	                    product = normalize_factor_root_rational(
+	                        product,
+	                        context,
+	                        kProbabilityPrefixPayloadScale,
+	                        false,
+	                        true);
+	                }
+	                const bool cancels_public_cardinality_denominator =
                     profile_section == "cardinality" &&
                     product.denominator_is_one &&
                     product.numerator_scale > 1000000.0 &&
@@ -7719,9 +8422,10 @@ SecureBundleExecutionResult evaluate_secure_bundle_impl_secure(
 	            previous_factor_weighted_count_direct = bound.factor.weighted_count_direct;
 	            previous_factor_requires_model_eval = bound.factor.requires_model_eval;
 	            previous_factor_inverse = bound.factor.inverse;
-	            has_previous_factor = true;
-	            product_is_initial_unit = false;
-	        };
+		            has_previous_factor = true;
+		            product_is_initial_unit = false;
+		            ++multiplied_non_unit_factor_count;
+		        };
         auto public_exact_inverse_pair = [](const json& forward, const json& inverse) {
             const auto kind = forward.value("factor_kind", std::string());
             return
@@ -7844,6 +8548,11 @@ SecureBundleExecutionResult evaluate_secure_bundle_impl_secure(
                         }
                         factor_timing_doc["padding_bucket_count"] = manifest.padding_bucket_count;
                         factor_timing_doc["bucket_padding_scope"] = manifest.bucket_padding_scope;
+                        factor_timing_doc["leaf_bucket_membership_invariant"] =
+                            manifest.leaf_bucket_membership_invariant;
+                        factor_timing_doc["partition_attestation_sha256"] =
+                            manifest.leaf_bitmap_source_sha256;
+                        factor_timing_doc["bitmap_logical_rows"] = manifest.total_rows;
                         factor_timing_doc["sample_total_rows"] = manifest.sample_total_rows;
                     }
                 }
@@ -8069,6 +8778,11 @@ SecureBundleExecutionResult evaluate_secure_bundle_impl_secure(
                     }
                     factor_timing_doc["padding_bucket_count"] = manifest.padding_bucket_count;
                     factor_timing_doc["bucket_padding_scope"] = manifest.bucket_padding_scope;
+                    factor_timing_doc["leaf_bucket_membership_invariant"] =
+                        manifest.leaf_bucket_membership_invariant;
+                    factor_timing_doc["partition_attestation_sha256"] =
+                        manifest.leaf_bitmap_source_sha256;
+                    factor_timing_doc["bitmap_logical_rows"] = manifest.total_rows;
                     factor_timing_doc["sample_total_rows"] = manifest.sample_total_rows;
                 }
             }
@@ -8200,7 +8914,18 @@ SecureBundleExecutionResult evaluate_secure_bundle_impl_secure(
         public_plan_doc["cardinality_plan"].is_object()) {
         const std::string conditional_semantics =
             public_plan_doc.value("conditional_factor_semantics_version", std::string());
-        if (conditional_semantics == "baseline_cm_a_v3") {
+        const std::string conditional_direct_mode =
+            public_plan_doc.contains("conditional_direct_count_plan") &&
+                    public_plan_doc["conditional_direct_count_plan"].is_object()
+                ? public_plan_doc["conditional_direct_count_plan"].value(
+                      "evaluation_mode",
+                      std::string("direct_row_product_v1"))
+                : std::string();
+        const bool use_conditional_direct_count =
+            conditional_semantics == "baseline_cm_a_v3" &&
+            (conditional_direct_mode == "direct_row_product_v1" ||
+             conditional_direct_mode == "direct_fixed_product_v2");
+        if (use_conditional_direct_count) {
             cardinality_rational = evaluate_conditional_direct_count_secure(
                 public_plan_doc,
                 secure_payload,
@@ -8221,13 +8946,20 @@ SecureBundleExecutionResult evaluate_secure_bundle_impl_secure(
             // Factor count is public query-shape metadata; no predicate or
             // intermediate value controls this branch.
             constexpr std::size_t kDeepCardinalityFactorThreshold = 8;
+            // Weighted Multiplier targets are combined across every public
+            // SUM child. Keeping the default 1x D16 payload loses one
+            // randomized truncation unit per child, which is material for
+            // low-cardinality COUNT estimates. This fixed public upscale is
+            // restored by weighted_sum_secure_rational(); it depends only on
+            // the public aggregation shape, never on query shares or values.
+            constexpr double kCardinalityPrivateTargetTermUpscale = 256.0;
             const bool stabilize_deep_cardinality_chain =
                 cardinality_factors.size() >= kDeepCardinalityFactorThreshold;
             cardinality_rational = eval_factor_product_secure(
                 cardinality_factors,
                 &cardinality_factor_debug,
                 "cardinality",
-                1.0,
+                kCardinalityPrivateTargetTermUpscale,
                 stabilize_deep_cardinality_chain,
                 true);
             if (factor_array_has_large_public_scale(cardinality_factors)) {
@@ -8380,6 +9112,8 @@ SecureBundleExecutionResult evaluate_secure_bundle_impl_secure(
                 auto denominator_factors =
                     term_doc.value("denominator_plan", json::object()).value("factors", json::array());
                 std::uint64_t cancelled_public_constants = 0;
+                std::uint64_t cancelled_secure_common_factors = 0;
+                json common_factor_validity_factors = json::array();
                 if (aggregation_type == "AVG") {
                     const std::size_t common_count = std::min(
                         numerator_factors.size(),
@@ -8405,14 +9139,52 @@ SecureBundleExecutionResult evaluate_secure_bundle_impl_secure(
                         denominator_factors[idx]["public_constant_value"] = 1.0;
                         ++cancelled_public_constants;
                     }
+                    json residual_numerator_factors = json::array();
+                    json residual_denominator_factors = json::array();
+                    for (std::size_t idx = 0; idx < numerator_factors.size(); ++idx) {
+                        const auto& numerator_factor = numerator_factors[idx];
+                        const std::string common_id =
+                            numerator_factor.value("avg_common_factor_id", std::string());
+                        bool cancel_pair = false;
+                        if (!common_id.empty() && idx < denominator_factors.size()) {
+                            const auto& denominator_factor = denominator_factors[idx];
+                            cancel_pair =
+                                denominator_factor.value("avg_common_factor_id", std::string()) == common_id;
+                        }
+                        if (cancel_pair) {
+                            common_factor_validity_factors.push_back(numerator_factor);
+                            ++cancelled_secure_common_factors;
+                        } else {
+                            residual_numerator_factors.push_back(numerator_factor);
+                        }
+                    }
+                    for (std::size_t idx = 0; idx < denominator_factors.size(); ++idx) {
+                        const auto& denominator_factor = denominator_factors[idx];
+                        const std::string common_id =
+                            denominator_factor.value("avg_common_factor_id", std::string());
+                        bool cancel_pair = false;
+                        if (!common_id.empty() && idx < numerator_factors.size()) {
+                            const auto& numerator_factor = numerator_factors[idx];
+                            cancel_pair =
+                                numerator_factor.value("avg_common_factor_id", std::string()) == common_id;
+                        }
+                        if (!cancel_pair) {
+                            residual_denominator_factors.push_back(denominator_factor);
+                        }
+                    }
+                    numerator_factors = std::move(residual_numerator_factors);
+                    denominator_factors = std::move(residual_denominator_factors);
                 }
-	                // Factorized AVG target payloads may already carry a large
-	                // row-value sum when they reach a SUM-node weight product.
-	                // Store the weighted terms in a fixed public 1/16 unit and
-	                // restore that unit after summation.  This keeps the D20
-	                // multiplication inside the 64-bit ring without selecting or
-	                // revealing the private target column.
-	                constexpr double kFactorizedAvgTargetWeightedSumScale = 1.0 / 16.0;
+	                // Leaf evaluation has already converted the selected target
+	                // sum to a conditional mean and applies the private
+	                // high-magnitude payload guard when required.  Applying an
+	                // additional 1/16 scale at every SUM node only discards four
+	                // D20 precision bits; restoring the scale later amplifies the
+	                // randomized truncation error for low-valued targets such as
+	                // l_discount.  Keep the ordinary D20 unit here.  This choice
+	                // is fixed for every private target and does not inspect or
+	                // reveal the selected column.
+	                constexpr double kFactorizedAvgTargetWeightedSumScale = 1.0;
 	                auto numerator_rational = eval_factor_product_secure(
 	                    numerator_factors,
 	                    &numerator_factor_debug,
@@ -8422,6 +9194,37 @@ SecureBundleExecutionResult evaluate_secure_bundle_impl_secure(
 	                    : 1.0,
 	                aggregation_type == "SUM" || aggregation_type == "AVG");
                 if (aggregation_type == "AVG") {
+                    auto common_factors_valid = shared_true_bool_scalar(context);
+                    for (const auto& common_factor_doc : common_factor_validity_factors) {
+                        json common_factor_debug = json::array();
+                        auto common_value = eval_factor_product_secure(
+                            json::array({common_factor_doc}),
+                            &common_factor_debug,
+                            "avg_common_validity",
+                            1.0,
+                            false);
+                        sbMatrix common_factor_valid;
+                        if (common_factor_doc.value("inverse", false)) {
+                            common_factor_valid = rational_positive_denominator_flag(
+                                common_value,
+                                context);
+                        } else {
+                            common_factor_valid = bool_not_scalar(
+                                rational_zero_numerator_flag(common_value, context),
+                                context);
+                        }
+                        common_factors_valid = bool_and_scalar(
+                            common_factors_valid,
+                            common_factor_valid,
+                            context);
+                        if (context.debug_internal_reveal) {
+                            denominator_factor_debug.push_back({
+                                {"factor_kind", "AVG_COMMON_FACTOR_VALIDITY"},
+                                {"avg_common_factor_id", common_factor_doc.value("avg_common_factor_id", std::string())},
+                                {"factor_debug", common_factor_debug},
+                            });
+                        }
+                    }
                     auto denominator_rational = eval_factor_product_secure(
                     denominator_factors,
                     &denominator_factor_debug,
@@ -8451,6 +9254,13 @@ SecureBundleExecutionResult evaluate_secure_bundle_impl_secure(
                         invert_secure_rational(denominator_rational),
                         context);
                 }
+				if (!common_factor_validity_factors.empty()) {
+				    current_value.denominator = fixed_mul_bool_same_shape(
+				        current_value.denominator,
+				        common_factors_valid,
+				        context);
+				    current_value.denominator_is_one = false;
+				}
 	                // secure_ratio_power2_normalized() already scales numerator
                 // and denominator together using a secret fixed-shape choice.
                 // The historical public 1/128 pre-scale therefore adds two
@@ -8467,6 +9277,7 @@ SecureBundleExecutionResult evaluate_secure_bundle_impl_secure(
                     denominator_factor_debug.push_back({
                         {"factor_kind", "PUBLIC_CONSTANT_CANCELLATION"},
                         {"cancelled_public_constants", cancelled_public_constants},
+                        {"cancelled_secure_common_factors", cancelled_secure_common_factors},
                     });
                 }
             } else {
@@ -8729,6 +9540,22 @@ void FlatBSPNModel::load_public_manifest(const std::string& manifest_path) {
         manifest_doc.value("model_secret_share_payload_dir", std::string("secret_shares/model"));
     manifest_.model_secret_share_payload_layout =
         manifest_doc.value("model_secret_share_payload_layout", std::string("pair_matrix_v1"));
+    manifest_.leaf_bucket_membership_invariant = manifest_doc.value(
+        "leaf_bucket_membership_invariant",
+        std::string());
+    manifest_.leaf_bucket_membership_attested = manifest_doc.value(
+        "leaf_bucket_membership_attested",
+        false);
+    manifest_.leaf_bitmap_source_sha256 = manifest_doc.value(
+        "leaf_bitmap_source_sha256",
+        std::string());
+    if (bspn_bitmap_partition_attestation_required() &&
+        (!manifest_.leaf_bucket_membership_attested ||
+         manifest_.leaf_bucket_membership_invariant != "pairwise_disjoint_v1" ||
+         manifest_.leaf_bitmap_source_sha256.size() != 64)) {
+        throw std::runtime_error(
+            "Optimized bitmap evaluation requires a pairwise_disjoint_v1 leaf bitmap attestation.");
+    }
     manifest_.secure_multiplier_materialized = manifest_doc.value("secure_multiplier_materialized", false);
     manifest_.secure_share_payload_dir = manifest_doc.value("secure_share_payload_dir", std::string("secret_shares"));
     manifest_.secure_share_payload_layout = manifest_doc.value("secure_share_payload_layout", std::string("consolidated_v1"));
@@ -9211,6 +10038,23 @@ void FlatBSPNModel::load_secret_payload(const FlatBSPNSecureContext& context) {
             model_share_decimal_bits = model_share_manifest.value(
                 "fixed_decimal_bits",
                 kFlatBSPNStoredDecimalBits);
+            if (bspn_bitmap_partition_attestation_required()) {
+                const auto share_invariant = model_share_manifest.value(
+                    "leaf_bucket_membership_invariant",
+                    std::string());
+                const auto share_attested = model_share_manifest.value(
+                    "leaf_bucket_membership_attested",
+                    false);
+                const auto share_source_hash = model_share_manifest.value(
+                    "leaf_bitmap_source_sha256",
+                    std::string());
+                if (!share_attested ||
+                    share_invariant != manifest_.leaf_bucket_membership_invariant ||
+                    share_source_hash != manifest_.leaf_bitmap_source_sha256) {
+                    throw std::runtime_error(
+                        "Model/share manifest bitmap partition attestation mismatch.");
+                }
+            }
         }
         auto load_fixed = [&](const std::string& name, std::size_t rows, std::size_t cols) {
             return read_fixed_share_pair_matrix<kFlatBSPNDecimal>(
@@ -9277,7 +10121,7 @@ void FlatBSPNModel::load_secret_payload(const FlatBSPNSecureContext& context) {
         }
         secret_shared_payload_.leaf_bitmaps = si64Matrix(0, 0);
         secret_shared_payload_.dense_bucket_bitmaps.clear();
-        secret_shared_payload_.dense_bucket_bitmaps.reserve(buckets_.size());
+        secret_shared_payload_.packed_bucket_bitmaps.clear();
         const u64 kMaxBitmapShareRowsPerChunk = bspn_bitmap_share_rows_per_chunk();
         const u64 total_rows_u64 = static_cast<u64>(manifest_.total_rows);
         const u64 buckets_per_chunk =
@@ -9286,45 +10130,59 @@ void FlatBSPNModel::load_secret_payload(const FlatBSPNSecureContext& context) {
                 : std::max<u64>(1, kMaxBitmapShareRowsPerChunk / std::max<u64>(1, total_rows_u64));
         if (bucket_count > 0 && total_rows_u64 > 0) {
             const std::string dense_bitmap_path = join_path(model_share_role_dir, "leaf_bitmaps.shares.bin");
-            const auto shared_flat_bitmaps = read_bool_share_pair_column_bitpacked(
-                dense_bitmap_path,
-                bucket_count * static_cast<std::size_t>(total_rows_u64));
-            for (std::size_t bucket_begin = 0; bucket_begin < buckets_.size(); bucket_begin += buckets_per_chunk) {
-                const std::size_t bucket_end = std::min<std::size_t>(
-                    buckets_.size(),
-                    bucket_begin + static_cast<std::size_t>(buckets_per_chunk));
-                const std::size_t chunk_bucket_count = bucket_end - bucket_begin;
-                sbMatrix shared_chunk(static_cast<u64>(chunk_bucket_count) * total_rows_u64, shared_flat_bitmaps.bitCount());
-                for (u64 row = 0; row < static_cast<u64>(chunk_bucket_count) * total_rows_u64; ++row) {
-                    const u64 source_row = static_cast<u64>(bucket_begin) * total_rows_u64 + row;
-                    for (u64 col = 0; col < static_cast<u64>(shared_flat_bitmaps.mShares[0].cols()); ++col) {
-                        shared_chunk.mShares[0](row, col) = shared_flat_bitmaps.mShares[0](source_row, col);
-                        shared_chunk.mShares[1](row, col) = shared_flat_bitmaps.mShares[1](source_row, col);
-                    }
-                }
-                std::vector<sbMatrix> chunk_bitmaps;
-                chunk_bitmaps.reserve(chunk_bucket_count);
-                for (std::size_t local_bucket_idx = 0; local_bucket_idx < chunk_bucket_count; ++local_bucket_idx) {
-                    chunk_bitmaps.emplace_back(total_rows_u64, shared_chunk.bitCount());
-                }
-                #pragma omp parallel for schedule(static)
-                for (std::int64_t local_bucket_idx_signed = 0; local_bucket_idx_signed < static_cast<std::int64_t>(chunk_bucket_count); ++local_bucket_idx_signed) {
-                    const auto local_bucket_idx = static_cast<std::size_t>(local_bucket_idx_signed);
-                    auto& shared_bitmap = chunk_bitmaps[local_bucket_idx];
-                    const u64 row_begin = static_cast<u64>(local_bucket_idx) * total_rows_u64;
-                    for (u64 row = 0; row < total_rows_u64; ++row) {
-                        for (u64 col = 0; col < static_cast<u64>(shared_chunk.mShares[0].cols()); ++col) {
-                            shared_bitmap.mShares[0](row, col) = shared_chunk.mShares[0](row_begin + row, col);
-                            shared_bitmap.mShares[1](row, col) = shared_chunk.mShares[1](row_begin + row, col);
+            if (bspn_bitmap_eval_mode() == BSPNBitmapEvalMode::PackedDisjointV1) {
+                secret_shared_payload_.packed_bucket_bitmaps =
+                    read_bool_share_pair_bucket_words_bitpacked(
+                        dense_bitmap_path,
+                        bucket_count,
+                        total_rows_u64);
+                secret_shared_payload_.packed_bucket_bitmaps_loaded = true;
+            } else {
+                secret_shared_payload_.dense_bucket_bitmaps.reserve(buckets_.size());
+                const auto shared_flat_bitmaps = read_bool_share_pair_column_bitpacked(
+                    dense_bitmap_path,
+                    bucket_count * static_cast<std::size_t>(total_rows_u64));
+                for (std::size_t bucket_begin = 0; bucket_begin < buckets_.size(); bucket_begin += buckets_per_chunk) {
+                    const std::size_t bucket_end = std::min<std::size_t>(
+                        buckets_.size(),
+                        bucket_begin + static_cast<std::size_t>(buckets_per_chunk));
+                    const std::size_t chunk_bucket_count = bucket_end - bucket_begin;
+                    sbMatrix shared_chunk(static_cast<u64>(chunk_bucket_count) * total_rows_u64, shared_flat_bitmaps.bitCount());
+                    for (u64 row = 0; row < static_cast<u64>(chunk_bucket_count) * total_rows_u64; ++row) {
+                        const u64 source_row = static_cast<u64>(bucket_begin) * total_rows_u64 + row;
+                        for (u64 col = 0; col < static_cast<u64>(shared_flat_bitmaps.mShares[0].cols()); ++col) {
+                            shared_chunk.mShares[0](row, col) = shared_flat_bitmaps.mShares[0](source_row, col);
+                            shared_chunk.mShares[1](row, col) = shared_flat_bitmaps.mShares[1](source_row, col);
                         }
                     }
+                    std::vector<sbMatrix> chunk_bitmaps;
+                    chunk_bitmaps.reserve(chunk_bucket_count);
+                    for (std::size_t local_bucket_idx = 0; local_bucket_idx < chunk_bucket_count; ++local_bucket_idx) {
+                        chunk_bitmaps.emplace_back(total_rows_u64, shared_chunk.bitCount());
+                    }
+                    #pragma omp parallel for schedule(static)
+                    for (std::int64_t local_bucket_idx_signed = 0; local_bucket_idx_signed < static_cast<std::int64_t>(chunk_bucket_count); ++local_bucket_idx_signed) {
+                        const auto local_bucket_idx = static_cast<std::size_t>(local_bucket_idx_signed);
+                        auto& shared_bitmap = chunk_bitmaps[local_bucket_idx];
+                        const u64 row_begin = static_cast<u64>(local_bucket_idx) * total_rows_u64;
+                        for (u64 row = 0; row < total_rows_u64; ++row) {
+                            for (u64 col = 0; col < static_cast<u64>(shared_chunk.mShares[0].cols()); ++col) {
+                                shared_bitmap.mShares[0](row, col) = shared_chunk.mShares[0](row_begin + row, col);
+                                shared_bitmap.mShares[1](row, col) = shared_chunk.mShares[1](row_begin + row, col);
+                            }
+                        }
+                    }
+                    for (auto& shared_bitmap : chunk_bitmaps) {
+                        secret_shared_payload_.dense_bucket_bitmaps.push_back(std::move(shared_bitmap));
+                    }
                 }
-                for (auto& shared_bitmap : chunk_bitmaps) {
-                    secret_shared_payload_.dense_bucket_bitmaps.push_back(std::move(shared_bitmap));
-                }
+                secret_shared_payload_.dense_bucket_bitmaps_loaded = true;
             }
         }
-        secret_shared_payload_.dense_bucket_bitmaps_loaded = true;
+        if (bspn_bitmap_eval_mode() == BSPNBitmapEvalMode::PackedDisjointV1 &&
+            !secret_shared_payload_.packed_bucket_bitmaps_loaded) {
+            secret_shared_payload_.packed_bucket_bitmaps_loaded = bucket_count == 0;
+        }
         loaded_from_model_share_dir = true;
     }
 
@@ -9481,6 +10339,19 @@ void FlatBSPNModel::load_secret_payload(const FlatBSPNSecureContext& context) {
 secret_shared_payload_.dense_bucket_bitmaps_loaded = true;
     }
 
+    if (bspn_bitmap_eval_mode() == BSPNBitmapEvalMode::PackedDisjointV1 &&
+        !secret_shared_payload_.packed_bucket_bitmaps_loaded &&
+        secret_shared_payload_.dense_bucket_bitmaps_loaded) {
+        secret_shared_payload_.packed_bucket_bitmaps.clear();
+        secret_shared_payload_.packed_bucket_bitmaps.reserve(
+            secret_shared_payload_.dense_bucket_bitmaps.size());
+        for (const auto& bitmap : secret_shared_payload_.dense_bucket_bitmaps) {
+            secret_shared_payload_.packed_bucket_bitmaps.push_back(
+                pack_dense_boolean_rows(bitmap, manifest_.total_rows));
+        }
+        secret_shared_payload_.packed_bucket_bitmaps_loaded = true;
+    }
+
     if (manifest_.secure_multiplier_materialized ||
         !manifest_.secure_multiplier_bucket_indices.empty() ||
         !manifest_.secure_multiplier_leaf_row_value_node_ids.empty()) {
@@ -9492,6 +10363,20 @@ secret_shared_payload_.dense_bucket_bitmaps_loaded = true;
         if (secure_bucket_count == 0 && !has_row_value_overlay) {
             throw std::runtime_error("Secure multiplier materialized payload has no bucket indices.");
         }
+        auto store_secure_bitmap = [&](std::uint32_t bucket_index, sbMatrix&& bitmap) {
+            if (bspn_bitmap_eval_mode() == BSPNBitmapEvalMode::PackedDisjointV1) {
+                if (bucket_index >= secret_shared_payload_.packed_bucket_bitmaps.size()) {
+                    throw std::runtime_error("Secure multiplier bucket index is out of packed bitmap bounds.");
+                }
+                secret_shared_payload_.packed_bucket_bitmaps[bucket_index] =
+                    pack_dense_boolean_rows(bitmap, manifest_.total_rows);
+            } else {
+                if (bucket_index >= secret_shared_payload_.dense_bucket_bitmaps.size()) {
+                    throw std::runtime_error("Secure multiplier bucket index is out of dense bitmap bounds.");
+                }
+                secret_shared_payload_.dense_bucket_bitmaps[bucket_index] = std::move(bitmap);
+            }
+        };
         const std::string share_root = join_path(base_dir_, manifest_.secure_share_payload_dir.empty()
             ? std::string("secret_shares")
             : manifest_.secure_share_payload_dir);
@@ -9556,8 +10441,7 @@ secret_shared_payload_.dense_bucket_bitmaps_loaded = true;
                 if (mapping.global_bucket_id != bucket_index) {
                     throw std::runtime_error("Secure multiplier per-leaf mapping bucket id mismatch.");
                 }
-                if (bucket_index >= secret_shared_payload_.dense_bucket_bitmaps.size() ||
-                    bucket_index >= static_cast<std::uint32_t>(secret_shared_payload_.bucket_values.rows())) {
+                if (bucket_index >= static_cast<std::uint32_t>(secret_shared_payload_.bucket_values.rows())) {
                     throw std::runtime_error("Secure multiplier bucket index is out of bounds.");
                 }
                 if (mapping.leaf_local_bucket_idx >= leaf_bucket_count) {
@@ -9590,7 +10474,7 @@ secret_shared_payload_.dense_bucket_bitmaps_loaded = true;
                         bitmap.mShares[1](row, col) = leaf_bitmaps.mShares[1](source_begin + row, col);
                     }
                 }
-                secret_shared_payload_.dense_bucket_bitmaps[bucket_index] = std::move(bitmap);
+                store_secure_bitmap(bucket_index, std::move(bitmap));
             }
 
             if (secret_shared_payload_.leaf_row_values_loaded &&
@@ -9662,8 +10546,7 @@ secret_shared_payload_.dense_bucket_bitmaps_loaded = true;
 
             for (std::size_t local_idx = 0; local_idx < secure_bucket_count; ++local_idx) {
                 const std::uint32_t bucket_index = manifest_.secure_multiplier_bucket_indices[local_idx];
-                if (bucket_index >= secret_shared_payload_.dense_bucket_bitmaps.size() ||
-                    bucket_index >= static_cast<std::uint32_t>(secret_shared_payload_.bucket_values.rows())) {
+                if (bucket_index >= static_cast<std::uint32_t>(secret_shared_payload_.bucket_values.rows())) {
                     throw std::runtime_error("Secure multiplier bucket index is out of bounds.");
                 }
                 secret_shared_payload_.bucket_values[0](bucket_index, 0) = shared_values[0](static_cast<u64>(local_idx), 0);
@@ -9681,7 +10564,7 @@ secret_shared_payload_.dense_bucket_bitmaps_loaded = true;
                         bitmap.mShares[1](row, col) = shared_bitmaps.mShares[1](source_begin + row, col);
                     }
                 }
-                secret_shared_payload_.dense_bucket_bitmaps[bucket_index] = std::move(bitmap);
+                store_secure_bitmap(bucket_index, std::move(bitmap));
             }
         }
         if (secret_shared_payload_.leaf_row_values_loaded &&
@@ -10805,14 +11688,79 @@ void BSPN_mask_selftest(const oc::CLP& cmd) {
         });
     }
 
+    json packed_bitmap_results = json::array();
+    const std::vector<std::uint64_t> packed_test_rows = {1, 63, 64, 65, 2500, 5000, 10000};
+    for (const auto logical_rows : packed_test_rows) {
+        i64Matrix left_plain(logical_rows, 1);
+        i64Matrix right_plain(logical_rows, 1);
+        left_plain.setZero();
+        right_plain.setZero();
+        for (std::uint64_t row = 0; row < logical_rows; ++row) {
+            left_plain(row, 0) = row % 3 == 0 ? 1 : 0;
+            right_plain(row, 0) = row % 3 == 1 ? 1 : 0;
+        }
+        sbMatrix left_shared;
+        sbMatrix right_shared;
+        share_bool_matrix(left_plain, left_shared, 0, context);
+        share_bool_matrix(right_plain, right_shared, 0, context);
+        auto left_packed = pack_dense_boolean_rows(left_shared, logical_rows);
+        auto right_packed = pack_dense_boolean_rows(right_shared, logical_rows);
+        sbMatrix packed_intersection(left_packed.rows(), 64);
+        bool_cipher_and(
+            context.role,
+            left_packed,
+            right_packed,
+            packed_intersection,
+            enc,
+            eval,
+            runtime);
+        mask_packed_bitmap_tail(packed_intersection, logical_rows);
+        sbMatrix packed_union = left_packed;
+        for (u64 word_idx = 0; word_idx < packed_union.rows(); ++word_idx) {
+            packed_union.mShares[0](word_idx, 0) ^= right_packed.mShares[0](word_idx, 0);
+            packed_union.mShares[1](word_idx, 0) ^= right_packed.mShares[1](word_idx, 0);
+        }
+        mask_packed_bitmap_tail(packed_union, logical_rows);
+        auto intersection_dense = unpack_packed_boolean_words(packed_intersection, logical_rows);
+        auto union_dense = unpack_packed_boolean_words(packed_union, logical_rows);
+        i64Matrix intersection_revealed(logical_rows, 1);
+        i64Matrix union_revealed(logical_rows, 1);
+        enc.revealAll(runtime.noDependencies(), intersection_dense, intersection_revealed).get();
+        enc.revealAll(runtime.noDependencies(), union_dense, union_revealed).get();
+        bool intersection_ok = true;
+        bool union_ok = true;
+        for (std::uint64_t row = 0; row < logical_rows; ++row) {
+            intersection_ok = intersection_ok && ((intersection_revealed(row, 0) & 1) == 0);
+            const i64 expected_union = (row % 3 == 0 || row % 3 == 1) ? 1 : 0;
+            union_ok = union_ok && ((union_revealed(row, 0) & 1) == expected_union);
+        }
+        bool tail_ok = true;
+        if (logical_rows % 64 != 0 && packed_union.rows() != 0) {
+            const std::uint64_t tail_mask =
+                (std::uint64_t(1) << (logical_rows % 64)) - 1;
+            const u64 last = packed_union.rows() - 1;
+            tail_ok =
+                (static_cast<std::uint64_t>(packed_union.mShares[0](last, 0)) & ~tail_mask) == 0 &&
+                (static_cast<std::uint64_t>(packed_union.mShares[1](last, 0)) & ~tail_mask) == 0;
+        }
+        packed_bitmap_results.push_back({
+            {"logical_rows", logical_rows},
+            {"word_count", left_packed.rows()},
+            {"intersection_ok", intersection_ok},
+            {"disjoint_xor_union_ok", union_ok},
+            {"tail_mask_ok", tail_ok},
+        });
+    }
+
     json result = {
-        {"schema", "BSPN_MASK_SELFTEST_V3"},
+        {"schema", "BSPN_MASK_SELFTEST_V4"},
         {"role", role},
         {"comm_threads", comm_threads},
         {"fixed_decimal_bits", static_cast<int>(kFlatBSPNDecimal)},
         {"cases", case_results},
         {"comparisons", comparison_results},
         {"ratios", ratio_results},
+        {"packed_bitmaps", packed_bitmap_results},
     };
     if (role == 0) {
         std::cout << result.dump() << std::endl;
